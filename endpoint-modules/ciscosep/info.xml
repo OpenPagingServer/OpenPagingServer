@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<info>
+    <name>Cisco Enterprise Phones</name>
+    <version>0.0.1</version>
+    <author>OpenPagingServer Project Contributors</author>
+    <desp>Supports audible and visual notification on 7800, 7900, 8800, 8900, 9900</desp>
+    <updated>2026-01-30</updated>
+</info>
