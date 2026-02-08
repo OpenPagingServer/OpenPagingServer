@@ -127,8 +127,8 @@ CREATE TABLE systemsettings (
 """)
 
 cursor.execute("INSERT INTO messages VALUES ('text+audio',1,'SRP HOLD','HOLD! In your area.','Hold! In your room or area. Clear the halls.','srphold.wav','',NULL,'')")
-cursor.execute("INSERT INTO messages VALUES ('text+audio',1,'SRP SECURE','SECURE!','Secure! Get Inside. Lock outside doors.','srpsecure.wav','',NULL,'')")
-cursor.execute("INSERT INTO messages VALUES ('text+audio',1,'SRP LOCKDOWN','LOCKDOWN! Locks, Lights, Out of Sight.','LOCKDOWN! Locks, Lights, Out of Sight.','srplockdown.wav','',NULL,'')")
+cursor.execute("INSERT INTO messages VALUES ('text+audio',2,'SRP SECURE','SECURE!','Secure! Get Inside. Lock outside doors.','srpsecure.wav','',NULL,'')")
+cursor.execute("INSERT INTO messages VALUES ('text+audio',3,'SRP LOCKDOWN','LOCKDOWN! Locks, Lights, Out of Sight.','LOCKDOWN! Locks, Lights, Out of Sight.','srplockdown.wav','',NULL,'')")
 
 cursor.execute("INSERT INTO enabledmodules VALUES (3,'modules/bells',1,'/bells.php','user,admin,tempadmin',1,'Bell Schedules','fa-bell')")
 cursor.execute("INSERT INTO enabledmodules VALUES (4,'modules/wakeup',1,'/wakeup.php','user,admin,tempadmin',1,'Wake Up Calls','fa-bed')")
