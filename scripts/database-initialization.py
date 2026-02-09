@@ -126,14 +126,13 @@ CREATE TABLE systemsettings (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
 """)
 
-cursor.execute("INSERT INTO messages VALUES ('text+audio',1,'SRP HOLD','HOLD! In your area.','Hold! In your room or area. Clear the halls.','srphold.wav','',NULL,'')")
-cursor.execute("INSERT INTO messages VALUES ('text+audio',2,'SRP SECURE','SECURE!','Secure! Get Inside. Lock outside doors.','srpsecure.wav','',NULL,'')")
-cursor.execute("INSERT INTO messages VALUES ('text+audio',3,'SRP LOCKDOWN','LOCKDOWN! Locks, Lights, Out of Sight.','LOCKDOWN! Locks, Lights, Out of Sight.','srplockdown.wav','',NULL,'')")
-
+cursor.execute("INSERT INTO messages VALUES ('text+audio',1,'SRP HOLD','HOLD! In your area.','Hold! In your room or area. Clear the halls.','OPS-400HZ-MedPulse.wav:OPS-SRP-Hold.wav','',NULL,'')")
+cursor.execute("INSERT INTO messages VALUES ('text+audio',2,'SRP SECURE','SECURE!','Secure! Get Inside. Lock outside doors.','OPS-400HZ-MedPulse.wav:OPS-SRP-Secure.wav','',NULL,'')")
+cursor.execute("INSERT INTO messages VALUES ('text+audio',3,'SRP LOCKDOWN','LOCKDOWN! Locks, Lights, Out of Sight.','LOCKDOWN! Locks, Lights, Out of Sight.','OPS-400HZ-MedPulse.wav:OPS-SRP-Lockdown.wav','',NULL,'')")
+cursor.execute("INSERT INTO messages VALUES ('text+audio',4,'ALL CLEAR','ALL CLEAR!!!','ALL CLEAR! Please standby for further information and confirmation.','OPS-900HZ-SlowPulse.wav:OPS-AllClear.wav','',NULL,'')")
+cursor.execute("INSERT INTO messages VALUES ('text+audio',5,'TEST Message','This is a test of Open Paging Server','This is a test of the Open Paging Server MNS system. No action is required.','OPS-900HZ-SlowPulse.wav:OPS-TESTING.wav','',NULL,'')")
 cursor.execute("INSERT INTO enabledmodules VALUES (3,'modules/bells',1,'/bells.php','user,admin,tempadmin',1,'Bell Schedules','fa-bell')")
 cursor.execute("INSERT INTO enabledmodules VALUES (4,'modules/wakeup',1,'/wakeup.php','user,admin,tempadmin',1,'Wake Up Calls','fa-bed')")
-
-cursor.execute("INSERT INTO `endpoints-input-sip` VALUES ('Paging','#10104','Test','livepaging')")
 
 cursor.execute("INSERT INTO systemsettings VALUES ('enable_insecure_sip','1','Enable SIP over UDP and TCP (0/1)')")
 cursor.execute("INSERT INTO systemsettings VALUES ('enable_login_logo','1','Enable the logo on login page')")
@@ -141,8 +140,8 @@ cursor.execute("INSERT INTO systemsettings VALUES ('enable_secure_sip','0','Enab
 cursor.execute("INSERT INTO systemsettings VALUES ('favicon','/assets/favicon.svg','Browser Favicon. Path to file within web server.')")
 cursor.execute("INSERT INTO systemsettings VALUES ('insecure_sip_port','5060','Port for UDP/TCP SIP')")
 cursor.execute("INSERT INTO systemsettings VALUES ('login_banner_enabled','1','Enable or disable the login page banner (0/1)')")
-cursor.execute("INSERT INTO systemsettings VALUES ('login_banner_message','','Message text for the login page banner')")
-cursor.execute("INSERT INTO systemsettings VALUES ('login_banner_title','Thank you for installing the Open Paging Server beta!','Optional title for the login page banner')")
+cursor.execute("INSERT INTO systemsettings VALUES ('login_banner_message','OPS is currently in early devlopment stages, and is not yet suitable for production use.  Visit our website at https://www.openpagingserver.org to learn how to contribute and to join our Discord. Thank you for installing the Open Paging Server beta!','Message text for the login page banner')")
+cursor.execute("INSERT INTO systemsettings VALUES ('login_banner_title','Welcome to Open Paging Server Beta!!!','Optional title for the login page banner')")
 cursor.execute("INSERT INTO systemsettings VALUES ('login_logo_dark','/assets/OPENPAGINGSERVER-768x576-DARKMODE.png','Dark mode logo. Path to file within web server.')")
 cursor.execute("INSERT INTO systemsettings VALUES ('login_logo_light','/assets/OPENPAGINGSERVER-768x576-LIGHTMODE.png','Light mode logo. Path to file within web server.')")
 cursor.execute("INSERT INTO systemsettings VALUES ('product_name','Open Paging Server','Name of this server.')")
