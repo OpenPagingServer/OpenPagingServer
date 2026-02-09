@@ -1,3 +1,5 @@
+# This is a temporary proof of concept
+
 #!/usr/bin/env python3
 import sys
 import random
@@ -183,5 +185,6 @@ sock.close()
 stop_xml = """<CiscoIPPhoneExecute>
 <ExecuteItem Priority="0" URL="RTPMRx:Stop"/>
 </CiscoIPPhoneExecute>"""
+
 
 post_xml(stop_xml)
