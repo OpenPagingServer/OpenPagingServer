@@ -31,7 +31,7 @@ PHONE_IP = "10.50.10.170"
 USERNAME = "admin"
 PASSWORD = "admin"
 
-ASSET_PATH = "/opt/openpagingserver/assets/"
+ASSET_PATH = "/var/lib/openpagingserver/assets/"
 SAMPLE_RATE = 8000
 FRAME_SIZE = 160
 PAYLOAD_TYPE = 0
@@ -188,3 +188,4 @@ stop_xml = """<CiscoIPPhoneExecute>
 
 
 post_xml(stop_xml)
+
