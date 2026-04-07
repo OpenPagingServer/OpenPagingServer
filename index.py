@@ -10,6 +10,8 @@ import importlib.util
 from pathlib import Path
 from dotenv import load_dotenv
 
+import sip.index as sip_server
+
 load_dotenv("/opt/openpagingserver/.env")
 
 DB_HOST = os.getenv("DB_HOST")
