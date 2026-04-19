@@ -129,7 +129,6 @@ CREATE TABLE systemsettings (
 cursor.execute("INSERT INTO messages VALUES ('text+audio',1,'SRP HOLD','HOLD! In your area.','Hold! In your room or area. Clear the halls.','OPS-400HZ-MedPulse.wav:OPS-SRP-Hold.wav','',NULL,'')")
 cursor.execute("INSERT INTO messages VALUES ('text+audio',2,'SRP SECURE','SECURE!','Secure! Get Inside. Lock outside doors.','OPS-400HZ-MedPulse.wav:OPS-SRP-Secure.wav','',NULL,'')")
 cursor.execute("INSERT INTO messages VALUES ('text+audio',3,'SRP LOCKDOWN','LOCKDOWN! Locks, Lights, Out of Sight.','LOCKDOWN! Locks, Lights, Out of Sight.','OPS-400HZ-MedPulse.wav:OPS-SRP-Lockdown.wav','',NULL,'')")
-cursor.execute("INSERT INTO messages VALUES ('text+audio',4,'ALL CLEAR','ALL CLEAR!!!','ALL CLEAR! Please standby for further information and confirmation.','OPS-900HZ-SlowPulse.wav:OPS-AllClear.wav','',NULL,'')")
 cursor.execute("INSERT INTO messages VALUES ('text+audio',5,'TEST Message','This is a test of Open Paging Server','This is a test of the Open Paging Server MNS system. No action is required.','OPS-900HZ-SlowPulse.wav:OPS-TESTING.wav','',NULL,'')")
 cursor.execute("INSERT INTO enabledmodules VALUES (3,'modules/bells',1,'/bells.php','user,admin,tempadmin',1,'Bell Schedules','fa-bell')")
 cursor.execute("INSERT INTO enabledmodules VALUES (4,'modules/wakeup',1,'/wakeup.php','user,admin,tempadmin',1,'Wake Up Calls','fa-bed')")
