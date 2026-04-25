@@ -42,6 +42,9 @@ if os.path.isdir(triggers_dir):
             if hasattr(module, "trigger_name") and hasattr(module, "handle"):
                 loaded_triggers[module.trigger_name] = module.handle
 
+class SipCongestionError(Exception):
+    pass
+
 class SipServer:
     def __init__(self):
         self.lock = threading.Lock()
@@ -361,6 +364,23 @@ class SipServer:
         lines.append("Content-Length: 0")
         return "\r\n".join(lines) + "\r\n\r\n"
 
+    def build_503(self, headers, local_ip=None, transport="udp", call_tag=None, reason_text="SIP congestion"):
+        return self.build_response(
+            headers,
+            "503 Service Unavailable",
+            local_ip=local_ip,
+            transport=transport,
+            call_tag=call_tag,
+            extra_headers=[f'Reason: SIP ;cause=503 ;text="{reason_text}"']
+        )
+
+    def run_trigger_preflight(self, session):
+        preflight = getattr(session, "preflight", None)
+        if callable(preflight):
+            preflight()
+            if getattr(session, "setup_failed", False):
+                raise SipCongestionError("SIP congestion")
+
     def build_invite_sdp(self, local_ip, local_port, disable_video=False):
         sdp = (
             "v=0\r\n"
@@ -526,47 +546,48 @@ class SipServer:
         if not remote_media_port:
             return self.build_response(headers, "400 Bad Request")
         
+        local_ip = self.local_ip_for(remote_media_ip)
+        
+        if session_class.__name__ == "RTPSession":
+            try:
+                session = session_class(
+                    remote_media_ip,
+                    remote_media_port,
+                    payload_generator=generator,
+                    on_finish=lambda cid=call_id: self.finish_early_media(cid) if early_media_status else self.finish_call(cid),
+                )
+            except TypeError:
+                session = session_class(
+                    remote_media_ip,
+                    remote_media_port,
+                    generator,
+                    on_finish=lambda cid=call_id: self.finish_early_media(cid) if early_media_status else self.finish_call(cid),
+                )
+        else:
+            try:
+                session = session_class(
+                    remote_media_ip,
+                    remote_media_port,
+                    generator=generator,
+                    on_finish=lambda cid=call_id: self.finish_early_media(cid) if early_media_status else self.finish_call(cid),
+                )
+            except TypeError:
+                session = session_class(
+                    remote_media_ip,
+                    remote_media_port,
+                    generator,
+                    on_finish=lambda cid=call_id: self.finish_early_media(cid) if early_media_status else self.finish_call(cid),
+                )
+
+        try:
+            self.run_trigger_preflight(session)
+        except Exception:
+            traceback.print_exc()
+            return self.build_503(headers, local_ip=local_ip, transport=transport)
+        
         with self.lock:
             call = self.calls.get(call_id)
             if call is None:
-                local_ip = self.local_ip_for(remote_media_ip)
-                
-                if early_media_status:
-                    cb = lambda cid=call_id: self.finish_early_media(cid)
-                else:
-                    cb = lambda cid=call_id: self.finish_call(cid)
-
-                if session_class.__name__ == "RTPSession":
-                    try:
-                        session = session_class(
-                            remote_media_ip,
-                            remote_media_port,
-                            payload_generator=generator,
-                            on_finish=cb,
-                        )
-                    except TypeError:
-                        session = session_class(
-                            remote_media_ip,
-                            remote_media_port,
-                            generator,
-                            on_finish=cb,
-                        )
-                else:
-                    try:
-                        session = session_class(
-                            remote_media_ip,
-                            remote_media_port,
-                            generator=generator,
-                            on_finish=cb,
-                        )
-                    except TypeError:
-                        session = session_class(
-                            remote_media_ip,
-                            remote_media_port,
-                            generator,
-                            on_finish=cb,
-                        )
-                
                 from_h = self.get_first(headers, "From")
                 to_h = self.get_first(headers, "To")
                 local_tag = uuid.uuid4().hex[:10]
