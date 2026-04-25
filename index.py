@@ -2,12 +2,13 @@
 
 import json
 import os
-import time
 import signal
 import sys
-import pymysql
+import time
 import importlib.util
 from pathlib import Path
+
+import pymysql
 from dotenv import load_dotenv
 
 import sip.index as sip_server
@@ -22,43 +23,79 @@ DB_NAME = os.getenv("DB_NAME")
 MODULES_DIR = Path("/opt/openpagingserver/endpoint-modules")
 loaded_modules = {}
 
+
 class Core:
     def log(self, msg):
         print(msg)
 
+
 core = Core()
 
+
+def get_db_connection():
+    return pymysql.connect(
+        host=DB_HOST,
+        user=DB_USER,
+        password=DB_PASS,
+        database=DB_NAME,
+    )
+
+
 def db_enabled_modules():
-    conn = pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASS, database=DB_NAME)
-    with conn.cursor() as cur:
-        cur.execute("SELECT plugin_id FROM enabledmodules WHERE enabled = 1")
-        rows = cur.fetchall()
-    conn.close()
-    return {r[0] for r in rows}
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM enabledmodules WHERE status = 1")
+            return {row[0] for row in cur.fetchall()}
+    finally:
+        conn.close()
+
 
 def discover_modules():
     found = {}
-    for d in MODULES_DIR.iterdir():
-        manifest = d / "manifest.json"
-        if manifest.exists():
-            data = json.loads(manifest.read_text())
-            found[data["id"]] = d / data["entry"]
+    if not MODULES_DIR.exists():
+        return found
+
+    for module_dir in MODULES_DIR.iterdir():
+        if not module_dir.is_dir():
+            continue
+
+        manifest = module_dir / "manifest.json"
+        if not manifest.exists():
+            continue
+
+        data = json.loads(manifest.read_text())
+        found[data["id"]] = module_dir / data["entry"]
+
     return found
+
 
 def load_module(mid, entry):
     spec = importlib.util.spec_from_file_location(mid, entry)
+    if spec is None or spec.loader is None:
+        return
+
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    mod.init(core)
+
+    if hasattr(mod, "init"):
+        mod.init(core)
+
     loaded_modules[mid] = mod
     core.log(f"loaded module {mid}")
 
+
 def unload_module(mid):
-    if mid in loaded_modules:
-        if hasattr(loaded_modules[mid], "shutdown"):
-            loaded_modules[mid].shutdown()
-        del loaded_modules[mid]
-        core.log(f"unloaded module {mid}")
+    mod = loaded_modules.get(mid)
+    if mod is None:
+        return
+
+    if hasattr(mod, "shutdown"):
+        mod.shutdown()
+
+    del loaded_modules[mid]
+    core.log(f"unloaded module {mid}")
+
 
 def sync_modules():
     enabled = db_enabled_modules()
@@ -72,14 +109,24 @@ def sync_modules():
         if mid not in enabled:
             unload_module(mid)
 
+
 def shutdown(sig, frame):
     for mid in list(loaded_modules.keys()):
         unload_module(mid)
     sys.exit(0)
 
-signal.signal(signal.SIGINT, shutdown)
-signal.signal(signal.SIGTERM, shutdown)
 
-while True:
-    sync_modules()
-    time.sleep(5)
+def main():
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    sip_server.start()
+    core.log("SIP server started")
+
+    while True:
+        sync_modules()
+        time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()
