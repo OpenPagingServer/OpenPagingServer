@@ -1,2 +1,2 @@
-# core
-Core Server
+# 📢 Open Paging Server
+Welcome to the Open Paging Server repository! 
