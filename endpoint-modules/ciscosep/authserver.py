@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-# For now it always returns AUTHORIZED. At some point, proper authentication will be added
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse
 
 class AuthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/":
+        parsed = urlparse(self.path)
+
+        if parsed.path == "/":
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
