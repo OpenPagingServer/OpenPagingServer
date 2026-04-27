@@ -1,6 +1,6 @@
 # 📢 Open Paging Server
 Welcome to the Open Paging Server repository! 
 
-Things are still massively under construction. So check back later for more!
+This is a very very very new project so things are still massively under construction. So check back later for more! A proper installer will be provided at some point as well as a more updated database initialization script.
 
 Endpoint modules are not included here. However, we have [Cisco](https://github.com/OpenPagingServer/cisco) and [Polycom](https://github.com/OpenPagingServer/polycom) modules.
