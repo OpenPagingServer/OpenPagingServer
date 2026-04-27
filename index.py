@@ -13,14 +13,17 @@ from dotenv import load_dotenv
 
 import sip.index as sip_server
 
-load_dotenv("/opt/openpagingserver/.env")
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
 DB_HOST = os.getenv("DB_HOST")
 DB_USER = os.getenv("DB_USER")
 DB_PASS = os.getenv("DB_PASS")
 DB_NAME = os.getenv("DB_NAME")
 
-MODULES_DIR = Path("/opt/openpagingserver/endpoint-modules")
+MODULE_LOADER_PATH = BASE_DIR / "endpoint-modules" / "index.py"
+MODULES_DIR = BASE_DIR / "endpoint-modules"
+
 loaded_modules = {}
 
 
@@ -110,9 +113,29 @@ def sync_modules():
             unload_module(mid)
 
 
+def load_endpoint_manager():
+    spec = importlib.util.spec_from_file_location("endpoint_manager", MODULE_LOADER_PATH)
+    if spec is None or spec.loader is None:
+        return None
+
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+endpoint_manager = load_endpoint_manager()
+
+if endpoint_manager and hasattr(endpoint_manager, "init"):
+    endpoint_manager.init(core)
+
+
 def shutdown(sig, frame):
+    if endpoint_manager and hasattr(endpoint_manager, "shutdown_all"):
+        endpoint_manager.shutdown_all()
+
     for mid in list(loaded_modules.keys()):
         unload_module(mid)
+
     sys.exit(0)
 
 
@@ -124,7 +147,12 @@ def main():
     core.log("SIP server started")
 
     while True:
-        sync_modules()
+        try:
+            sync_modules()
+            if endpoint_manager and hasattr(endpoint_manager, "sync_modules"):
+                endpoint_manager.sync_modules()
+        except Exception as exc:
+            core.log(f"module sync error: {exc}")
         time.sleep(5)
 
 
