@@ -43,6 +43,27 @@ $product_name = $settings['product_name'] ?? 'Open Paging Server';
 $favicon = $settings['favicon'] ?? '';
 $show_online_docs = $settings['show_online_docs'] ?? '1';
 
+function get_application_version() {
+    $candidates = [
+        dirname(__DIR__, 3) . '/pyproject.toml',
+        '/opt/openpagingserver/pyproject.toml',
+        '/var/www/pyproject.toml',
+    ];
+
+    foreach ($candidates as $path) {
+        if (!is_readable($path)) {
+            continue;
+        }
+
+        $contents = file_get_contents($path);
+        if ($contents !== false && preg_match('/^version\s*=\s*"([^"]+)"/m', $contents, $matches)) {
+            return $matches[1];
+        }
+    }
+
+    return '';
+}
+
 function is_private_ip($ip) {
     return filter_var(
         $ip,
@@ -104,6 +125,7 @@ function get_system_info() {
 
 $sysInfo = get_system_info();
 $netInfo = get_network_info();
+$applicationVersion = get_application_version();
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -245,7 +267,7 @@ h2,h3{ color:#BB86FC; }
             <source srcset="/assets/OPENPAGINGSERVER-768x576-DARKMODE.png" media="(prefers-color-scheme: dark)">
             <img src="/assets/OPENPAGINGSERVER-768x576-LIGHTMODE.png" class="server-image">
         </picture>
-        <p>Open Paging Server 0.1.0</p>
+        <p>Open Paging Server<?php if ($applicationVersion !== ''): ?> <?php echo htmlspecialchars($applicationVersion); ?><?php endif; ?></p>
 		<p>Open Paging Server is licensed under the GNU General Public License v2.0. Third-party components, modules, and software used by Open Paging Server are subject to their own licenses.</p>
         <p>Open Paging Server is provided "as is" without any warranties, express or implied, including but not limited to fitness for a particular purpose or non-infringement.</p>
         <p></p>
