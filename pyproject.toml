@@ -1,0 +1,11 @@
+[project]
+name = "open-paging-server"
+version = "0.1.0"
+description = "Open Paging Server"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "PyMySQL",
+    "python-dotenv",
+    "mysql-connector-python",
+]
