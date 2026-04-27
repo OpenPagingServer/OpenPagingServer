@@ -246,7 +246,7 @@ h2,h3{ color:#BB86FC; }
             <img src="/assets/OPENPAGINGSERVER-768x576-LIGHTMODE.png" class="server-image">
         </picture>
         <p>Open Paging Server 0.1.0</p>
-		<p>Open Paging Server is licensed under the GNU General Public License v2.0. Open Paging Server installs and uses several open-source software from their official sources without source code modifications. These components are subject to their own licenses.</p>
+		<p>Open Paging Server is licensed under the GNU General Public License v2.0. Third-party components, modules, and software used by Open Paging Server are subject to their own licenses.</p>
         <p>Open Paging Server is provided "as is" without any warranties, express or implied, including but not limited to fitness for a particular purpose or non-infringement.</p>
         <p></p>
         <div class="info-card">
