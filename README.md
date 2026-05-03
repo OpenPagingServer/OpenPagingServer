@@ -21,4 +21,4 @@ THIS IS COMING SOON!!!
 
 Open Paging Server can be installed on Linux using:
 
-```curl -fsSL https://install.openpagingserver.org | bash```
+```curl -fsSL https://install.openpagingserver.org | bash
