@@ -18,5 +18,6 @@ Examples of official endpoint modules for Open Paging Server include:
 
 ### Install Open Paging Server
 THIS IS COMING SOON!!!
+
 Open Paging Server can be installed on Linux using:
 ```curl -fsSL https://install.openpagingserver.org | bash```
