@@ -1,3 +1,5 @@
+Open Paging Server is currently in beta and not ready for production use yet. 
+
 # 📢 Open Paging Server
 
 ### Open Paging Server is a free & open source public address system that runs on existing VoIP infrastructure
