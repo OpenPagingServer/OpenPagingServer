@@ -13,7 +13,7 @@ Open Paging Server is written in Python & PHP. Allowing for great flexibility, q
 
 ### Endpoint Support
 Examples of official endpoint modules for Open Paging Server include:
-- [Cisco](https://github.com/OpenPagingServer/cisco) IP Phones (with integration for Unified Communications Manager)
+- [Cisco](https://github.com/OpenPagingServer/cisco) IP Phones (built-in integration with Unified Communications Manager)
 - [Polycom](https://github.com/OpenPagingServer/polycom)
 
 ### Install Open Paging Server
