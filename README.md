@@ -1,4 +1,4 @@
-Open Paging Server is currently in beta and not ready for production use yet. 
+Open Paging Server is currently in beta and not ready for production use yet. This repo is still a mess. More info will come out soon.
 
 # 📢 Open Paging Server
 
