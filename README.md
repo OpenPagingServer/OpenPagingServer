@@ -18,10 +18,10 @@ Examples of official endpoint modules for Open Paging Server include:
 - [Polycom](https://github.com/OpenPagingServer/polycom)
 
 ### Install Open Paging Server
-THIS IS COMING SOON!!!
-
-Open Paging Server can be installed on Linux using:
+Open Paging Server can be installed on Debian Linux using:
 
 ```
 curl -fsSL https://install.openpagingserver.org | bash
 ```
+Please note that this install script is still in beta and may have issues.
+[Install script's repo](https://github.com/OpenPagingServer/Installer)
