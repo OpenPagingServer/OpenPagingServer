@@ -292,7 +292,6 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 
             <div class="form-group">
                 <label class="main-label" for="expires">Expiration</label>
-                <p class="help-text">Use 30m or 15m, msg=3 or msg=3.4, or manual for no automatic expiration.</p>
                 <input type="text" name="expires" id="expires" class="form-control" value="manual">
             </div>
 
