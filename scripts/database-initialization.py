@@ -8,6 +8,11 @@ import os
 def random_password(length=32):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
+base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+env_path = os.path.join(base_dir, ".env")
+web_dir = os.path.join(base_dir, "web")
+config_path = os.path.join(web_dir, "config.php")
+
 try:
     conn = mysql.connector.connect(
         user="root",
@@ -37,8 +42,11 @@ cursor.execute("USE openpagingserver")
 
 db_password = random_password()
 cursor.execute("DROP USER IF EXISTS 'openpagingserver'@'localhost'")
+cursor.execute("DROP USER IF EXISTS 'openpagingserver'@'127.0.0.1'")
 cursor.execute(f"CREATE USER 'openpagingserver'@'localhost' IDENTIFIED BY '{db_password}'")
+cursor.execute(f"CREATE USER 'openpagingserver'@'127.0.0.1' IDENTIFIED BY '{db_password}'")
 cursor.execute("GRANT ALL PRIVILEGES ON openpagingserver.* TO 'openpagingserver'@'localhost'")
+cursor.execute("GRANT ALL PRIVILEGES ON openpagingserver.* TO 'openpagingserver'@'127.0.0.1'")
 cursor.execute("FLUSH PRIVILEGES")
 
 cursor.execute("""
@@ -53,6 +61,28 @@ CREATE TABLE messages (
     color VARCHAR(7),
     icon VARCHAR(255) DEFAULT ''
 )
+""")
+
+cursor.execute("""
+CREATE TABLE broadcats (
+    id VARCHAR(100),
+    shortmessage VARCHAR(100),
+    longmessage TEXT,
+    icon VARCHAR(100),
+    color VARCHAR(100),
+    vendor_specific VARCHAR(100),
+    type ENUM('Page','AudioMessage','TextMessage','Text+AudioMessage'),
+    expires DATETIME,
+    issued DATETIME,
+    groups TEXT,
+    image VARCHAR(100),
+    audio VARCHAR(10000),
+    sender VARCHAR(100),
+    priority ENUM('Low','Normal','High','Emergency'),
+    delivery VARCHAR(100),
+    name VARCHAR(100),
+    UNIQUE KEY id_unique (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
 """)
 
 cursor.execute("""
@@ -156,11 +186,18 @@ cursor.execute("INSERT INTO systemsettings VALUES ('webserver_http_port','80','H
 conn.commit()
 conn.close()
 
-config_php = """<?php
+env_file = f"""DB_HOST='127.0.0.1'
+DB_USER='openpagingserver'
+DB_PASS='{db_password}'
+DB_NAME='openpagingserver'
+DEBUG=false
+"""
+
+config_php = f"""<?php
 $host = 'localhost';
 $db   = 'openpagingserver';
 $user = 'openpagingserver';
-$pass = '""" + db_password + """';
+$pass = '{db_password}';
 $charset = 'utf8mb4';
 
 $dsn = "mysql:host=$host;dbname=$db;charset=$charset";
@@ -170,15 +207,21 @@ $options = [
     PDO::ATTR_EMULATE_PREPARES   => false,
 ];
 
-try {
+try {{
     $pdo = new PDO($dsn, $user, $pass, $options);
-} catch (\\PDOException $e) {
+}} catch (\\PDOException $e) {{
     throw new \\PDOException($e->getMessage(), (int)$e->getCode());
-}
+}}
 """
 
-os.makedirs("/var/www/html", exist_ok=True)
-with open("/var/www/html/config.php", "w") as f:
+os.makedirs(web_dir, exist_ok=True)
+
+with open(env_path, "w") as f:
+    f.write(env_file)
+
+with open(config_path, "w") as f:
     f.write(config_php)
 
 print("Done.")
+print(f"Wrote {env_path}")
+print(f"Wrote {config_path}")
