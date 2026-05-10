@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+import shutil
 
 import mysql.connector
 
@@ -43,10 +44,41 @@ def discover_endpoint_module_dirs():
     return sorted(path.name for path in ENDPOINT_MODULES_DIR.iterdir() if safe_endpoint_module_dir(path))
 
 
+def systemctl_available():
+    return shutil.which("systemctl") is not None
+
+
+def systemd_unit_exists(unit):
+    if not systemctl_available():
+        return False
+
+    checks = [
+        ["systemctl", "list-unit-files", unit],
+        ["systemctl", "list-units", "--all", unit],
+    ]
+
+    for check in checks:
+        result = subprocess.run(check, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
+        if result.returncode == 0:
+            return True
+
+    return False
+
+
 def run_systemctl(action):
-    result = subprocess.run(["systemctl", action, "openpagingserver"], text=True)
+    unit = "openpagingserver.service"
+
+    if not systemctl_available():
+        print("systemctl not found, skipping service command")
+        return
+
+    if not systemd_unit_exists(unit):
+        print(f"{unit} does not exist in systemd, skipping systemctl {action}")
+        return
+
+    result = subprocess.run(["systemctl", action, unit], text=True)
     if result.returncode != 0:
-        print(f"systemctl {action} openpagingserver failed with exit code {result.returncode}")
+        print(f"systemctl {action} {unit} failed with exit code {result.returncode}")
 
 
 def connect_as_admin():
@@ -459,7 +491,7 @@ def main():
     conn.close()
 
     write_config(db_password)
-    print("Done.")
+    print("Database initialized successfully")
 
 
 def wrapped_main():
