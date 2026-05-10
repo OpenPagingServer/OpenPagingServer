@@ -30,51 +30,111 @@ if ($userRole !== 'admin' && $userRole !== 'tempadmin') {
     exit;
 }
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $name = $_POST['name'] ?? '';
-    $type = $_POST['type'] ?? '';
-    $shortmessage = $_POST['shortmessage'] ?? '';
-    $longmessage = message_multiline_text($_POST['longmessage'] ?? '');
-    $color = ltrim($_POST['color'] ?? '', '#');
-    $expires = trim($_POST['expires'] ?? 'manual');
-    $audioFilesArr = $_POST['audio_files'] ?? [];
-    $audio = implode(':', $audioFilesArr);
+function h($value) {
+    return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8');
+}
 
-    $stmt = $pdo->query("SELECT messageid FROM messages ORDER BY messageid ASC");
-    $existingIds = $stmt->fetchAll(PDO::FETCH_COLUMN);
-    
-    $newId = 1;
-    foreach ($existingIds as $id) {
-        if ($id == $newId) {
-            $newId++;
-        } else if ($id > $newId) {
-            break;
-        }
-    }
-
-    $columnsStmt = $pdo->query("SHOW COLUMNS FROM messages");
-    $messageColumns = array_column($columnsStmt->fetchAll(PDO::FETCH_ASSOC), 'Field');
-    $insertColumns = ['messageid', 'name', 'type', 'shortmessage', 'longmessage', 'color', 'audio'];
-    $insertValues = [
-        'id' => $newId,
-        'name' => $name,
-        'type' => $type,
-        'shortmessage' => $shortmessage,
-        'longmessage' => $longmessage,
-        'color' => $color,
-        'audio' => $audio
-    ];
-    if (in_array('expires', $messageColumns, true)) {
-        $insertColumns[] = 'expires';
-        $insertValues['expires'] = $expires;
-    }
-    $columnSql = implode(', ', $insertColumns);
-    $placeholderSql = ':' . implode(', :', array_keys($insertValues));
-    $stmt = $pdo->prepare("INSERT INTO messages ($columnSql) VALUES ($placeholderSql)");
-    $stmt->execute($insertValues);
-
-    header("Location: /messages");
+$msgid = $_GET['msgid'] ?? $_POST['msgid'] ?? '';
+if (!preg_match('/^\d+$/', (string)$msgid)) {
+    http_response_code(400);
+    echo "Invalid message.";
     exit;
+}
+
+$columnsStmt = $pdo->query("SHOW COLUMNS FROM messages");
+$messageColumns = array_column($columnsStmt->fetchAll(PDO::FETCH_ASSOC), 'Field');
+$selectColumns = array_intersect(
+    ['messageid', 'name', 'type', 'shortmessage', 'longmessage', 'color', 'audio', 'expires'],
+    $messageColumns
+);
+$selectSql = implode(', ', array_map(function ($column) {
+    return "`$column`";
+}, $selectColumns));
+
+$stmt = $pdo->prepare("SELECT $selectSql FROM messages WHERE messageid = :id LIMIT 1");
+$stmt->execute(['id' => $msgid]);
+$message = $stmt->fetch(PDO::FETCH_ASSOC);
+if (!$message) {
+    http_response_code(404);
+    echo "Message not found.";
+    exit;
+}
+
+$messageType = (string)($message['type'] ?? '');
+$showVisualFields = ($messageType === 'text' || $messageType === 'text+audio');
+$showAudioFields = ($messageType === 'audio' || $messageType === 'text+audio');
+$error = '';
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    try {
+        $updates = [];
+        $params = ['messageid' => $msgid];
+
+        if (in_array('name', $messageColumns, true)) {
+            $name = trim((string)($_POST['name'] ?? ''));
+            if ($name === '') {
+                throw new RuntimeException('Name is required.');
+            }
+            $updates[] = "`name` = :name";
+            $params['name'] = $name;
+            $message['name'] = $name;
+        }
+
+        if ($showVisualFields) {
+            if (in_array('shortmessage', $messageColumns, true)) {
+                $shortmessage = (string)($_POST['shortmessage'] ?? '');
+                $updates[] = "`shortmessage` = :shortmessage";
+                $params['shortmessage'] = $shortmessage;
+                $message['shortmessage'] = $shortmessage;
+            }
+            if (in_array('longmessage', $messageColumns, true)) {
+                $longmessage = message_multiline_text($_POST['longmessage'] ?? '');
+                $updates[] = "`longmessage` = :longmessage";
+                $params['longmessage'] = $longmessage;
+                $message['longmessage'] = $longmessage;
+            }
+            if (in_array('color', $messageColumns, true)) {
+                $color = strtoupper(ltrim(trim((string)($_POST['color'] ?? '')), '#'));
+                if ($color !== '' && !preg_match('/^[A-F0-9]{6}$/', $color)) {
+                    throw new RuntimeException('Color must be a 6 character hex value.');
+                }
+                $updates[] = "`color` = :color";
+                $params['color'] = $color;
+                $message['color'] = $color;
+            }
+        }
+
+        if ($showAudioFields && in_array('audio', $messageColumns, true)) {
+            $audioFilesArr = $_POST['audio_files'] ?? [];
+            if (!is_array($audioFilesArr)) {
+                $audioFilesArr = [];
+            }
+            $audioFilesArr = array_filter($audioFilesArr, function ($value) {
+                return trim((string)$value) !== '';
+            });
+            $audio = implode(':', array_map('trim', $audioFilesArr));
+            $updates[] = "`audio` = :audio";
+            $params['audio'] = $audio;
+            $message['audio'] = $audio;
+        }
+
+        if (in_array('expires', $messageColumns, true)) {
+            $expires = trim((string)($_POST['expires'] ?? 'manual'));
+            $updates[] = "`expires` = :expires";
+            $params['expires'] = $expires;
+            $message['expires'] = $expires;
+        }
+
+        if (!empty($updates)) {
+            $stmt = $pdo->prepare("UPDATE messages SET " . implode(', ', $updates) . " WHERE messageid = :messageid");
+            $stmt->execute($params);
+        }
+
+        header("Location: /messages");
+        exit;
+    } catch (Throwable $exc) {
+        $error = $exc->getMessage();
+    }
 }
 
 $settings = [];
@@ -97,15 +157,25 @@ if (is_dir($audioDir)) {
         }
     }
 }
+
+$selectedAudioFiles = array_values(array_filter(explode(':', (string)($message['audio'] ?? '')), function ($value) {
+    return trim($value) !== '';
+}));
+$selectedAudioLookup = array_flip($selectedAudioFiles);
+$availableAudioFiles = array_values(array_filter($availableAudioFiles, function ($file) use ($selectedAudioLookup) {
+    return !isset($selectedAudioLookup[$file]);
+}));
+$colorValue = strtoupper(ltrim((string)($message['color'] ?? ''), '#'));
+$colorPickerValue = preg_match('/^[A-Fa-f0-9]{6}$/', $colorValue) ? '#' . $colorValue : '#000000';
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>New Message - <?= htmlspecialchars($product_name) ?></title>
+<title>Edit Message - <?= h($product_name) ?></title>
 <?php if (!empty($favicon)): ?>
-<link rel="icon" href="<?= htmlspecialchars($favicon) ?>" type="image/x-icon">
+<link rel="icon" href="<?= h($favicon) ?>" type="image/x-icon">
 <?php endif; ?>
 <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet" />
 <link href="/assets/sidebar-brand.css" rel="stylesheet" />
@@ -139,11 +209,8 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .form-control { width: 100%; padding: 10px; border: 1px solid #DDD; border-radius: 4px; box-sizing: border-box; background: #FFF; color: #000; font-family: inherit; }
 .form-control.textarea-long { min-height: 140px; resize: vertical; white-space: pre-wrap; }
 .help-text { font-size: 0.9em; color: #666; margin-top: 0; margin-bottom: 12px; line-height: 1.4; }
-.radio-group label { display: block; margin-bottom: 8px; font-weight: normal; cursor: pointer; }
-.radio-group input[type="radio"] { margin-right: 8px; }
 .color-picker-container { display: flex; align-items: center; gap: 12px; }
 .color-picker-input { height: 42px; width: 42px; padding: 0; border: 1px solid #DDD; border-radius: 4px; cursor: pointer; background: none; }
-
 .transfer-list-container { display: flex; gap: 15px; align-items: stretch; height: 300px; margin-top: 10px; }
 .tl-panel { flex: 1; display: flex; flex-direction: column; border: 1px solid #DDD; border-radius: 4px; background: #FFF; overflow: hidden; }
 .tl-panel input.tl-search { border: none; border-bottom: 1px solid #DDD; border-radius: 0; padding: 10px; font-family: inherit; width: 100%; box-sizing: border-box; outline: none; }
@@ -155,7 +222,7 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .tl-item.dragging { opacity: 0.5; }
 .tl-controls { display: flex; flex-direction: column; justify-content: center; gap: 10px; }
 .tl-controls .btn-primary { width: 40px; height: 40px; justify-content: center; padding: 0; font-size: 16px; }
-
+.error { background:#FFEBEE; border:1px solid #EF9A9A; color:#B71C1C; padding:10px; border-radius:6px; margin-bottom:12px; }
 @media(prefers-color-scheme:dark){
     body,html{ background-color:#121212; color:#E0E0E0; }
     #sidebar{ background-color:#424242; }
@@ -166,7 +233,7 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
     #content{ background-color:#121212; }
     .info-card{ border:1px solid #333; background-color:#1E1E1E; }
     .form-control { background: #333; border: 1px solid #444; color: #FFF; }
-    .btn-primary { background:#BB86FC; color:#000; } 
+    .btn-primary { background:#BB86FC; color:#000; }
     .btn-primary:hover { background:#A370F7; }
     .form-group { border-bottom: 1px solid #333; }
     .help-text { color: #AAA; }
@@ -177,6 +244,7 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
     .tl-item { background: #2A2A2A; border-color: #333; color: #E0E0E0; }
     .tl-item:hover { background: #333; }
     .tl-item.selected { background: #BB86FC; color: #000; border-color: #A370F7; }
+    .error { background:#3B1515; border-color:#6D2A2A; color:#FFCDD2; }
 }
 </style>
 </head>
@@ -206,74 +274,63 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 </div>
 <div id="content" onclick="closeSidebarOnContentClick()">
     <div class="header-actions">
-        <h1>New Message</h1>
+        <h1>Edit Message</h1>
     </div>
 
     <div class="info-card">
+        <?php if ($error): ?><div class="error"><?= h($error) ?></div><?php endif; ?>
         <form method="POST">
-            
+            <input type="hidden" name="msgid" value="<?= h($message['messageid'] ?? $msgid) ?>">
+
             <div class="form-group">
                 <label class="main-label" for="name">Name</label>
                 <p class="help-text">Enter the name of the message. It will be shown in the interface, and may show up on certain endpoints.</p>
-                <input type="text" name="name" id="name" class="form-control" required>
+                <input type="text" name="name" id="name" class="form-control" value="<?= h($message['name'] ?? '') ?>" required>
             </div>
 
-            <div class="form-group">
-                <label class="main-label">Message Type</label>
-                <p class="help-text">Select the type of message</p>
-                <div class="radio-group">
-                    <label>
-                        <input type="radio" name="type" value="text+audio" onchange="toggleFields()" required> Audio & visual message (audio+text)
-                    </label>
-                    <label>
-                        <input type="radio" name="type" value="audio" onchange="toggleFields()"> Audio message (audio)
-                    </label>
-                    <label>
-                        <input type="radio" name="type" value="text" onchange="toggleFields()"> Visual message (text)
-                    </label>
-                </div>
-            </div>
-
-            <div id="visual-fields" style="display:none;">
+            <?php if ($showVisualFields): ?>
+            <div id="visual-fields">
                 <div class="form-group">
                     <label class="main-label" for="shortmessage">Short Message</label>
                     <p class="help-text">Enter the short text message. Usually shown on previews and on wall-mounted devices. This should be brief. You can use variables.</p>
-                    <input type="text" name="shortmessage" id="shortmessage" class="form-control">
+                    <input type="text" name="shortmessage" id="shortmessage" class="form-control" value="<?= h($message['shortmessage'] ?? '') ?>">
                 </div>
-                
+
                 <div class="form-group">
                     <label class="main-label" for="longmessage">Long Message</label>
                     <p class="help-text">Enter the long text message. Usually shown on apps, and in a "more details" section. This should contain as much information as a user would need to know about the situation or incident associated with the message.</p>
-                    <textarea name="longmessage" id="longmessage" class="form-control textarea-long" rows="7" wrap="soft"></textarea>
+                    <textarea name="longmessage" id="longmessage" class="form-control textarea-long" rows="7" wrap="soft"><?= h($message['longmessage'] ?? '') ?></textarea>
                 </div>
 
                 <div class="form-group">
                     <label class="main-label">Color</label>
                     <p class="help-text">Certain endpoints can show a color-coded message.</p>
                     <div class="color-picker-container">
-                        <input type="color" id="colorPicker" value="#000000" class="color-picker-input">
-                        <input type="text" name="color" id="colorHex" class="form-control" style="width: 150px;" placeholder="000000" maxlength="6">
+                        <input type="color" id="colorPicker" value="<?= h($colorPickerValue) ?>" class="color-picker-input">
+                        <input type="text" name="color" id="colorHex" class="form-control" style="width: 150px;" placeholder="000000" maxlength="6" value="<?= h($colorValue) ?>">
                     </div>
                 </div>
             </div>
+            <?php endif; ?>
 
-            <div id="audio-fields" style="display:none;" class="form-group">
+            <?php if ($showAudioFields): ?>
+            <div id="audio-fields" class="form-group">
                 <label class="main-label">Audio</label>
                 <p class="help-text">Select audio files to include in this message. The files will play in the order listed in the selected column. You can click to select and use buttons, or drag and drop to move and reorder.</p>
-                
+
                 <div class="transfer-list-container">
                     <div class="tl-panel">
                         <div class="tl-header">Available Files</div>
                         <input type="text" id="audioSearch" class="tl-search" placeholder="Search files..." onkeyup="filterAudio()">
                         <div class="tl-list" id="availableAudioList" ondrop="dropToAvailable(event)" ondragover="allowDrop(event)">
                             <?php foreach($availableAudioFiles as $file): ?>
-                                <div class="tl-item" draggable="true" ondragstart="dragStart(event)" onclick="selectItem(this)" data-value="<?= htmlspecialchars($file) ?>">
-                                    <?= htmlspecialchars($file) ?>
+                                <div class="tl-item" draggable="true" ondragstart="dragStart(event)" onclick="selectItem(this)" data-value="<?= h($file) ?>">
+                                    <?= h($file) ?>
                                 </div>
                             <?php endforeach; ?>
                         </div>
                     </div>
-                    
+
                     <div class="tl-controls">
                         <button type="button" class="btn-primary" onclick="moveRight()" title="Move Selected Right"><i class="fa-solid fa-angle-right"></i></button>
                         <button type="button" class="btn-primary" onclick="moveLeft()" title="Move Selected Left"><i class="fa-solid fa-angle-left"></i></button>
@@ -284,64 +341,47 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
                     <div class="tl-panel">
                         <div class="tl-header">Selected Files (In Order)</div>
                         <div class="tl-list" id="selectedAudioList" ondrop="dropToSelected(event)" ondragover="allowDrop(event)">
+                            <?php foreach($selectedAudioFiles as $file): ?>
+                                <div class="tl-item" draggable="true" ondragstart="dragStart(event)" onclick="selectItem(this)" data-value="<?= h($file) ?>">
+                                    <?= h($file) ?><input type="hidden" name="audio_files[]" value="<?= h($file) ?>">
+                                </div>
+                            <?php endforeach; ?>
                         </div>
                     </div>
                 </div>
-
             </div>
+            <?php endif; ?>
 
             <div class="form-group">
                 <label class="main-label" for="expires">Expiration</label>
                 <p class="help-text">Use 30m or 15m, msg=3 or msg=3.4, or manual for no automatic expiration.</p>
-                <input type="text" name="expires" id="expires" class="form-control" value="manual">
+                <input type="text" name="expires" id="expires" class="form-control" value="<?= h($message['expires'] ?? 'manual') ?>">
             </div>
 
             <div style="margin-top: 20px;">
-                <button type="submit" class="btn-primary">Create Message</button>
+                <button type="submit" class="btn-primary">Save Message</button>
                 <a href="/messages" style="margin-left:10px; color:#777; text-decoration:none;">Cancel</a>
             </div>
         </form>
     </div>
 </div>
 <script>
-function toggleFields() {
-    const typeRadios = document.getElementsByName('type');
-    let selectedType = '';
-    for (let i = 0; i < typeRadios.length; i++) {
-        if (typeRadios[i].checked) {
-            selectedType = typeRadios[i].value;
-            break;
-        }
-    }
-
-    const visualFields = document.getElementById('visual-fields');
-    const audioFields = document.getElementById('audio-fields');
-
-    visualFields.style.display = 'none';
-    audioFields.style.display = 'none';
-
-    if (selectedType === 'text' || selectedType === 'text+audio') {
-        visualFields.style.display = 'block';
-    }
-    if (selectedType === 'audio' || selectedType === 'text+audio') {
-        audioFields.style.display = 'block';
-    }
-}
-
 const colorPicker = document.getElementById('colorPicker');
 const colorHex = document.getElementById('colorHex');
 
-colorPicker.addEventListener('input', function() {
-    colorHex.value = this.value.substring(1).toUpperCase();
-});
+if (colorPicker && colorHex) {
+    colorPicker.addEventListener('input', function() {
+        colorHex.value = this.value.substring(1).toUpperCase();
+    });
 
-colorHex.addEventListener('input', function() {
-    let val = this.value.replace(/[^A-Fa-f0-9]/g, '');
-    this.value = val;
-    if (val.length === 6) {
-        colorPicker.value = '#' + val;
-    }
-});
+    colorHex.addEventListener('input', function() {
+        let val = this.value.replace(/[^A-Fa-f0-9]/g, '');
+        this.value = val.toUpperCase();
+        if (val.length === 6) {
+            colorPicker.value = '#' + val;
+        }
+    });
+}
 
 let draggedItem = null;
 
@@ -352,8 +392,11 @@ function selectItem(el) {
 }
 
 function filterAudio() {
-    const search = document.getElementById('audioSearch').value.toLowerCase();
-    const items = document.getElementById('availableAudioList').querySelectorAll('.tl-item');
+    const searchInput = document.getElementById('audioSearch');
+    const list = document.getElementById('availableAudioList');
+    if (!searchInput || !list) return;
+    const search = searchInput.value.toLowerCase();
+    const items = list.querySelectorAll('.tl-item');
     items.forEach(item => {
         if (item.innerText.toLowerCase().includes(search)) {
             item.style.display = '';
@@ -454,7 +497,7 @@ function dropToSelected(e) {
 
     const list = document.getElementById('selectedAudioList');
     const afterElement = getDragAfterElement(list, e.clientY);
-    
+
     if (afterElement == null) {
         list.appendChild(draggedItem);
     } else {

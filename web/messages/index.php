@@ -6,7 +6,8 @@ ini_set('error_log', '/tmp/php-debug.log');
 error_reporting(E_ALL);
 
 session_start();
-require_once '/var/www/html/config.php';
+require_once __DIR__ . '/../config.php';
+require_once __DIR__ . '/../includes/sidebar-brand.php';
 
 if (!isset($_SESSION['user_id'])) {
     header("Location: /");
@@ -16,6 +17,11 @@ if (!isset($_SESSION['user_id'])) {
 $stmt = $pdo->prepare("SELECT role FROM users WHERE id = :id LIMIT 1");
 $stmt->execute(['id' => $_SESSION['user_id']]);
 $userRole = $stmt->fetchColumn();
+$isReceiver = ($userRole === 'receiver' || $userRole === 'tempreceiver');
+if ($isReceiver) {
+    header("Location: /dashboard.php");
+    exit;
+}
 $isAdmin = ($userRole === 'admin' || $userRole === 'tempadmin');
 
 if (isset($_GET['delete_msgid']) && $isAdmin) {
@@ -38,8 +44,6 @@ $show_online_docs = $settings['show_online_docs'] ?? '1';
 $stmt = $pdo->query("SELECT messageid, name, type FROM messages ORDER BY name ASC");
 $messages = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-$stmt = $pdo->query("SELECT path, webpath, webroles, webinterface, webname, webicon FROM enabledmodules WHERE status = 1 ORDER BY path ASC");
-$modules = $stmt->fetchAll(PDO::FETCH_ASSOC);
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -51,6 +55,7 @@ $modules = $stmt->fetchAll(PDO::FETCH_ASSOC);
 <link rel="icon" href="<?= htmlspecialchars($favicon) ?>" type="image/x-icon">
 <?php endif; ?>
 <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet" />
+<link href="/assets/sidebar-brand.css" rel="stylesheet" />
 <style>
 body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:300; background-color:#FFF; height:100%; }
 #sidebar { width:220px; background-color:#1976D2; color:#FFF; height:100vh; position:fixed; top:0; left:0; display:flex; flex-direction:column; box-shadow:2px 0 8px rgba(0,0,0,0.2); transition:transform 0.3s ease; z-index:1200; }
@@ -90,9 +95,11 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 .header-actions { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
 .btn-primary { background:#1976D2; color:#FFF; border:none; padding:10px 16px; border-radius:6px; font-size:14px; cursor:pointer; text-decoration:none; display:inline-flex; align-items:center; }
 .btn-primary:hover { background:#1565C0; }
+.btn-custom-send { background:#2E7D32; color:#FFF; border:none; padding:10px 16px; border-radius:6px; font-size:14px; cursor:pointer; text-decoration:none; display:inline-flex; align-items:center; }
+.btn-custom-send:hover { background:#1B5E20; }
 .btn-send { background:#2E7D32; color:#FFF; border:none; padding:8px 12px; border-radius:4px; font-size:13px; cursor:pointer; text-decoration:none; }
 .btn-send:hover { background:#1B5E20; }
-@media(prefers-color-scheme:dark){ .btn-primary { background:#BB86FC; color:#000; } .btn-primary:hover { background:#A370F7; } }
+@media(prefers-color-scheme:dark){ .btn-primary { background:#BB86FC; color:#000; } .btn-primary:hover { background:#A370F7; } .btn-custom-send { background:#81C784; color:#000; } .btn-custom-send:hover { background:#66BB6A; } }
 .msg-type { font-size: 0.8em; color: #777; font-weight: 400; display: block; }
 .dropdown { position: relative; display: inline-block; }
 .dropbtn { background: none; border: none; font-size: 1.2em; cursor: pointer; color: #777; padding: 5px 10px; }
@@ -111,24 +118,17 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 <body>
 <div id="mobile-header">
     <span class="hamburger" onclick="toggleSidebar()"><i class="fa-solid fa-bars"></i></span>
-    <h2><?= htmlspecialchars($product_name) ?></h2>
+    <?= ops_sidebar_brand_html($settings, $product_name) ?>
 </div>
 <div id="overlay" onclick="closeSidebar()"></div>
 <div id="sidebar">
-    <h2><?= htmlspecialchars($product_name) ?></h2>
+    <?= ops_sidebar_brand_html($settings, $product_name) ?>
     <a href="/dashboard.php"><i class="fa-solid fa-house"></i> Dashboard</a>
-    <a href="/paging.php"><i class="fa-solid fa-bullhorn"></i> Paging</a>
+    <a href="/paging"><i class="fa-solid fa-bullhorn"></i> Paging</a>
     <a href="/messages" class="active"><i class="fa-solid fa-message"></i> Messages</a>
-    <a href="/history.php"><i class="fa-solid fa-clock-rotate-left"></i> History</a>
-    <?php foreach ($modules as $mod):
-        if ($mod['webinterface'] != 1) continue;
-        $allowedRoles = array_map('trim', explode(',', $mod['webroles']));
-        if (!in_array($userRole, $allowedRoles)) continue;
-    ?>
-        <a href="<?= htmlspecialchars($mod['webpath']) ?>">
-            <i class="fa-solid <?= htmlspecialchars($mod['webicon']) ?: 'fa-circle' ?>"></i> <?= htmlspecialchars($mod['webname']) ?>
-        </a>
-    <?php endforeach; ?>
+    <a href="/history"><i class="fa-solid fa-clock-rotate-left"></i> History</a>
+    <a href="/bells"><i class="fa-solid fa-bell"></i> Bells</a>
+    <a href="/assets/"><i class="fa-solid fa-folder-open"></i> Assets</a>
     <?php if ($isAdmin): ?>
       <a href="/admin/manage-users.php" class="admin-only"><i class="fa-solid fa-users-cog"></i> Manage Users</a>
       <a href="/admin/manage-endpoints.php" class="admin-only"><i class="fa-solid fa-shapes"></i> Manage Endpoints</a>
@@ -144,9 +144,12 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 <div id="content" onclick="closeSidebarOnContentClick()">
     <div class="header-actions">
         <h1>Messages</h1>
+        <div style="display:flex; gap:10px; align-items:center;">
+        <a href="/messages/custom.php" class="btn-custom-send"><i class="fa-solid fa-paper-plane" style="margin-right:8px;"></i> Send Custom Message</a>
         <?php if ($isAdmin): ?>
         <a href="/messages/new.php" class="btn-primary"><i class="fa-solid fa-plus" style="margin-right:8px;"></i> New Message</a>
         <?php endif; ?>
+        </div>
     </div>
 
     <div class="info-card">

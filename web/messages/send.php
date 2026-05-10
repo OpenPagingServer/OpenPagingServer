@@ -5,36 +5,53 @@ ini_set('log_errors', 1);
 ini_set('error_log', '/tmp/php-debug.log');
 error_reporting(E_ALL);
 session_start();
-require_once '/var/www/html/config.php';
+require_once __DIR__ . '/../config.php';
+require_once __DIR__ . '/../includes/sidebar-brand.php';
+require_once __DIR__ . '/broadcast_helpers.php';
 
 if (!isset($_SESSION['user_id'])) {
     header("Location: /");
     exit;
 }
 
-$stmt = $pdo->prepare("SELECT role FROM users WHERE id = :id LIMIT 1");
+$stmt = $pdo->prepare("SELECT role, username FROM users WHERE id = :id LIMIT 1");
 $stmt->execute(['id' => $_SESSION['user_id']]);
-$userRole = $stmt->fetchColumn();
+$user = $stmt->fetch(PDO::FETCH_ASSOC);
+$userRole = $user['role'] ?? '';
+$isReceiver = ($userRole === 'receiver' || $userRole === 'tempreceiver');
+if ($isReceiver) {
+    header("Location: /dashboard.php");
+    exit;
+}
+$sender = $user['username'] ?? ($_SESSION['username'] ?? 'User');
 $isAdmin = ($userRole === 'admin' || $userRole === 'tempadmin');
+$sendError = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['msgid'])) {
-    $msgid_post = escapeshellarg($_POST['msgid']);
+    $messageId = (string)$_POST['msgid'];
     
     if (isset($_POST['send_all'])) {
         $targets = '0';
     } else {
         if (!empty($_POST['groups']) && is_array($_POST['groups'])) {
             $clean_groups = array_map('intval', $_POST['groups']);
-            $targets = escapeshellarg(implode('.', $clean_groups));
+            $targets = implode('.', $clean_groups);
         } else {
             header("Location: /messages/send.php?msgid=" . urlencode($_POST['msgid']));
             exit;
         }
     }
     
-    exec("nohup /usr/bin/python3 /opt/openpagingserver/sendmsgd.py $targets $msgid_post > /dev/null 2>&1 &");
-    header("Location: /messages");
-    exit;
+    try {
+        message_create_broadcast_from_template($pdo, $messageId, $targets, $sender);
+    } catch (Throwable $e) {
+        $sendError = "Failed to send message: " . $e->getMessage();
+        error_log("Failed to create broadcast from message template {$messageId}: " . $e->getMessage());
+    }
+    if ($sendError === '') {
+        header("Location: /messages");
+        exit;
+    }
 }
 
 if (!isset($_GET['msgid'])) {
@@ -65,8 +82,6 @@ $product_name = $settings['product_name'] ?? 'Open Paging Server';
 $favicon = $settings['favicon'] ?? '';
 $show_online_docs = $settings['show_online_docs'] ?? '1';
 
-$stmt = $pdo->query("SELECT path, webpath, webroles, webinterface, webname, webicon FROM enabledmodules WHERE status = 1 ORDER BY path ASC");
-$modules = $stmt->fetchAll(PDO::FETCH_ASSOC);
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -78,6 +93,7 @@ $modules = $stmt->fetchAll(PDO::FETCH_ASSOC);
 <link rel="icon" href="<?= htmlspecialchars($favicon) ?>" type="image/x-icon">
 <?php endif; ?>
 <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet" />
+<link href="/assets/sidebar-brand.css" rel="stylesheet" />
 <style>
 body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:300; background-color:#FFF; height:100%; }
 #sidebar { width:220px; background-color:#1976D2; color:#FFF; height:100vh; position:fixed; top:0; left:0; display:flex; flex-direction:column; box-shadow:2px 0 8px rgba(0,0,0,0.2); transition:transform 0.3s ease; z-index:1200; }
@@ -149,24 +165,17 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 <body>
 <div id="mobile-header">
     <span class="hamburger" onclick="toggleSidebar()"><i class="fa-solid fa-bars"></i></span>
-    <h2><?= htmlspecialchars($product_name) ?></h2>
+    <?= ops_sidebar_brand_html($settings, $product_name) ?>
 </div>
 <div id="overlay" onclick="closeSidebar()"></div>
 <div id="sidebar">
-    <h2><?= htmlspecialchars($product_name) ?></h2>
+    <?= ops_sidebar_brand_html($settings, $product_name) ?>
     <a href="/dashboard.php"><i class="fa-solid fa-house"></i> Dashboard</a>
-    <a href="/paging.php"><i class="fa-solid fa-bullhorn"></i> Paging</a>
+    <a href="/paging"><i class="fa-solid fa-bullhorn"></i> Paging</a>
     <a href="/messages" class="active"><i class="fa-solid fa-message"></i> Messages</a>
-    <a href="/history.php"><i class="fa-solid fa-clock-rotate-left"></i> History</a>
-    <?php foreach ($modules as $mod):
-        if ($mod['webinterface'] != 1) continue;
-        $allowedRoles = array_map('trim', explode(',', $mod['webroles']));
-        if (!in_array($userRole, $allowedRoles)) continue;
-    ?>
-        <a href="<?= htmlspecialchars($mod['webpath']) ?>">
-            <i class="fa-solid <?= htmlspecialchars($mod['webicon']) ?: 'fa-circle' ?>"></i> <?= htmlspecialchars($mod['webname']) ?>
-        </a>
-    <?php endforeach; ?>
+    <a href="/history"><i class="fa-solid fa-clock-rotate-left"></i> History</a>
+    <a href="/bells"><i class="fa-solid fa-bell"></i> Bells</a>
+    <a href="/assets/"><i class="fa-solid fa-folder-open"></i> Assets</a>
     <?php if ($isAdmin): ?>
       <a href="/admin/manage-users.php" class="admin-only"><i class="fa-solid fa-users-cog"></i> Manage Users</a>
       <a href="/admin/manage-endpoints.php" class="admin-only"><i class="fa-solid fa-shapes"></i> Manage Endpoints</a>
@@ -183,6 +192,11 @@ body,html{ background-color:#121212; color:#E0E0E0; }
     <div class="header-actions">
         <h1>Sending <?= htmlspecialchars($messageName) ?></h1>
     </div>
+    <?php if ($sendError !== ''): ?>
+        <div class="info-card" style="border-color:#C62828;color:#C62828;">
+            <?= htmlspecialchars($sendError) ?>
+        </div>
+    <?php endif; ?>
 
     <form action="/messages/send.php?msgid=<?= urlencode($msgid) ?>" method="POST" id="sendForm">
         <input type="hidden" name="msgid" value="<?= htmlspecialchars($msgid) ?>">
