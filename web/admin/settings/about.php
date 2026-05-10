@@ -6,7 +6,8 @@ ini_set('error_log', '/tmp/php-debug.log');
 error_reporting(E_ALL);
 
 session_start();
-require_once '/var/www/html/config.php';
+require_once __DIR__ . '/../../config.php';
+require_once __DIR__ . '/../../includes/sidebar-brand.php';
 
 $is_insecure = (!isset($_SERVER['HTTPS']) || $_SERVER['HTTPS'] !== 'on');
 if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
@@ -21,6 +22,11 @@ if (!isset($_SESSION['user_id'])) {
 $stmt = $pdo->prepare("SELECT role FROM users WHERE id = :id LIMIT 1");
 $stmt->execute(['id' => $_SESSION['user_id']]);
 $userRole = $stmt->fetchColumn();
+$isReceiver = ($userRole === 'receiver' || $userRole === 'tempreceiver');
+if ($isReceiver) {
+    header("Location: /dashboard.php");
+    exit;
+}
 $isAdmin = ($userRole === 'admin' || $userRole === 'tempadmin');
 if (!$isAdmin) {
     http_response_code(403);
@@ -30,8 +36,6 @@ if (!$isAdmin) {
 }
 $username = $_SESSION['username'] ?? 'User';
 
-$stmt = $pdo->query("SELECT path, webpath, webroles, webinterface, webname, webicon FROM enabledmodules WHERE status = 1 ORDER BY path ASC");
-$modules = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 $stmt = $pdo->query("SELECT parameter, value FROM systemsettings");
 $settings = [];
@@ -137,6 +141,7 @@ $applicationVersion = get_application_version();
 <link rel="icon" href="<?= htmlspecialchars($favicon) ?>" type="image/x-icon">
 <?php endif; ?>
 <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet" />
+<link href="/assets/sidebar-brand.css" rel="stylesheet" />
 <style>
 body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:300; background-color:#FFF; height:100%; }
 strong { font-weight:700; }
@@ -204,33 +209,22 @@ h2,h3{ color:#BB86FC; }
 <body>
 <div id="mobile-header">
     <span class="hamburger" onclick="toggleSidebar()"><i class="fa-solid fa-bars"></i></span>
-    <h2><?= htmlspecialchars($product_name) ?></h2>
+    <?= ops_sidebar_brand_html($settings, $product_name) ?>
 </div>
 <div id="overlay" onclick="closeSidebar()"></div>
 <div id="sidebar">
-    <h2><?= htmlspecialchars($product_name) ?></h2>
+    <?= ops_sidebar_brand_html($settings, $product_name) ?>
     <a href="/dashboard.php"><i class="fa-solid fa-house"></i> Dashboard</a>
-    <a href="/paging.php"><i class="fa-solid fa-bullhorn"></i> Paging</a>
+    <a href="/paging"><i class="fa-solid fa-bullhorn"></i> Paging</a>
     <a href="/messages"><i class="fa-solid fa-message"></i> Messages</a>
-    <a href="/history.php"><i class="fa-solid fa-clock-rotate-left"></i> History</a>
-
-    <?php foreach ($modules as $mod):
-        if ($mod['webinterface'] != 1) continue;
-        $allowedRoles = array_map('trim', explode(',', $mod['webroles']));
-        if (!in_array($userRole, $allowedRoles)) continue;
-        $link = htmlspecialchars($mod['webpath']);
-        $name = htmlspecialchars($mod['webname']);
-        $icon = htmlspecialchars($mod['webicon']) ?: 'fa-circle';
-    ?>
-        <a href="<?php echo $link; ?>">
-            <i class="fa-solid <?php echo $icon; ?>"></i> <?php echo $name; ?>
-        </a>
-    <?php endforeach; ?>
+    <a href="/history"><i class="fa-solid fa-clock-rotate-left"></i> History</a>
+    <a href="/bells"><i class="fa-solid fa-bell"></i> Bells</a>
+    <a href="/assets/"><i class="fa-solid fa-folder-open"></i> Assets</a>
 
     <?php if ($isAdmin): ?>
       <a href="/admin/manage-users.php" class="admin-only"><i class="fa-solid fa-users-cog"></i> Manage Users</a>
       <a href="/admin/manage-endpoints.php" class="admin-only"><i class="fa-solid fa-shapes"></i> Manage Endpoints</a>
-      <a href="/admim/manage-groups.php"><i class="fa-solid fa-user-group"></i> Manage Groups</a>
+      <a href="/admin/manage-groups.php"><i class="fa-solid fa-user-group"></i> Manage Groups</a>
       <a href="/admin/settings/general.php" class="active admin-only"><i class="fa-solid fa-cogs"></i> Server Settings</a>
     <?php endif; ?>
     
@@ -268,7 +262,7 @@ h2,h3{ color:#BB86FC; }
             <img src="/assets/OPENPAGINGSERVER-768x576-LIGHTMODE.png" class="server-image">
         </picture>
         <p>Open Paging Server<?php if ($applicationVersion !== ''): ?> <?php echo htmlspecialchars($applicationVersion); ?><?php endif; ?></p>
-		<p>Open Paging Server is licensed under the GNU General Public License v2.0. Third-party components, modules, and software used by Open Paging Server are subject to their own licenses.</p>
+        <p>Open Paging Server is licensed under the GNU General Public License v2.0. Third-party components, modules, and software used by Open Paging Server are subject to their own licenses.</p>
         <p>Open Paging Server is provided "as is" without any warranties, express or implied, including but not limited to fitness for a particular purpose or non-infringement.</p>
         <p></p>
         <div class="info-card">

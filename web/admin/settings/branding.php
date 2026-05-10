@@ -6,7 +6,8 @@ ini_set('error_log', '/tmp/php-debug.log');
 error_reporting(E_ALL);
 
 session_start();
-require_once '/var/www/html/config.php';
+require_once __DIR__ . '/../../config.php';
+require_once __DIR__ . '/../../includes/sidebar-brand.php';
 
 $is_insecure = (!isset($_SERVER['HTTPS']) || $_SERVER['HTTPS'] !== 'on');
 if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
@@ -23,6 +24,11 @@ $stmt->execute(['id' => $_SESSION['user_id']]);
 $userData = $stmt->fetch(PDO::FETCH_ASSOC);
 
 $userRole = $userData['role'];
+$isReceiver = ($userRole === 'receiver' || $userRole === 'tempreceiver');
+if ($isReceiver) {
+    header("Location: /dashboard.php");
+    exit;
+}
 $adminPerms = explode(',', $userData['adminperm'] ?? '');
 $adminPerms = array_map('trim', $adminPerms);
 
@@ -38,8 +44,6 @@ if (!$hasPermission) {
 
 $username = $_SESSION['username'] ?? 'User';
 
-$stmt = $pdo->query("SELECT path, webpath, webroles, webinterface, webname, webicon FROM enabledmodules WHERE status = 1 ORDER BY path ASC");
-$modules = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 $stmt = $pdo->query("SELECT parameter, value FROM systemsettings");
 $settings = [];
@@ -50,12 +54,41 @@ foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
 $product_name = $settings['product_name'] ?? 'Open Paging Server';
 $favicon = $settings['favicon'] ?? '';
 $show_online_docs = $settings['show_online_docs'] ?? '1';
+$use_logo_in_sidebar = $settings['use_logo_in_sidebar'] ?? '1';
+$sidebar_logo_light = $settings['sidebar_logo_light'] ?? '/assets/OPENPAGINGSERVER-768x576-LIGHTMODE.png';
+$sidebar_logo_dark = $settings['sidebar_logo_dark'] ?? '/assets/OPENPAGINGSERVER-768x576-DARKMODE.png';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_branding_settings'])) {
     $new_product_name = $_POST['product_name'] ?? 'Open Paging Server';
+    $new_use_logo_in_sidebar = isset($_POST['use_logo_in_sidebar']) ? '1' : '0';
+    $new_sidebar_logo_light = trim((string)($_POST['sidebar_logo_light'] ?? '/assets/OPENPAGINGSERVER-768x576-LIGHTMODE.png'));
+    $new_sidebar_logo_dark = trim((string)($_POST['sidebar_logo_dark'] ?? '/assets/OPENPAGINGSERVER-768x576-DARKMODE.png'));
 
-    $stmt = $pdo->prepare("UPDATE systemsettings SET value = :value WHERE parameter = 'product_name'");
-    $stmt->execute(['value' => $new_product_name]);
+    $upsert = $pdo->prepare("
+        INSERT INTO systemsettings (`parameter`, `value`, `description`)
+        VALUES (:parameter, :value, :description)
+        ON DUPLICATE KEY UPDATE `value` = VALUES(`value`), `description` = VALUES(`description`)
+    ");
+    $upsert->execute([
+        'parameter' => 'product_name',
+        'value' => $new_product_name,
+        'description' => 'Name of this server.',
+    ]);
+    $upsert->execute([
+        'parameter' => 'use_logo_in_sidebar',
+        'value' => $new_use_logo_in_sidebar,
+        'description' => 'Use a logo in the sidebar, if disabled the product name will show',
+    ]);
+    $upsert->execute([
+        'parameter' => 'sidebar_logo_light',
+        'value' => $new_sidebar_logo_light,
+        'description' => 'Light mode logo for the sidebar',
+    ]);
+    $upsert->execute([
+        'parameter' => 'sidebar_logo_dark',
+        'value' => $new_sidebar_logo_dark,
+        'description' => 'Dark mode logo for the sidebar',
+    ]);
 
     if (isset($_SERVER['HTTP_X_REQUESTED_WITH']) && $_SERVER['HTTP_X_REQUESTED_WITH'] === 'XMLHttpRequest') {
         echo json_encode(['status' => 'success']);
@@ -74,6 +107,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_branding_setting
 <?php endif; ?>
 <link href="https://fonts.googleapis.com/css?family=Roboto:300,400,500,700&display=swap" rel="stylesheet" />
 <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet" />
+<link href="/assets/sidebar-brand.css" rel="stylesheet" />
 <style>
 body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:300; background-color:#FFF; height:100%; }
 strong { font-weight:700; }
@@ -139,30 +173,22 @@ h4 { color:#BB86FC; }
 <body>
 <div id="mobile-header">
     <span class="hamburger" onclick="toggleSidebar()"><i class="fa-solid fa-bars"></i></span>
-    <h2><?= htmlspecialchars($product_name) ?></h2>
+    <?= ops_sidebar_brand_html($settings, $product_name) ?>
 </div>
 <div id="overlay" onclick="closeSidebar()"></div>
 <div id="sidebar">
-    <h2><?= htmlspecialchars($product_name) ?></h2>
+    <?= ops_sidebar_brand_html($settings, $product_name) ?>
     <a href="/dashboard.php"><i class="fa-solid fa-house"></i> Dashboard</a>
-    <a href="/paging.php"><i class="fa-solid fa-bullhorn"></i> Paging</a>
+    <a href="/paging"><i class="fa-solid fa-bullhorn"></i> Paging</a>
     <a href="/messages"><i class="fa-solid fa-message"></i> Messages</a>
-    <a href="/history.php"><i class="fa-solid fa-clock-rotate-left"></i> History</a>
-
-    <?php foreach ($modules as $mod):
-        if ($mod['webinterface'] != 1) continue;
-        $allowedRoles = array_map('trim', explode(',', $mod['webroles']));
-        if (!in_array($userRole, $allowedRoles)) continue;
-    ?>
-        <a href="<?= htmlspecialchars($mod['webpath']) ?>">
-            <i class="fa-solid <?= htmlspecialchars($mod['webicon']) ?: 'fa-circle' ?>"></i> <?= htmlspecialchars($mod['webname']) ?>
-        </a>
-    <?php endforeach; ?>
+    <a href="/history"><i class="fa-solid fa-clock-rotate-left"></i> History</a>
+    <a href="/bells"><i class="fa-solid fa-bell"></i> Bells</a>
+    <a href="/assets/"><i class="fa-solid fa-folder-open"></i> Assets</a>
 
     <?php if ($isAdmin): ?>
       <a href="/admin/manage-users.php" class="admin-only"><i class="fa-solid fa-users-cog"></i> Manage Users</a>
       <a href="/admin/manage-endpoints.php" class="admin-only"><i class="fa-solid fa-shapes"></i> Manage Endpoints</a>
-      <a href="/admim/manage-groups.php"><i class="fa-solid fa-user-group"></i> Manage Groups</a>
+      <a href="/admin/manage-groups.php"><i class="fa-solid fa-user-group"></i> Manage Groups</a>
       <a href="/admin/settings/general.php" class="active admin-only"><i class="fa-solid fa-cogs"></i> Server Settings</a>
     <?php endif; ?>
     
@@ -201,6 +227,25 @@ h4 { color:#BB86FC; }
                     <h4>Product Name</h4>
                     <p>This displays throughout the various user interfaces of Open Paging Server. You can set a name to relfect your facility.</p>
                     <input type="text" name="product_name" value="<?= htmlspecialchars($product_name) ?>">
+                </div>
+
+                <div style="margin-bottom:16px;">
+                    <h4>Sidebar Logo</h4>
+                    <p>When enabled, the sidebar uses the configured logo paths instead of the product name.</p>
+                    <label style="display:flex; gap:8px; align-items:center; margin-bottom:12px;">
+                        <input type="checkbox" name="use_logo_in_sidebar" value="1" <?= ops_sidebar_truthy($use_logo_in_sidebar) ? 'checked' : '' ?> style="width:auto;">
+                        <span>Use logo in sidebar</span>
+                    </label>
+                    <div style="display:grid; gap:12px;">
+                        <div>
+                            <h4 style="font-size:1em;">Light Mode Sidebar Logo</h4>
+                            <input type="text" name="sidebar_logo_light" value="<?= htmlspecialchars($sidebar_logo_light) ?>">
+                        </div>
+                        <div>
+                            <h4 style="font-size:1em;">Dark Mode Sidebar Logo</h4>
+                            <input type="text" name="sidebar_logo_dark" value="<?= htmlspecialchars($sidebar_logo_dark) ?>">
+                        </div>
+                    </div>
                 </div>
 
                 <input type="hidden" name="save_branding_settings" value="1">

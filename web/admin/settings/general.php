@@ -6,7 +6,8 @@ ini_set('error_log', '/tmp/php-debug.log');
 error_reporting(E_ALL);
 
 session_start();
-require_once '/var/www/html/config.php';
+require_once __DIR__ . '/../../config.php';
+require_once __DIR__ . '/../../includes/sidebar-brand.php';
 
 if (!isset($_SESSION['user_id'])) {
     header("Location: /");
@@ -16,6 +17,11 @@ if (!isset($_SESSION['user_id'])) {
 $stmt = $pdo->prepare("SELECT role FROM users WHERE id = :id LIMIT 1");
 $stmt->execute(['id' => $_SESSION['user_id']]);
 $userRole = $stmt->fetchColumn();
+$isReceiver = ($userRole === 'receiver' || $userRole === 'tempreceiver');
+if ($isReceiver) {
+    header("Location: /dashboard.php");
+    exit;
+}
 $isAdmin = ($userRole === 'admin' || $userRole === 'tempadmin');
 if (!$isAdmin) {
     http_response_code(403);
@@ -33,11 +39,31 @@ foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
 $product_name = $settings['product_name'] ?? 'Open Paging Server';
 $favicon = $settings['favicon'] ?? '';
 $show_online_docs = $settings['show_online_docs'] ?? '1';
+$analytics_enabled = $settings['analytics'] ?? '0';
+
+function save_system_setting(PDO $pdo, string $parameter, string $value, string $description): void
+{
+    $stmt = $pdo->prepare("
+        INSERT INTO systemsettings (`parameter`, `value`, `description`)
+        VALUES (:parameter, :value, :description)
+        ON DUPLICATE KEY UPDATE
+            `value` = VALUES(`value`),
+            `description` = VALUES(`description`)
+    ");
+    $stmt->execute([
+        'parameter' => $parameter,
+        'value' => $value,
+        'description' => $description,
+    ]);
+}
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_general_settings'])) {
     $docs_enabled = isset($_POST['show_online_docs']) ? '1' : '0';
-    $stmt = $pdo->prepare("UPDATE systemsettings SET value = :value WHERE parameter = 'show_online_docs'");
-    $stmt->execute(['value' => $docs_enabled]);
+    $analytics_enabled = isset($_POST['analytics']) ? '1' : '0';
+
+    save_system_setting($pdo, 'show_online_docs', $docs_enabled, 'Show GUI links to docs.openpagingserver.org (0/1)');
+    save_system_setting($pdo, 'analytics', $analytics_enabled, 'To help the Open Paging Server project improve, you can opt-in to share optional analytics. Analytics contain mainly anonymous data such as your operating system, software versions, anonymized crash logs, etc. And may include your public IP address. Privacy Policy: https://www.openpagingserver.org/privacypolicy/analytics');
+    $show_online_docs = $docs_enabled;
     
     if (isset($_SERVER['HTTP_X_REQUESTED_WITH']) && $_SERVER['HTTP_X_REQUESTED_WITH'] === 'XMLHttpRequest') {
         header('Content-Type: application/json');
@@ -47,8 +73,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_general_settings
     }
 }
 
-$stmt = $pdo->query("SELECT path, webpath, webroles, webinterface, webname, webicon FROM enabledmodules WHERE status = 1 ORDER BY path ASC");
-$modules = $stmt->fetchAll(PDO::FETCH_ASSOC);
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -60,6 +84,7 @@ $modules = $stmt->fetchAll(PDO::FETCH_ASSOC);
 <link rel="icon" href="<?= htmlspecialchars($favicon) ?>" type="image/x-icon">
 <?php endif; ?>
 <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet" />
+<link href="/assets/sidebar-brand.css" rel="stylesheet" />
 <style>
 body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:300; background-color:#FFF; height:100%; }
 #sidebar { width:220px; background-color:#1976D2; color:#FFF; height:100vh; position:fixed; top:0; left:0; display:flex; flex-direction:column; box-shadow:2px 0 8px rgba(0,0,0,0.2); transition:transform 0.3s ease; z-index:1200; }
@@ -83,6 +108,9 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .info-row { display:flex; justify-content:space-between; padding:10px 0; border-bottom:1px solid #f0f0f0; align-items: center; }
 .info-row:last-child { border-bottom:none; }
 .info-label { font-weight:500; color:#555; }
+.info-description { display:block; margin-top:4px; color:#777; font-size:0.88em; font-weight:300; line-height:1.35; }
+.info-description a { color:#1976D2; text-decoration:none; }
+.info-description a:hover { text-decoration:underline; }
 .tabs-container { margin-bottom: 20px; border-bottom: 1px solid #DDD; }
 .tabs-desktop { display: flex; gap: 10px; }
 .tab-link { padding: 10px 20px; cursor: pointer; border: 1px solid transparent; border-bottom: none; border-radius: 5px 5px 0 0; background: #f5f5f5; color: #555; transition: 0.3s; text-decoration: none; }
@@ -106,6 +134,8 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 #content{ background-color:#121212; }
 .info-card{ border:1px solid #333; background-color:#1E1E1E; }
 .info-label { color:#BBB; }
+.info-description { color:#999; }
+.info-description a { color:#BB86FC; }
 .info-row { border-bottom:1px solid #333; }
 .tabs-container { border-bottom-color: #333; }
 .tab-link { background: #333; color: #BBB; }
@@ -123,28 +153,21 @@ input:checked + .slider:before { background-color: #BB86FC; }
 <body>
 <div id="mobile-header">
     <span class="hamburger" onclick="toggleSidebar()"><i class="fa-solid fa-bars"></i></span>
-    <h2><?= htmlspecialchars($product_name) ?></h2>
+    <?= ops_sidebar_brand_html($settings, $product_name) ?>
 </div>
 <div id="overlay" onclick="closeSidebar()"></div>
 <div id="sidebar">
-    <h2><?= htmlspecialchars($product_name) ?></h2>
+    <?= ops_sidebar_brand_html($settings, $product_name) ?>
     <a href="/dashboard.php"><i class="fa-solid fa-house"></i> Dashboard</a>
     <a href="/paging"><i class="fa-solid fa-bullhorn"></i> Paging</a>
     <a href="/messages"><i class="fa-solid fa-message"></i> Messages</a>
     <a href="/history"><i class="fa-solid fa-clock-rotate-left"></i> History</a>
-    <?php foreach ($modules as $mod):
-        if ($mod['webinterface'] != 1) continue;
-        $allowedRoles = array_map('trim', explode(',', $mod['webroles']));
-        if (!in_array($userRole, $allowedRoles)) continue;
-    ?>
-        <a href="<?= htmlspecialchars($mod['webpath']) ?>">
-            <i class="fa-solid <?= htmlspecialchars($mod['webicon']) ?: 'fa-circle' ?>"></i> <?= htmlspecialchars($mod['webname']) ?>
-        </a>
-    <?php endforeach; ?>
+    <a href="/bells"><i class="fa-solid fa-bell"></i> Bells</a>
+    <a href="/assets/"><i class="fa-solid fa-folder-open"></i> Assets</a>
     <?php if ($isAdmin): ?>
       <a href="/admin/manage-users.php" class="admin-only"><i class="fa-solid fa-users-cog"></i> Manage Users</a>
       <a href="/admin/manage-endpoints.php" class="admin-only"><i class="fa-solid fa-shapes"></i> Manage Endpoints</a>
-      <a href="/admim/manage-groups.php"><i class="fa-solid fa-user-group"></i> Manage Groups</a>
+      <a href="/admin/manage-groups.php"><i class="fa-solid fa-user-group"></i> Manage Groups</a>
       <a href="/admin/settings/general.php" class="active admin-only"><i class="fa-solid fa-cogs"></i> Server Settings</a>
     <?php endif; ?>
     <?php if ($show_online_docs == '1'): ?>
@@ -164,10 +187,10 @@ input:checked + .slider:before { background-color: #BB86FC; }
             <a href="about.php" class="tab-link">About</a>
         </div>
         <select class="tabs-mobile" onchange="window.location.href=this.value">
-            <option value="general.php">General</option>
+            <option value="general.php" selected>General</option>
             <option value="login.php">Login</option>
             <option value="sip.php">SIP</option>
-            <option value="branding.php" selected>Branding</option>
+            <option value="branding.php">Branding</option>
             <option value="about.php">About</option>
         </select>
     </div>
@@ -179,6 +202,20 @@ input:checked + .slider:before { background-color: #BB86FC; }
                     <span>
                         <label class="switch">
                             <input type="checkbox" name="show_online_docs" id="docsToggle" <?= $show_online_docs === '1' ? 'checked' : '' ?>>
+                            <span class="slider"></span>
+                        </label>
+                    </span>
+                </div>
+                <div class="info-row">
+                    <span class="info-label">
+                        Send optional analytics to the Open Paging Server project
+                        <span class="info-description">
+                            To help the Open Paging Server project improve, you can opt-in to share optional analytics. Analytics contain mainly anonymous data such as your operating system, software versions, anonymized crash logs, etc. And may include your public IP address. <a href="https://www.openpagingserver.org/privacypolicy/analytics" target="_blank" rel="noopener">Privacy Policy</a>
+                        </span>
+                    </span>
+                    <span>
+                        <label class="switch">
+                            <input type="checkbox" name="analytics" id="analyticsToggle" <?= $analytics_enabled === '1' ? 'checked' : '' ?>>
                             <span class="slider"></span>
                         </label>
                     </span>
