@@ -2,7 +2,9 @@ import getpass
 import os
 import random
 import string
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import mysql.connector
@@ -39,6 +41,12 @@ def discover_endpoint_module_dirs():
     if not ENDPOINT_MODULES_DIR.is_dir():
         return []
     return sorted(path.name for path in ENDPOINT_MODULES_DIR.iterdir() if safe_endpoint_module_dir(path))
+
+
+def run_systemctl(action):
+    result = subprocess.run(["systemctl", action, "openpagingserver"], text=True)
+    if result.returncode != 0:
+        print(f"systemctl {action} openpagingserver failed with exit code {result.returncode}")
 
 
 def connect_as_admin():
@@ -241,6 +249,87 @@ def seed_defaults(cursor):
         (default_bell_schedule_id,),
     )
 
+    messages = [
+        (
+            "text+audio",
+            1,
+            "SRP HOLD",
+            "HOLD! In your room or area. Clear the halls",
+            "Hold! In your room or area. Clear the halls.",
+            "OPS-400HZ-MedPulse.wav:OPS-SRP-Hold.wav",
+            "",
+            "012463",
+            "SRP-HOLD.png",
+            None,
+            None,
+            None,
+        ),
+        (
+            "text+audio",
+            2,
+            "SRP SECURE",
+            "SECURE! Get Inside. Lock outside doors.",
+            "Secure! Get Inside. Lock outside doors.",
+            "OPS-400HZ-MedPulse.wav:OPS-SRP-Secure.wav",
+            "",
+            "0000FF",
+            "SRP-SECURE.png",
+            None,
+            None,
+            None,
+        ),
+        (
+            "text+audio",
+            3,
+            "SRP LOCKDOWN",
+            "LOCKDOWN! Locks, Lights, Out of Sight.",
+            "LOCKDOWN! Locks, Lights, Out of Sight.",
+            "OPS-400HZ-MedPulse.wav:OPS-SRP-Lockdown.wav",
+            "",
+            "FF0000",
+            "SRP-LOCKDOWN.png",
+            None,
+            None,
+            None,
+        ),
+        (
+            "text+audio",
+            4,
+            "SRP EVACUATE",
+            "EVACUATE! To your assigned aseembly point",
+            "OCCUPANTS: Evacuate to specified location, Bring your phone, Instructions may be provided about retaining or leaving belongings.  \nSTAFF: Lead evacuation to specified location, Account for occupants and staff, Notify if missing, extra or injured people",
+            "OPS-SimulatedBell-10sec.wav:OPS-SRP-Evacuate.wav",
+            "",
+            "88E788",
+            "SRP-EVACUATE.png",
+            "manual",
+            None,
+            None,
+        ),
+        (
+            "text+audio",
+            5,
+            "TEST Message",
+            "This is a test of Open Paging Server",
+            "This is a test of the Open Paging Server MNS system. No action is required.",
+            "OPS-900HZ-SlowPulse.wav:OPS-TESTING.wav",
+            "",
+            None,
+            "",
+            "15m",
+            None,
+            None,
+        ),
+    ]
+
+    cursor.executemany(
+        """
+        INSERT INTO messages (`type`, messageid, name, shortmessage, longmessage, audio, image, color, icon, expires, vendor_specific, priority)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        messages,
+    )
+
     systemsettings = [
         ("enable_insecure_sip", "1", "Enable SIP over UDP and TCP (0/1)"),
         ("enable_login_logo", "1", "Enable the logo on login page"),
@@ -322,10 +411,21 @@ try {{
 }}
 """
 
+    env_file = f"""DB_HOST='127.0.0.1'
+DB_USER='{DATABASE_USER}'
+DB_PASS={sql_string(db_password)}
+DB_NAME='{DATABASE_NAME}'
+DEBUG=false
+"""
+
     os.makedirs("/opt/OpenPagingServer/web", exist_ok=True)
     os.makedirs("/var/lib/openpagingserver/assets", exist_ok=True)
     with open("/opt/OpenPagingServer/web/config.php", "w", encoding="utf-8") as config_file:
         config_file.write(config_php)
+    with open(PROJECT_ROOT / ".env", "w", encoding="utf-8") as env_config_file:
+        env_config_file.write(env_file)
+    with open(PROJECT_ROOT / ".oobe", "w", encoding="utf-8"):
+        pass
 
 
 def main():
@@ -362,5 +462,15 @@ def main():
     print("Done.")
 
 
+def wrapped_main():
+    run_systemctl("stop")
+    time.sleep(5)
+    try:
+        main()
+    finally:
+        time.sleep(5)
+        run_systemctl("start")
+
+
 if __name__ == "__main__":
-    main()
+    wrapped_main()
