@@ -3,6 +3,7 @@
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 import importlib.util
@@ -25,6 +26,9 @@ MODULE_LOADER_PATH = BASE_DIR / "endpoint-modules" / "index.py"
 MODULES_DIR = BASE_DIR / "endpoint-modules"
 
 loaded_modules = {}
+messaged_proc = None
+livepaged_proc = None
+belld_proc = None
 
 
 class Core:
@@ -45,13 +49,7 @@ def get_db_connection():
 
 
 def db_enabled_modules():
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id FROM enabledmodules WHERE status = 1")
-            return {row[0] for row in cur.fetchall()}
-    finally:
-        conn.close()
+    return set()
 
 
 def discover_modules():
@@ -130,18 +128,44 @@ if endpoint_manager and hasattr(endpoint_manager, "init"):
 
 
 def shutdown(sig, frame):
+    global messaged_proc, livepaged_proc, belld_proc
     if endpoint_manager and hasattr(endpoint_manager, "shutdown_all"):
         endpoint_manager.shutdown_all()
 
     for mid in list(loaded_modules.keys()):
         unload_module(mid)
 
+    if messaged_proc:
+        messaged_proc.terminate()
+
+    if livepaged_proc:
+        livepaged_proc.terminate()
+
+    if belld_proc:
+        belld_proc.terminate()
+
     sys.exit(0)
 
 
 def main():
+    global messaged_proc, livepaged_proc, belld_proc
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
+
+    messaged_path = BASE_DIR / "messaged.py"
+    if messaged_path.exists():
+        messaged_proc = subprocess.Popen([sys.executable, str(messaged_path)], cwd=BASE_DIR)
+        core.log(f"message worker started pid={messaged_proc.pid}")
+
+    livepaged_path = BASE_DIR / "livepaged.py"
+    if livepaged_path.exists():
+        livepaged_proc = subprocess.Popen([sys.executable, str(livepaged_path)], cwd=BASE_DIR)
+        core.log(f"live paging websocket worker started pid={livepaged_proc.pid}")
+
+    belld_path = BASE_DIR / "belld.py"
+    if belld_path.exists():
+        belld_proc = subprocess.Popen([sys.executable, str(belld_path)], cwd=BASE_DIR)
+        core.log(f"bell scheduler worker started pid={belld_proc.pid}")
 
     sip_server.start()
     core.log("SIP server started")
