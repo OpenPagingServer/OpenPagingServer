@@ -19,7 +19,8 @@ $separate_dark_logo = false;
 $enable_login_logo = false;
 
 try {
-    require_once 'config.php';
+    require_once __DIR__ . '/config.php';
+
     if (!isset($pdo)) {
         throw new Exception('PDO not set in config.php');
     }
@@ -38,6 +39,15 @@ try {
     $login_logo_dark = $settings['login_logo_dark'] ?? '';
     $favicon = $settings['favicon'] ?? '';
 
+    $oobeTrigger = dirname(__DIR__) . '/.oobe';
+
+    if (is_file($oobeTrigger)) {
+        $stmt_user_count = $pdo->query("SELECT COUNT(*) FROM users");
+        if ((int)$stmt_user_count->fetchColumn() === 0) {
+            header("Location: /oobe");
+            exit;
+        }
+    }
 } catch (Throwable $e) {
     $login_error = 'Initialization failed: ' . $e->getMessage();
 }
@@ -85,66 +95,82 @@ function getDelay(PDO $pdo, string $ip): int {
         $remaining = $delay - ($GLOBALS['now']->getTimestamp() - $lastAttempt->getTimestamp());
         return max(0, $remaining);
     }
+
     return 0;
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['get_challenge'])) {
     header('Content-Type: application/json');
     $delay = getDelay($pdo, $ip);
+
     if ($delay > 0) {
         echo json_encode(['success' => false, 'message' => "Too many login attempts. Try again in $delay seconds."]);
         exit;
     }
+
     try {
         $username = trim($_POST['username'] ?? '');
         $stmt = $pdo->prepare("SELECT salt FROM users WHERE username = :u1 OR email = :u2 LIMIT 1");
         $stmt->execute(['u1' => $username, 'u2' => $username]);
         $user = $stmt->fetch(PDO::FETCH_ASSOC);
+
         if ($user) {
             $challenge = bin2hex(random_bytes(32));
             $_SESSION['temp_challenge'] = $challenge;
             $_SESSION['temp_user'] = $username;
+
             $stmt = $pdo->prepare("INSERT INTO login_attempts (ip, username, success, attempt_time, user_agent) VALUES (:ip, :u, 0, NOW(), :ua)");
             $stmt->execute(['ip' => $ip, 'u' => $username, 'ua' => $ua]);
+
             echo json_encode(['success' => true, 'salt' => $user['salt'], 'challenge' => $challenge]);
         } else {
             $stmt = $pdo->prepare("INSERT INTO login_attempts (ip, username, success, attempt_time, user_agent) VALUES (:ip, :u, 0, NOW(), :ua)");
             $stmt->execute(['ip' => $ip, 'u' => $username, 'ua' => $ua]);
+
             echo json_encode(['success' => false, 'message' => 'Invalid username or password.']);
         }
     } catch (Throwable $e) {
         echo json_encode(['success' => false, 'message' => $e->getMessage()]);
     }
+
     exit;
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['response'])) {
     header('Content-Type: application/json');
     $delay = getDelay($pdo, $ip);
+
     if ($delay > 0) {
         echo json_encode(['success' => false, 'message' => "Too many login attempts. Try again in $delay seconds."]);
         exit;
     }
+
     try {
         $clientResponse = $_POST['response'];
         $username = $_SESSION['temp_user'] ?? '';
         $challenge = $_SESSION['temp_challenge'] ?? '';
+
         $stmt = $pdo->prepare("SELECT id, username, password FROM users WHERE username = :u1 OR email = :u2 LIMIT 1");
         $stmt->execute(['u1' => $username, 'u2' => $username]);
         $user = $stmt->fetch(PDO::FETCH_ASSOC);
+
         if ($user && $challenge) {
             $expected = hash('sha256', $user['password'] . $challenge);
+
             if ($clientResponse === $expected) {
                 session_regenerate_id(true);
                 $_SESSION['user_id'] = $user['id'];
                 $_SESSION['username'] = $user['username'];
                 unset($_SESSION['temp_challenge'], $_SESSION['temp_user']);
+
                 $stmt = $pdo->prepare("INSERT INTO login_attempts (ip, username, success, attempt_time, user_agent) VALUES (:ip, :u, 1, NOW(), :ua)");
                 $stmt->execute(['ip' => $ip, 'u' => $username, 'ua' => $ua]);
+
                 echo json_encode(['success' => true]);
             } else {
                 $stmt = $pdo->prepare("INSERT INTO login_attempts (ip, username, success, attempt_time, user_agent) VALUES (:ip, :u, 0, NOW(), :ua)");
                 $stmt->execute(['ip' => $ip, 'u' => $username, 'ua' => $ua]);
+
                 echo json_encode(['success' => false, 'message' => 'Authentication failed.']);
             }
         } else {
@@ -153,6 +179,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['response'])) {
     } catch (Throwable $e) {
         echo json_encode(['success' => false, 'message' => $e->getMessage()]);
     }
+
     exit;
 }
 ?>
@@ -258,29 +285,38 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['response'])) {
         const password = document.getElementById('pw').value;
         const btn = document.getElementById('login-button');
         const err = document.getElementById('login-error');
+
         if (!username || !password) {
           err.innerText = 'Enter username and password';
           return;
         }
+
         err.innerText = '';
         btn.classList.add('loading');
         btn.innerHTML = '<div class="loading-circle"></div>';
+
         try {
           const res1 = await fetch('index.php', {
             method: 'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body: new URLSearchParams({ get_challenge: 1, username: username })
           });
+
           const data1 = await res1.json();
+
           if (!data1.success) throw new Error(data1.message);
+
           const verifier = sha256(password + data1.salt);
           const proof = sha256(verifier + data1.challenge);
+
           const res2 = await fetch('index.php', {
             method: 'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body: new URLSearchParams({ response: proof })
           });
+
           const data2 = await res2.json();
+
           if (data2.success) {
             window.location.href = 'dashboard.php';
           } else {
