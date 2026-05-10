@@ -10,6 +10,7 @@ Open Paging Server is written in Python & PHP. Allowing for great flexibility, q
 - Live Paging
 - Mass Notification Messages (Visual & Audio)
 - Bells
+- More to come!
 
 ### Endpoint Support
 Examples of official endpoint modules for Open Paging Server include:
