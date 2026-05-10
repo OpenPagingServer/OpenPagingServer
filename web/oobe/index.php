@@ -210,7 +210,7 @@ h1{color:#1976d2;font-weight:500;margin:0 0 12px}.lead{line-height:1.5;color:#42
                 <p class="lead">You are a few steps away from getting started with your new paging system.</p>
                 <form method="post">
                     <input type="hidden" name="stage" value="welcome">
-                    <div class="actions"><button class="button" type="submit">Start</button></div>
+                    <div class="actions"><button class="button good" type="submit">Start</button></div>
                 </form>
             <?php elseif ($stage === 'account'): ?>
                 <h1>Create an account</h1>
@@ -238,7 +238,7 @@ h1{color:#1976d2;font-weight:500;margin:0 0 12px}.lead{line-height:1.5;color:#42
                     <input type="hidden" name="stage" value="time">
                     <button class="button secondary" name="action" value="back" type="submit">Back</button>
                     <input type="hidden" name="back_stage" value="account">
-                    <button class="button good" name="action" value="next" type="submit">Next</button>
+                    <button class="button" name="action" value="next" type="submit">Next</button>
                 </form>
             <?php elseif ($stage === 'modules'): ?>
                 <h1>Endpoint modules</h1>
@@ -263,8 +263,8 @@ h1{color:#1976d2;font-weight:500;margin:0 0 12px}.lead{line-height:1.5;color:#42
                     <input type="hidden" name="stage" value="analytics">
                     <button class="button secondary" name="action" value="back" type="submit">Back</button>
                     <input type="hidden" name="back_stage" value="modules">
-                    <button class="button warn" name="action" value="continue_disabled" type="submit">Continue disabled</button>
-                    <button class="button good" name="action" value="opt_in" type="submit">Opt-in</button>
+                    <button class="button good" name="action" value="continue_disabled" type="submit">Continue disabled</button>
+                    <button class="button" name="action" value="opt_in" type="submit">Opt-in</button>
                 </form>
             <?php else: ?>
                 <h1>Setup complete!</h1>
