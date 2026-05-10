@@ -1,203 +1,311 @@
-import subprocess
-import sys
+import getpass
+import os
 import random
 import string
+import sys
+from pathlib import Path
+
 import mysql.connector
-import os
+
+
+DATABASE_NAME = "openpagingserver"
+DATABASE_USER = "openpagingserver"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ENDPOINT_MODULES_DIR = PROJECT_ROOT / "endpoint-modules"
+
 
 def random_password(length=32):
-    return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
+    return "".join(random.choices(string.ascii_letters + string.digits, k=length))
 
-base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-env_path = os.path.join(base_dir, ".env")
-web_dir = os.path.join(base_dir, "web")
-config_path = os.path.join(web_dir, "config.php")
 
-try:
-    conn = mysql.connector.connect(
-        user="root",
-        unix_socket="/var/run/mysqld/mysqld.sock"
+def sql_string(value):
+    return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def php_string(value):
+    return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def safe_endpoint_module_dir(path):
+    return (
+        path.is_dir()
+        and path.name not in (".", "..", "__pycache__")
+        and all(char.isalnum() or char in "-_" for char in path.name)
+        and (path / "index.py").exists()
     )
-except mysql.connector.Error:
-    print("Root socket auth failed, enter credentials:")
-    user = input("Username: ")
-    passwd = input("Password: ")
+
+
+def discover_endpoint_module_dirs():
+    if not ENDPOINT_MODULES_DIR.is_dir():
+        return []
+    return sorted(path.name for path in ENDPOINT_MODULES_DIR.iterdir() if safe_endpoint_module_dir(path))
+
+
+def connect_as_admin():
     try:
-        conn = mysql.connector.connect(user=user, password=passwd)
-    except mysql.connector.Error as e:
-        print("Connection failed:", e)
-        sys.exit(1)
+        return mysql.connector.connect(
+            user="root",
+            unix_socket="/var/run/mysqld/mysqld.sock",
+        )
+    except mysql.connector.Error:
+        print("Root socket auth failed, enter database admin credentials:")
+        user = input("Username: ")
+        passwd = getpass.getpass("Password: ")
+        try:
+            return mysql.connector.connect(user=user, password=passwd)
+        except mysql.connector.Error as exc:
+            print("Connection failed:", exc)
+            sys.exit(1)
 
-cursor = conn.cursor()
-cursor.execute("SHOW DATABASES LIKE 'openpagingserver'")
-if cursor.fetchone():
-    overwrite = input("Database exists. Overwrite? (y/n): ")
-    if overwrite.lower() != "y":
-        print("Exiting.")
-        sys.exit(0)
-    cursor.execute("DROP DATABASE openpagingserver")
 
-cursor.execute("CREATE DATABASE openpagingserver")
-cursor.execute("USE openpagingserver")
+def execute_schema(cursor):
+    schema_statements = [
+        """
+        CREATE TABLE messages (
+            type ENUM('liveaudio','liveaudio+text','text','text+audio','audio','record','record+text','text+audio+live') DEFAULT NULL,
+            messageid INT DEFAULT NULL,
+            name VARCHAR(255) DEFAULT NULL,
+            shortmessage TEXT DEFAULT NULL,
+            longmessage TEXT DEFAULT NULL,
+            audio VARCHAR(255) DEFAULT NULL,
+            image VARCHAR(255) DEFAULT '',
+            color VARCHAR(7) DEFAULT NULL,
+            icon VARCHAR(255) DEFAULT '',
+            expires VARCHAR(100) DEFAULT NULL,
+            vendor_specific TEXT DEFAULT NULL,
+            priority ENUM('Low','Normal','High','Emergency') DEFAULT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+        """,
+        """
+        CREATE TABLE users (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            username VARCHAR(100) UNIQUE NOT NULL,
+            email VARCHAR(255) UNIQUE,
+            password VARCHAR(64) NOT NULL,
+            salt VARCHAR(64) NOT NULL,
+            role ENUM('admin','tempadmin','user','tempuser','receiver','tempreceiver') NOT NULL,
+            loginsleft INT DEFAULT 0,
+            logincount INT DEFAULT 0,
+            lastlogin DATETIME DEFAULT NULL,
+            accountexpire DATE DEFAULT NULL,
+            accountcreated DATE DEFAULT (CURRENT_DATE),
+            adminperm LONGTEXT DEFAULT NULL,
+            msgsendperm LONGTEXT DEFAULT NULL,
+            userperm LONGTEXT DEFAULT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+        """,
+        """
+        CREATE TABLE login_attempts (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            ip VARCHAR(45) DEFAULT NULL,
+            username VARCHAR(255) DEFAULT NULL,
+            success TINYINT(1) DEFAULT NULL,
+            attempt_time DATETIME DEFAULT NULL,
+            user_agent TEXT DEFAULT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+        """,
+        """
+        CREATE TABLE endpointmodulesloaded (
+            `dir` VARCHAR(100) NOT NULL,
+            enabled ENUM('true','false') DEFAULT 'true',
+            PRIMARY KEY (`dir`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+        """,
+        """
+        CREATE TABLE groups (
+            id VARCHAR(100) DEFAULT NULL,
+            name VARCHAR(100) DEFAULT NULL,
+            members TEXT DEFAULT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+        """,
+        """
+        CREATE TABLE broadcasts (
+            id VARCHAR(100) DEFAULT NULL,
+            shortmessage VARCHAR(100) DEFAULT NULL,
+            longmessage TEXT DEFAULT NULL,
+            icon VARCHAR(100) DEFAULT NULL,
+            color VARCHAR(100) DEFAULT NULL,
+            vendor_specific VARCHAR(100) DEFAULT NULL,
+            type ENUM('Page','AudioMessage','TextMessage','Text+AudioMessage') DEFAULT NULL,
+            expires DATETIME DEFAULT NULL,
+            issued DATETIME DEFAULT NULL,
+            `groups` TEXT DEFAULT NULL,
+            image VARCHAR(100) DEFAULT NULL,
+            audio VARCHAR(10000) DEFAULT NULL,
+            sender VARCHAR(100) DEFAULT NULL,
+            priority ENUM('Low','Normal','High','Emergency') DEFAULT NULL,
+            delivery VARCHAR(100) DEFAULT NULL,
+            name VARCHAR(100) DEFAULT NULL,
+            template_id VARCHAR(64) DEFAULT NULL,
+            expires_rule VARCHAR(64) DEFAULT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+        """,
+        """
+        CREATE TABLE bell_schedules (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(100) NOT NULL,
+            enabled TINYINT(1) NOT NULL DEFAULT 1,
+            created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+            timezone VARCHAR(64) NOT NULL DEFAULT 'server'
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+        """,
+        """
+        CREATE TABLE bell_lists (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            schedule_id INT NOT NULL DEFAULT 0,
+            name VARCHAR(100) NOT NULL,
+            created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+            KEY schedule_id_idx (schedule_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+        """,
+        """
+        CREATE TABLE bell_events (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            list_id INT NOT NULL,
+            fire_time TIME NOT NULL,
+            audio TEXT NOT NULL,
+            days_of_week VARCHAR(32) NOT NULL DEFAULT '0,1,2,3,4,5,6',
+            KEY list_id_idx (list_id),
+            KEY fire_time_idx (fire_time)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+        """,
+        """
+        CREATE TABLE bell_schedule_groups (
+            schedule_id INT NOT NULL,
+            group_id VARCHAR(100) NOT NULL,
+            PRIMARY KEY (schedule_id, group_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+        """,
+        """
+        CREATE TABLE bell_calendar (
+            schedule_id INT NOT NULL,
+            bell_date DATE NOT NULL,
+            list_id INT DEFAULT NULL,
+            PRIMARY KEY (schedule_id, bell_date)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+        """,
+        """
+        CREATE TABLE bell_calendar_lists (
+            schedule_id INT NOT NULL,
+            bell_date DATE NOT NULL,
+            list_id INT NOT NULL,
+            PRIMARY KEY (schedule_id, bell_date, list_id),
+            KEY bell_date_idx (bell_date),
+            KEY list_id_idx (list_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+        """,
+        """
+        CREATE TABLE history (
+            entryid INT NOT NULL AUTO_INCREMENT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            actor VARCHAR(255) DEFAULT NULL,
+            action VARCHAR(255) DEFAULT NULL,
+            target VARCHAR(255) DEFAULT NULL,
+            message TEXT NOT NULL,
+            icon VARCHAR(50) DEFAULT NULL,
+            PRIMARY KEY (entryid)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE systemsettings (
+            parameter VARCHAR(128) NOT NULL,
+            value TEXT NOT NULL,
+            description TEXT NOT NULL,
+            PRIMARY KEY (parameter)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+        """,
+    ]
 
-db_password = random_password()
-cursor.execute("DROP USER IF EXISTS 'openpagingserver'@'localhost'")
-cursor.execute("DROP USER IF EXISTS 'openpagingserver'@'127.0.0.1'")
-cursor.execute(f"CREATE USER 'openpagingserver'@'localhost' IDENTIFIED BY '{db_password}'")
-cursor.execute(f"CREATE USER 'openpagingserver'@'127.0.0.1' IDENTIFIED BY '{db_password}'")
-cursor.execute("GRANT ALL PRIVILEGES ON openpagingserver.* TO 'openpagingserver'@'localhost'")
-cursor.execute("GRANT ALL PRIVILEGES ON openpagingserver.* TO 'openpagingserver'@'127.0.0.1'")
-cursor.execute("FLUSH PRIVILEGES")
+    for statement in schema_statements:
+        cursor.execute(statement)
 
-cursor.execute("""
-CREATE TABLE messages (
-    type ENUM('liveaudio','liveaudio+text','text','text+audio','audio','record','record+text','text+audio+live'),
-    messageid INT,
-    name VARCHAR(255),
-    shortmessage TEXT,
-    longmessage TEXT,
-    audio VARCHAR(255),
-    image VARCHAR(255) DEFAULT '',
-    color VARCHAR(7),
-    icon VARCHAR(255) DEFAULT ''
-)
-""")
 
-cursor.execute("""
-CREATE TABLE broadcasts (
-    id VARCHAR(100),
-    shortmessage VARCHAR(100),
-    longmessage TEXT,
-    icon VARCHAR(100),
-    color VARCHAR(100),
-    vendor_specific VARCHAR(100),
-    type ENUM('Page','AudioMessage','TextMessage','Text+AudioMessage'),
-    expires DATETIME,
-    issued DATETIME,
-    groups TEXT,
-    image VARCHAR(100),
-    audio VARCHAR(10000),
-    sender VARCHAR(100),
-    priority ENUM('Low','Normal','High','Emergency'),
-    delivery VARCHAR(100),
-    name VARCHAR(100),
-    UNIQUE KEY id_unique (id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
-""")
+def seed_defaults(cursor):
+    endpoint_module_dirs = [(module_dir, "true") for module_dir in discover_endpoint_module_dirs()]
+    if endpoint_module_dirs:
+        cursor.executemany(
+            """
+            INSERT INTO endpointmodulesloaded (`dir`, enabled)
+            VALUES (%s, %s)
+            ON DUPLICATE KEY UPDATE enabled = VALUES(enabled)
+            """,
+            endpoint_module_dirs,
+        )
 
-cursor.execute("""
-CREATE TABLE users (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    username VARCHAR(100) UNIQUE NOT NULL,
-    email VARCHAR(255) UNIQUE,
-    password VARCHAR(64) NOT NULL, 
-    salt VARCHAR(64) NOT NULL,
-    role ENUM('admin','tempadmin','user','tempuser','receiver','tempreceiver') NOT NULL,
-    loginsleft INT DEFAULT 0,
-    logincount INT DEFAULT 0,
-    lastlogin DATETIME,
-    accountexpire DATE,
-    accountcreated DATE DEFAULT CURRENT_DATE,
-    adminperm LONGTEXT,
-    msgsendperm LONGTEXT,
-    userperm LONGTEXT
-)
-""")
+    cursor.execute(
+        "INSERT INTO bell_schedules (name, enabled, timezone) VALUES ('Default Bell Schedule', 1, 'server')"
+    )
+    default_bell_schedule_id = cursor.lastrowid
+    cursor.execute(
+        "INSERT INTO bell_lists (schedule_id, name) VALUES (%s, 'Regular Day')",
+        (default_bell_schedule_id,),
+    )
 
-cursor.execute("""
-CREATE TABLE login_attempts (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    ip VARCHAR(45),
-    username VARCHAR(255),
-    success TINYINT(1),
-    attempt_time DATETIME,
-    user_agent TEXT
-) ENGINE=InnoDB
-""")
+    systemsettings = [
+        ("enable_insecure_sip", "1", "Enable SIP over UDP and TCP (0/1)"),
+        ("enable_login_logo", "1", "Enable the logo on login page"),
+        (
+            "enable_secure_sip",
+            "0",
+            "Enable SIP over TLS (0 = NO, 1 = Yes with same cert as web server, 2 = Yes with independent cert)",
+        ),
+        (
+            "analytics",
+            "0",
+            "Send optional analytics to the Open Paging Server project. Privacy Policy: https://www.openpagingserver.org/privacypolicy/analytics",
+        ),
+        ("favicon", "/assets/favicon.svg", "Browser Favicon. Path to file within web server."),
+        ("insecure_sip_port", "5060", "Port for UDP/TCP SIP"),
+        ("login_banner_enabled", "1", "Enable or disable the login page banner (0/1)"),
+        (
+            "login_banner_message",
+            "OPS is currently in early devlopment stages, and is not yet suitable for production use.  Visit our website at https://www.openpagingserver.org to learn how to contribute and to join our Discord. Thank you for installing the Open Paging Server beta!",
+            "Message text for the login page banner",
+        ),
+        ("login_banner_title", "Welcome to Open Paging Server Beta!!!", "Optional title for the login page banner"),
+        (
+            "login_logo_dark",
+            "/assets/OPENPAGINGSERVER-768x576-DARKMODE.png",
+            "Dark mode logo. Path to file within web server.",
+        ),
+        (
+            "login_logo_light",
+            "/assets/OPENPAGINGSERVER-768x576-LIGHTMODE.png",
+            "Light mode logo. Path to file within web server.",
+        ),
+        ("product_name", "Open Paging Server", "Name of this server."),
+        ("secure_sip_cert", "", "If enable_secure_sip is 2, this cert will be used. Path to file"),
+        ("secure_sip_port", "5061", "Port for TLS SIP"),
+        ("secure_sip_privkey", "", "If enable_secure_sip is 2, this private key will be used. Path to file"),
+        (
+            "separate_dark_logo",
+            "1",
+            "Use a separate logo for dark mode. When disabled, uses only logo_light. (0/1)",
+        ),
+        ("show_online_docs", "1", "Show GUI links to docs.openpagingserver.org (0/1)"),
+        ("use_logo_in_sidebar", "1", "Use a logo in the sidebar, if disabled the product name will show"),
+        ("sidebar_logo_light", "/assets/OPENPAGINGSERVER-768x576-LIGHTMODE.png", "Light mode logo for the sidebar"),
+        ("sidebar_logo_dark", "/assets/OPENPAGINGSERVER-768x576-DARKMODE.png", "Dark mode logo for the sidebar"),
+        ("webserver_https_enable", "0", "HTTPs Enable (0/1)"),
+        ("webserver_https_port", "443", "HTTPs Server Port (Default: 443)"),
+        ("webserver_http_port", "80", "HTTP Server Port (Default: 80)"),
+    ]
+    cursor.executemany(
+        """
+        INSERT INTO systemsettings (parameter, value, description)
+        VALUES (%s, %s, %s)
+        ON DUPLICATE KEY UPDATE value = VALUES(value), description = VALUES(description)
+        """,
+        systemsettings,
+    )
 
-cursor.execute("""
-CREATE TABLE enabledmodules (
-    id INT UNSIGNED NOT NULL AUTO_INCREMENT,
-    path VARCHAR(255) NOT NULL,
-    status TINYINT(1) NOT NULL DEFAULT 1,
-    webpath VARCHAR(255) NOT NULL,
-    webroles VARCHAR(255) NOT NULL DEFAULT 'user',
-    webinterface TINYINT(1) NOT NULL DEFAULT 1,
-    webname VARCHAR(255) NOT NULL DEFAULT '',
-    webicon VARCHAR(50) NOT NULL DEFAULT 'fa-circle',
-    PRIMARY KEY (id),
-    UNIQUE KEY path_unique (path)
-) ENGINE=InnoDB AUTO_INCREMENT=5 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
-""")
 
-cursor.execute("""
-CREATE TABLE `endpoints-input-sip` (
-    name VARCHAR(100) DEFAULT NULL,
-    extension VARCHAR(100) DEFAULT NULL,
-    `group` VARCHAR(100) DEFAULT NULL,
-    `trigger` VARCHAR(100) DEFAULT NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
-""")
-
-cursor.execute("""
-CREATE TABLE groups (
-    id VARCHAR(100) DEFAULT NULL,
-    name VARCHAR(100) DEFAULT NULL,
-    members VARCHAR(100) DEFAULT NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
-""")
-
-cursor.execute("""
-CREATE TABLE systemsettings (
-    parameter VARCHAR(128) NOT NULL,
-    value TEXT NOT NULL,
-    description TEXT NOT NULL,
-    PRIMARY KEY (parameter)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
-""")
-
-cursor.execute("INSERT INTO messages VALUES ('text+audio',1,'SRP HOLD','HOLD! In your area.','Hold! In your room or area. Clear the halls.','OPS-400HZ-MedPulse.wav:OPS-SRP-Hold.wav','',NULL,'')")
-cursor.execute("INSERT INTO messages VALUES ('text+audio',2,'SRP SECURE','SECURE!','Secure! Get Inside. Lock outside doors.','OPS-400HZ-MedPulse.wav:OPS-SRP-Secure.wav','',NULL,'')")
-cursor.execute("INSERT INTO messages VALUES ('text+audio',3,'SRP LOCKDOWN','LOCKDOWN! Locks, Lights, Out of Sight.','LOCKDOWN! Locks, Lights, Out of Sight.','OPS-400HZ-MedPulse.wav:OPS-SRP-Lockdown.wav','',NULL,'')")
-cursor.execute("INSERT INTO messages VALUES ('text+audio',5,'TEST Message','This is a test of Open Paging Server','This is a test of the Open Paging Server MNS system. No action is required.','OPS-900HZ-SlowPulse.wav:OPS-TESTING.wav','',NULL,'')")
-cursor.execute("INSERT INTO enabledmodules VALUES (3,'modules/bells',1,'/bells.php','user,admin,tempadmin',1,'Bell Schedules','fa-bell')")
-cursor.execute("INSERT INTO enabledmodules VALUES (4,'modules/wakeup',1,'/wakeup.php','user,admin,tempadmin',1,'Wake Up Calls','fa-bed')")
-
-cursor.execute("INSERT INTO systemsettings VALUES ('enable_insecure_sip','1','Enable SIP over UDP and TCP (0/1)')")
-cursor.execute("INSERT INTO systemsettings VALUES ('enable_login_logo','1','Enable the logo on login page')")
-cursor.execute("INSERT INTO systemsettings VALUES ('enable_secure_sip','0','Enable SIP over TLS (0 = NO, 1 = Yes with same cert as web server, 2 = Yes with independent cert)')")
-cursor.execute("INSERT INTO systemsettings VALUES ('favicon','/assets/favicon.svg','Browser Favicon. Path to file within web server.')")
-cursor.execute("INSERT INTO systemsettings VALUES ('insecure_sip_port','5060','Port for UDP/TCP SIP')")
-cursor.execute("INSERT INTO systemsettings VALUES ('login_banner_enabled','1','Enable or disable the login page banner (0/1)')")
-cursor.execute("INSERT INTO systemsettings VALUES ('login_banner_message','OPS is currently in early devlopment stages, and is not yet suitable for production use.  Visit our website at https://www.openpagingserver.org to learn how to contribute and to join our Discord. Thank you for installing the Open Paging Server beta!','Message text for the login page banner')")
-cursor.execute("INSERT INTO systemsettings VALUES ('login_banner_title','Welcome to Open Paging Server Beta!!!','Optional title for the login page banner')")
-cursor.execute("INSERT INTO systemsettings VALUES ('login_logo_dark','/assets/OPENPAGINGSERVER-768x576-DARKMODE.png','Dark mode logo. Path to file within web server.')")
-cursor.execute("INSERT INTO systemsettings VALUES ('login_logo_light','/assets/OPENPAGINGSERVER-768x576-LIGHTMODE.png','Light mode logo. Path to file within web server.')")
-cursor.execute("INSERT INTO systemsettings VALUES ('product_name','Open Paging Server','Name of this server.')")
-cursor.execute("INSERT INTO systemsettings VALUES ('secure_sip_cert','','If enable_secure_sip is 2, this cert will be used. Path to file')")
-cursor.execute("INSERT INTO systemsettings VALUES ('secure_sip_port','5061','Port for TLS SIP')")
-cursor.execute("INSERT INTO systemsettings VALUES ('secure_sip_privkey','','If enable_secure_sip is 2, this private key will be used. Path to file')")
-cursor.execute("INSERT INTO systemsettings VALUES ('separate_dark_logo','1','Use a separate logo for dark mode. When disabled, uses only logo_light. (0/1)')")
-cursor.execute("INSERT INTO systemsettings VALUES ('show_online_docs','1','Show GUI links to docs.openpagingserver.org (0/1)')")
-cursor.execute("INSERT INTO systemsettings VALUES ('webserver_https_enable','0','HTTPs Enable (0/1)')")
-cursor.execute("INSERT INTO systemsettings VALUES ('webserver_https_port','443','HTTPs Server Port (Default: 443)')")
-cursor.execute("INSERT INTO systemsettings VALUES ('webserver_http_port','80','HTTP Server Port (Default: 80)')")
-
-conn.commit()
-conn.close()
-
-env_file = f"""DB_HOST='127.0.0.1'
-DB_USER='openpagingserver'
-DB_PASS='{db_password}'
-DB_NAME='openpagingserver'
-DEBUG=false
-"""
-
-config_php = f"""<?php
+def write_config(db_password):
+    config_php = f"""<?php
 $host = 'localhost';
-$db   = 'openpagingserver';
-$user = 'openpagingserver';
-$pass = '{db_password}';
+$db   = '{DATABASE_NAME}';
+$user = '{DATABASE_USER}';
+$pass = {php_string(db_password)};
 $charset = 'utf8mb4';
 
 $dsn = "mysql:host=$host;dbname=$db;charset=$charset";
@@ -214,14 +322,45 @@ try {{
 }}
 """
 
-os.makedirs(web_dir, exist_ok=True)
+    os.makedirs("/opt/OpenPagingServer/web", exist_ok=True)
+    os.makedirs("/var/lib/openpagingserver/assets", exist_ok=True)
+    with open("/opt/OpenPagingServer/web/config.php", "w", encoding="utf-8") as config_file:
+        config_file.write(config_php)
 
-with open(env_path, "w") as f:
-    f.write(env_file)
 
-with open(config_path, "w") as f:
-    f.write(config_php)
+def main():
+    conn = connect_as_admin()
+    cursor = conn.cursor()
 
-print("Done.")
-print(f"Wrote {env_path}")
-print(f"Wrote {config_path}")
+    cursor.execute(f"SHOW DATABASES LIKE {sql_string(DATABASE_NAME)}")
+    if cursor.fetchone():
+        overwrite = input("Database exists. Overwrite? (y/n): ")
+        if overwrite.lower() != "y":
+            print("Exiting.")
+            cursor.close()
+            conn.close()
+            sys.exit(0)
+        cursor.execute(f"DROP DATABASE `{DATABASE_NAME}`")
+
+    cursor.execute(f"CREATE DATABASE `{DATABASE_NAME}` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci")
+    cursor.execute(f"USE `{DATABASE_NAME}`")
+
+    db_password = random_password()
+    cursor.execute(f"DROP USER IF EXISTS '{DATABASE_USER}'@'localhost'")
+    cursor.execute(f"CREATE USER '{DATABASE_USER}'@'localhost' IDENTIFIED BY {sql_string(db_password)}")
+    cursor.execute(f"GRANT ALL PRIVILEGES ON `{DATABASE_NAME}`.* TO '{DATABASE_USER}'@'localhost'")
+    cursor.execute("FLUSH PRIVILEGES")
+
+    execute_schema(cursor)
+    seed_defaults(cursor)
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    write_config(db_password)
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
