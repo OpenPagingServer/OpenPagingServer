@@ -10,6 +10,7 @@ DB_HOST = os.getenv("DB_HOST")
 DB_USER = os.getenv("DB_USER")
 DB_PASS = os.getenv("DB_PASS")
 DB_NAME = os.getenv("DB_NAME")
+TRUNK_TABLE = "sip-trunks"
 
 def connect_db():
     return pymysql.connect(
@@ -19,6 +20,10 @@ def connect_db():
         database=DB_NAME,
         autocommit=True,
     )
+
+def normalize_status(status):
+    text = str(status or "").strip()
+    return text or "Offline"
 
 def ip_match(ipaddr, entry_ip):
     try:
@@ -62,17 +67,44 @@ def get_all_ip_trunks():
         conn.close()
 
 def update_trunk_status_by_ip(ipaddr, status):
+    wanted = str(ipaddr or "").strip()
+    if not wanted:
+        return 0
     conn = connect_db()
     try:
         with conn.cursor() as cur:
-            cur.execute("UPDATE `sip-trunks` SET status=%s WHERE auth='IP' AND ipaddr=%s", (status, ipaddr))
+            cur.execute(
+                f"UPDATE `{TRUNK_TABLE}` SET status=%s WHERE auth='IP' AND ipaddr=%s",
+                (normalize_status(status), wanted),
+            )
+            if cur.rowcount:
+                return cur.rowcount
+            cur.execute(f"SELECT id, ipaddr FROM `{TRUNK_TABLE}` WHERE auth='IP'")
+            matches = []
+            for row in cur.fetchall():
+                trunk_id, trunk_ip = row[0], row[1]
+                if trunk_ip and trunk_ip not in ("0.0.0.0", "0.0.0.0/0") and ip_match(wanted, trunk_ip):
+                    matches.append(trunk_id)
+            for trunk_id in matches:
+                cur.execute(
+                    f"UPDATE `{TRUNK_TABLE}` SET status=%s WHERE id=%s",
+                    (normalize_status(status), trunk_id),
+                )
+            return len(matches)
     finally:
         conn.close()
 
 def update_trunk_status_by_user(username, status):
+    wanted = str(username or "").strip()
+    if not wanted:
+        return 0
     conn = connect_db()
     try:
         with conn.cursor() as cur:
-            cur.execute("UPDATE `sip-trunks` SET status=%s WHERE auth='USERPASS' AND username=%s", (status, username))
+            cur.execute(
+                f"UPDATE `{TRUNK_TABLE}` SET status=%s WHERE auth='USERPASS' AND username=%s",
+                (normalize_status(status), wanted),
+            )
+            return cur.rowcount
     finally:
         conn.close()
