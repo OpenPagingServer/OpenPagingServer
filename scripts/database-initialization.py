@@ -64,7 +64,7 @@ CREATE TABLE messages (
 """)
 
 cursor.execute("""
-CREATE TABLE broadcats (
+CREATE TABLE broadcasts (
     id VARCHAR(100),
     shortmessage VARCHAR(100),
     longmessage TEXT,
