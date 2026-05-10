@@ -325,7 +325,8 @@ input:checked + .slider:before { background-color: #BB86FC; }
                     <span id="udpPortError" class="port-error-text">Please enter a valid port (1-65535).</span>
                 </div>
 
-                <div class="info-row" style="border-bottom:none; padding-bottom:0;">
+				<!-- SIP over TLS is hidden because the SIP server does not currently support TLS and cert functions. It will be added at a later date... -->
+                <div class="info-row" style="border-bottom:none; padding-bottom:0; display:none;">
                     <span class="info-label">Enable SIP over TLS</span>
                     <span>
                         <label class="switch">
@@ -334,7 +335,7 @@ input:checked + .slider:before { background-color: #BB86FC; }
                         </label>
                     </span>
                 </div>
-                <div class="info-row" style="flex-direction: column; align-items: flex-start; gap: 8px;">
+                <div class="info-row" style="flex-direction: column; align-items: flex-start; gap: 8px; display:none;">
                     <span class="info-label">Port</span>
                     <input type="number" name="secure_sip_port" id="tlsPort" min="1" max="65535" value="<?= htmlspecialchars($tlsPort) ?>" <?= !$tlsEnabled ? 'disabled' : '' ?>>
                     <span id="tlsPortError" class="port-error-text">Please enter a valid port (1-65535).</span>
