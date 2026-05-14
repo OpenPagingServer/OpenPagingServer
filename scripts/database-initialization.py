@@ -69,17 +69,12 @@ def run_systemctl(action):
     unit = "openpagingserver.service"
 
     if not systemctl_available():
-        print("systemctl not found, skipping service command")
         return
 
     if not systemd_unit_exists(unit):
-        print(f"{unit} does not exist in systemd, skipping systemctl {action}")
         return
 
-    result = subprocess.run(["systemctl", action, unit], text=True)
-    if result.returncode != 0:
-        print(f"systemctl {action} {unit} failed with exit code {result.returncode}")
-
+    subprocess.run(["systemctl", action, unit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
 
 def connect_as_admin():
     try:
@@ -439,14 +434,19 @@ def main():
 
 
 def wrapped_main():
-    run_systemctl("stop")
-    time.sleep(5)
+    unit = "openpagingserver.service"
+    service_exists = systemctl_available() and systemd_unit_exists(unit)
+
+    if service_exists:
+        run_systemctl("stop")
+        time.sleep(5)
+
     try:
         main()
     finally:
-        time.sleep(5)
-        run_systemctl("start")
-
+        if service_exists:
+            time.sleep(5)
+            run_systemctl("start")
 
 if __name__ == "__main__":
     wrapped_main()
