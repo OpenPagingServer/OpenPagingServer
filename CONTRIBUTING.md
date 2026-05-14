@@ -52,7 +52,7 @@ Please provide as much context as possible. Including how you found the bug and 
 
 ## Questions, Comments, Concerns? Contact the Open Paging Server project.
 
-Email: contact@openpagingserver
+Email: contact@openpagingserver.org
 
 Telephone: +1 (877) 595-0746
 
