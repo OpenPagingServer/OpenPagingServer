@@ -210,7 +210,7 @@ input:checked + .slider:before { background-color: #BB86FC; }
                     <span class="info-label">
                         Send optional analytics to the Open Paging Server project
                         <span class="info-description">
-                            To help the Open Paging Server project improve, you can opt in to share optional analytics. Analytics contain mainly anonymous data about your server such as hardware and software information, anonymized crash logs, etc. And may include your public IP address used to send information. <a href="https://www.openpagingserver.org/privacypolicy/analytics" target="_blank" rel="noopener">Privacy Policy</a>
+                            To help the Open Paging Server project improve, you can opt in to share optional analytics. Analytics contain mainly anonymous data about your server such as hardware and software information, anonymized crash logs, etc. And may include your public IP address used to send reports <a href="https://www.openpagingserver.org/privacypolicy/analytics" target="_blank" rel="noopener">Privacy Policy</a>
                         </span>
                     </span>
                     <span>
