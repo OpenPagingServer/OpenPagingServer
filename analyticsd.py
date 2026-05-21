@@ -68,7 +68,7 @@ def save_server_id(server_id):
     save_local_setting(
         "analytics_server_id",
         server_id,
-        "Analytics identifier. Reference this to Open Paging Server Project staff when requested.",
+        "Analytics identifier. Reference this to Open Paging Server Project staff or in bug reports when requested."
     )
 
 
