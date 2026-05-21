@@ -38,7 +38,7 @@ The [Open Paging Server Online Documentation](https://docs.openpagingserver.org/
 ## Reporting bugs or requests 
 > [!WARNING]
 > **DO NOT REPORT** security-related vulnerabilities or bugs containing other sensitive information publicly. Instead, email securityissues@openpagingserver.org.
-> The Open Paging Server project staff team will mae
+> The Open Paging Server project staff team will determine the best next steps as soon as possible.
 
 Non-security-related bug reports or feature requests can be reported either in the [Issues page on GitHub](https://github.com/OpenPagingServer/OpenPagingServer/issues) or the wishlist-requests-issues fourm channel on the Discord server.
 
