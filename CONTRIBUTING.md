@@ -9,7 +9,7 @@
 ⠀⠀⠀⠀⠀⠀⢻⣿⣿⣆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠉⠀⠀⠀⠀⠀⠀
 ⠀⠀⠀⠀⠀⠀⠘⠛⠛⠛
 -->
-# Open Paging Server Contributing Guidelines
+# 📢 Open Paging Server Contributing Guidelines </>
 Thank you for your interest in developing for the Open Paging Server project. This document will introduce you to the project, some things you need to know, how to contribute, and guidelines for pull requests.
 
 This document is still in progress and will be updated and finished over time.
