@@ -317,12 +317,12 @@ def seed_defaults(cursor):
         (
             "analytics_server_id",
             "",
-            "Permanent anonymous analytics server identifier. Requested from the analytics server when analytics is first enabled.",
+            "Analytics identifier. Reference this to Open Paging Server Project staff or in bug reports when requested.",
         ),
         (
             "analytics_server_secret",
             "",
-            "Permanent analytics server secret. Keep private.",
+            "Analytics secret. DO NOT SHARE.",
         ),
         ("favicon", "/assets/favicon.svg", "Browser Favicon. Path to file within web server."),
         ("insecure_sip_port", "5060", "Port for UDP/TCP SIP"),
