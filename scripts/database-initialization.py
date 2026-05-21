@@ -314,6 +314,16 @@ def seed_defaults(cursor):
             "0",
             "Send optional analytics to the Open Paging Server project. Privacy Policy: https://www.openpagingserver.org/privacypolicy/analytics",
         ),
+        (
+            "analytics_server_id",
+            "",
+            "Permanent anonymous analytics server identifier. Requested from the analytics server when analytics is first enabled.",
+        ),
+        (
+            "analytics_server_secret",
+            "",
+            "Permanent analytics server secret. Keep private.",
+        ),
         ("favicon", "/assets/favicon.svg", "Browser Favicon. Path to file within web server."),
         ("insecure_sip_port", "5060", "Port for UDP/TCP SIP"),
         ("login_banner_enabled", "1", "Enable or disable the login page banner (0/1)"),
@@ -354,7 +364,9 @@ def seed_defaults(cursor):
         """
         INSERT INTO systemsettings (parameter, value, description)
         VALUES (%s, %s, %s)
-        ON DUPLICATE KEY UPDATE value = VALUES(value), description = VALUES(description)
+        ON DUPLICATE KEY UPDATE
+            value = IF(parameter IN ('analytics_server_id', 'analytics_server_secret') AND value <> '', value, VALUES(value)),
+            description = VALUES(description)
         """,
         systemsettings,
     )
