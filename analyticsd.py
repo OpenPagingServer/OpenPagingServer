@@ -23,12 +23,6 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
-ANALYTICS_URL = os.getenv("ANALYTICS_URL", "https://analytics.openpagingserver.org").rstrip("/")
-USER_AGENT = "OpenPagingServer"
-TOKEN_RENEW_SECONDS = 7 * 24 * 60 * 60
-REGISTER_RETRY_SECONDS = 24 * 60 * 60
-LOOP_SLEEP_SECONDS = 30
-
 DB_HOST = os.getenv("DB_HOST")
 DB_USER = os.getenv("DB_USER")
 DB_PASS = os.getenv("DB_PASS")
@@ -41,7 +35,7 @@ stopping = False
 
 def db():
     if not DB_NAME:
-        raise RuntimeError("DB_NAME is not set; run analyticsd.py from the OpenPagingServer install with a valid .env")
+        raise RuntimeError(".env not set!")
     return pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASS, database=DB_NAME)
 
 
@@ -74,7 +68,7 @@ def save_server_id(server_id):
     save_local_setting(
         "analytics_server_id",
         server_id,
-        "Permanent anonymous analytics server identifier.",
+        "Analytics identifier. Reference this to Open Paging Server Project staff when requested.",
     )
 
 
@@ -82,7 +76,7 @@ def save_server_secret(server_secret):
     save_local_setting(
         "analytics_server_secret",
         server_secret,
-        "Permanent analytics server secret. Keep private.",
+        "Analytics secret. DO NOT SHARE.",
     )
 
 
@@ -120,7 +114,7 @@ def xml_bytes(root_name, values):
 
 def request(endpoint, body=None, auth_token=None):
     headers = {
-        "User-Agent": USER_AGENT,
+        "User-Agent": "OpenPagingServer",
         "Content-Type": "application/xml",
         "Accept": "*/*",
     }
@@ -128,7 +122,7 @@ def request(endpoint, body=None, auth_token=None):
         headers["Authorization"] = f"Bearer {auth_token}"
 
     req = urllib.request.Request(
-        f"{ANALYTICS_URL}/{endpoint.strip('/')}/",
+        f"https://analytics.openpagingserver.org/{endpoint.strip('/')}/",
         data=body,
         headers=headers,
         method="POST",
@@ -143,7 +137,7 @@ def register_token(server_id):
     global token, last_token_renewal
     server_secret = load_server_secret()
     if server_id and not server_secret:
-        log("local analytics_server_id has no analytics_server_secret; requesting a new secured server identity")
+        log("equesting a new secured server identity")
         server_id = None
     response = request(
         "token/create",
@@ -466,9 +460,9 @@ def main():
                 if registered_server_id:
                     server_id = registered_server_id
                 else:
-                    next_register_attempt = now + REGISTER_RETRY_SECONDS
+                    next_register_attempt = now + 24 * 60 * 60
 
-            if token and server_id and now - last_token_renewal >= TOKEN_RENEW_SECONDS:
+            if token and server_id and now - last_token_renewal >= 7 * 24 * 60 * 60:
                 renewed_server_id = renew_token(server_id)
                 if renewed_server_id:
                     server_id = renewed_server_id
@@ -479,13 +473,13 @@ def main():
         except Exception as exc:
             log(f"loop error: {exc}")
 
-        time.sleep(LOOP_SLEEP_SECONDS)
+        time.sleep(30)
 
     delete_token()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Open Paging Server analytics worker")
+    parser = argparse.ArgumentParser(description="Open Paging Server analytics daemon")
     parser.add_argument("-u", "--upload-now", action="store_true", help="upload one analytics report immediately")
     args = parser.parse_args()
 
