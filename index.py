@@ -29,6 +29,7 @@ loaded_modules = {}
 messaged_proc = None
 livepaged_proc = None
 belld_proc = None
+analytics_proc = None
 
 
 class Core:
@@ -46,6 +47,78 @@ def get_db_connection():
         password=DB_PASS,
         database=DB_NAME,
     )
+
+
+def analytics_enabled():
+    try:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM systemsettings WHERE parameter = 'analytics' LIMIT 1")
+                row = cur.fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:
+        core.log(f"analytics setting read error: {exc}")
+        return False
+
+    if not row:
+        return False
+
+    return str(row[0]).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def start_analytics():
+    global analytics_proc
+    analytics_path = BASE_DIR / "analyticsd.py"
+    if analytics_proc and analytics_proc.poll() is None:
+        return
+    if not analytics_path.exists():
+        return
+
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
+        "WINDIR": os.environ.get("WINDIR", ""),
+        "DB_HOST": DB_HOST or "",
+        "DB_USER": DB_USER or "",
+        "DB_PASS": DB_PASS or "",
+        "DB_NAME": DB_NAME or "",
+        "ANALYTICS_URL": os.environ.get("ANALYTICS_URL", "https://analytics.openpagingserver.org"),
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1",
+    }
+    popen_kwargs = {
+        "cwd": BASE_DIR,
+        "env": env,
+        "close_fds": True,
+    }
+    if os.name == "posix":
+        popen_kwargs["start_new_session"] = True
+    analytics_proc = subprocess.Popen([sys.executable, str(analytics_path)], **popen_kwargs)
+    core.log(f"analytics worker started pid={analytics_proc.pid}")
+
+
+def stop_analytics():
+    global analytics_proc
+    if not analytics_proc:
+        return
+    if analytics_proc.poll() is None:
+        analytics_proc.terminate()
+        try:
+            analytics_proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            analytics_proc.kill()
+            analytics_proc.wait(timeout=5)
+    core.log("analytics worker stopped")
+    analytics_proc = None
+
+
+def sync_analytics():
+    if analytics_enabled():
+        start_analytics()
+    else:
+        stop_analytics()
 
 
 def db_enabled_modules():
@@ -128,7 +201,7 @@ if endpoint_manager and hasattr(endpoint_manager, "init"):
 
 
 def shutdown(sig, frame):
-    global messaged_proc, livepaged_proc, belld_proc
+    global messaged_proc, livepaged_proc, belld_proc, analytics_proc
     if endpoint_manager and hasattr(endpoint_manager, "shutdown_all"):
         endpoint_manager.shutdown_all()
 
@@ -144,11 +217,13 @@ def shutdown(sig, frame):
     if belld_proc:
         belld_proc.terminate()
 
+    stop_analytics()
+
     sys.exit(0)
 
 
 def main():
-    global messaged_proc, livepaged_proc, belld_proc
+    global messaged_proc, livepaged_proc, belld_proc, analytics_proc
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
@@ -173,6 +248,7 @@ def main():
     while True:
         try:
             sync_modules()
+            sync_analytics()
             if endpoint_manager and hasattr(endpoint_manager, "sync_modules"):
                 endpoint_manager.sync_modules()
         except Exception as exc:
