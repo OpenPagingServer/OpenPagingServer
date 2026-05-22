@@ -1,5 +1,3 @@
-"""Python web page implementation."""
-
 from srv.web.app import *
 from srv.web.pages.messages.form_common import (
     MESSAGE_FORM_SCRIPT,
