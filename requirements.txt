@@ -1,3 +1,5 @@
 PyMySQL
 python-dotenv
 mysql-connector-python
+Flask
+waitress
