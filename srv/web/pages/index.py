@@ -20,7 +20,7 @@ def handle_request():
         data = {}
         login_error = "Initialization failed: " + str(exc)
 
-    if session.get("user_id"):
+    if session.get("user_id") is not None and session.get("user_id") != "":
         return redirect("/dashboard")
 
     if request.method == "POST":
