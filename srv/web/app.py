@@ -157,7 +157,7 @@ def truthy(value):
 
 def current_user():
     user_id = session.get("user_id")
-    if user_id is None or user_id == "":
+    if not user_id:
         return None
     return query_one("SELECT id, username, role, adminperm, userperm FROM users WHERE id=%s LIMIT 1", (user_id,))
 
@@ -277,7 +277,7 @@ def legacy_sidebar_html(ctx, active):
 
 
 def legacy_page(title, ctx, active, style, content, extra_script="", extra_after=""):
-    favicon_html = '<link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">'
+    favicon_html = f'<link rel="icon" href="{h(ctx.get("favicon"))}" type="image/x-icon">' if ctx.get("favicon") else ""
     common_sidebar_style = """
 #sidebar a,.logout-btn,.admin-only{display:flex!important;align-items:center;gap:10px}
 #sidebar .nav-icon,.logout-btn .nav-icon,.admin-only .nav-icon{width:20px;display:inline-flex;justify-content:center;flex:0 0 20px}
@@ -913,7 +913,7 @@ def endpoint_module_settings():
     return dispatch_web_page("admin/endpoint-module-settings")
 
 
-@alias("/admin/endpoint-module-settings-configure", methods=["GET", "POST"])
+@alias("/admin/endpoint-module-settings-configure")
 @alias("/admin/endpoint-module-settings-frame")
 def endpoint_module_settings_configure():
     return dispatch_web_page("admin/endpoint-module-settings-configure")
@@ -1001,7 +1001,7 @@ def bells_groups():
     return dispatch_web_page("bells/groups")
 
 
-@alias("/bells/calendar", methods=["GET", "POST"])
+@alias("/bells/calendar")
 def bells_calendar():
     return dispatch_web_page("bells/calendar")
 
