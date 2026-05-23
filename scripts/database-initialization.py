@@ -336,7 +336,7 @@ def seed_defaults(cursor):
         ),
         (
             "login_logo_light",
-            "/assets/OPENPAGINGSERVER-768x576-DARKMODE.png",
+            "/assets/OPENPAGINGSERVER-768x576-LIGHTMODE.png",
             "Light mode logo. Path to file within web server.",
         ),
         ("product_name", "Open Paging Server", "Name of this server."),
