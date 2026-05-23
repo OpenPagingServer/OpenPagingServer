@@ -3,6 +3,10 @@ import xml.etree.ElementTree as ET
 from srv.web.app import *
 
 OOBE_STAGES = {"welcome", "account", "time", "modules", "analytics", "complete"}
+WELCOME_START_BUTTON_CLASS = "button good"
+TIME_NEXT_BUTTON_CLASS = "button"
+ANALYTICS_CONTINUE_DISABLED_BUTTON_CLASS = "button good"
+ANALYTICS_OPT_IN_BUTTON_CLASS = "button"
 
 OOBE_STYLE = r"""
 body,html{margin:0;padding:0;min-height:100%;font-family:Tahoma,sans-serif;background:#e3f2fd;color:#202124}
@@ -83,9 +87,9 @@ def logo_html(settings):
     return f"""<div class="logo"><img src="{h(settings.get("login_logo_light"))}" alt="{h(settings.get("product_name"))} logo"></div>"""
 
 
-def form_buttons(stage, back_stage=None, next_label="Next"):
+def form_buttons(stage, back_stage=None, next_label="Next", next_class="button"):
     back = f'<button class="button secondary" name="action" value="back" type="submit">Back</button><input type="hidden" name="back_stage" value="{h(back_stage)}">' if back_stage else ""
-    return f'<input type="hidden" name="stage" value="{h(stage)}"><div class="actions">{back}<button class="button" type="submit">{h(next_label)}</button></div>'
+    return f'<input type="hidden" name="stage" value="{h(stage)}"><div class="actions">{back}<button class="{h(next_class)}" type="submit">{h(next_label)}</button></div>'
 
 
 def stage_body(stage, settings, error, notice):
@@ -93,7 +97,7 @@ def stage_body(stage, settings, error, notice):
     modules = module_list()
     alerts = (f'<div class="error">{h(error)}</div>' if error else "") + (f'<div class="notice">{h(notice)}</div>' if notice else "")
     if stage == "welcome":
-        content = '<h1>Welcome to Open Paging Server</h1><p class="lead">You are a few steps away from getting started with your new paging system.</p><form method="post">' + form_buttons("welcome", None, "Start") + "</form>"
+        content = '<h1>Welcome to Open Paging Server</h1><p class="lead">You are a few steps away from getting started with your new paging system.</p><form method="post">' + form_buttons("welcome", None, "Start", WELCOME_START_BUTTON_CLASS) + "</form>"
     elif stage == "account":
         content = """<h1>Create an account</h1><p class="lead">To begin, please create your user account. This will be the main administrator account, and cannot be deleted.</p>
         <form method="post"><input type="hidden" name="stage" value="account">
@@ -105,19 +109,52 @@ def stage_body(stage, settings, error, notice):
     elif stage == "time":
         content = f"""<h1>Is this date and time correct?</h1><p class="lead">If not, ensure this system is using the correct NTP server and timezone. Correct date &amp; time is important for bells, scheduled broadcasts, history, message expiration, and general housekeeping.</p>
         <div class="timebox"><div class="time" id="serverTime" data-iso="{h(now.isoformat())}">{h(now.strftime("%I:%M %p").lstrip("0"))}</div><div class="date" id="serverDate" data-iso="{h(now.isoformat())}">{h(now.strftime("%A %b %d, %Y"))}</div></div>
-        <form method="post"><input type="hidden" name="stage" value="time"><div class="actions"><button class="button secondary" name="action" value="back" type="submit">Back</button><input type="hidden" name="back_stage" value="account"><button class="button good" name="action" value="next" type="submit">Next</button></div></form>"""
+        <form method="post"><input type="hidden" name="stage" value="time"><div class="actions"><button class="button secondary" name="action" value="back" type="submit">Back</button><input type="hidden" name="back_stage" value="account"><button class="{TIME_NEXT_BUTTON_CLASS}" name="action" value="next" type="submit">Next</button></div></form>"""
     elif stage == "modules":
         items = "".join(f"<li>{h(item['name'])}{(' ' + h(item['version'])) if item['version'] else ''}{(' by ' + h(item['author'])) if item['author'] else ''}</li>" for item in modules) or "<li>No endpoint modules found.</li>"
         content = f"""<h1>Endpoint modules</h1><p class="lead">Open Paging Server uses endpoint modules. You have the following endpoint modules installed:</p><ul class="module-list">{items}</ul><p class="lead">You can add more in /opt/openpagingserver/endpoint-modules</p>
         <form method="post"><input type="hidden" name="stage" value="modules"><div class="actions"><button class="button secondary" name="action" value="back" type="submit">Back</button><input type="hidden" name="back_stage" value="time"><button class="button" type="submit">Next</button></div></form>"""
     elif stage == "analytics":
-        content = """<h1>Would you like to enable optional analytics?</h1><p class="lead">To help the Open Paging Server project improve, you can opt-in to share optional analytics. Analytics contain mainly anonymous data such as your operating system, software versions, anonymized crash logs, etc. And may include your public IP address. You can change this setting later.</p>
-        <form method="post"><input type="hidden" name="stage" value="analytics"><div class="actions"><button class="button secondary" name="action" value="back" type="submit">Back</button><input type="hidden" name="back_stage" value="modules"><button class="button warn" name="action" value="continue_disabled" type="submit">Continue disabled</button><button class="button good" name="action" value="opt_in" type="submit">Opt-in</button></div></form>"""
+        content = f"""<h1>Would you like to enable optional analytics?</h1><p class="lead">To help the Open Paging Server project improve, you can opt-in to share optional analytics. Analytics contain mainly anonymous data such as your operating system, software versions, anonymized crash logs, etc. And may include your public IP address. You can change this setting later.</p>
+        <form method="post"><input type="hidden" name="stage" value="analytics"><div class="actions"><button class="button secondary" name="action" value="back" type="submit">Back</button><input type="hidden" name="back_stage" value="modules"><button class="{ANALYTICS_CONTINUE_DISABLED_BUTTON_CLASS}" name="action" value="continue_disabled" type="submit">Continue disabled</button><button class="{ANALYTICS_OPT_IN_BUTTON_CLASS}" name="action" value="opt_in" type="submit">Opt-in</button></div></form>"""
     else:
         content = '<h1>Setup complete!</h1><p class="lead">To continue, login with your username and password you just made.</p><p class="lead">Happy Paging!</p><div class="actions"><a class="button" href="/">Login</a></div>'
     script = """<script>
 const serverTime=document.getElementById('serverTime'),serverDate=document.getElementById('serverDate');
 if(serverTime&&serverDate){const d=new Date(serverTime.dataset.iso);if(!Number.isNaN(d.getTime())){serverTime.textContent=new Intl.DateTimeFormat(undefined,{hour:'numeric',minute:'2-digit'}).format(d);serverDate.textContent=new Intl.DateTimeFormat(undefined,{weekday:'long',month:'short',day:'numeric',year:'numeric'}).format(d);}}
+</script>"""
+    if stage == "welcome":
+        script += """<script>
+(async()=>{
+  if(window.name==='ops-oobe-reset-done') return;
+  window.name='ops-oobe-reset-done';
+  try{ localStorage.clear(); }catch(e){}
+  try{ sessionStorage.clear(); }catch(e){}
+  try{
+    const cookies=document.cookie ? document.cookie.split(';') : [];
+    for(const cookie of cookies){
+      const name=cookie.split('=')[0].trim();
+      if(!name) continue;
+      document.cookie=`${name}=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/`;
+    }
+  }catch(e){}
+  try{
+    if('caches' in window){
+      const names=await caches.keys();
+      await Promise.all(names.map((name)=>caches.delete(name)));
+    }
+  }catch(e){}
+  try{
+    if(window.indexedDB && indexedDB.databases){
+      const dbs=await indexedDB.databases();
+      await Promise.all((dbs||[]).map((db)=>db && db.name ? new Promise((resolve)=>{
+        const req=indexedDB.deleteDatabase(db.name);
+        req.onsuccess=req.onerror=req.onblocked=()=>resolve();
+      }) : Promise.resolve()));
+    }
+  }catch(e){}
+  window.location.replace(window.location.pathname);
+})();
 </script>"""
     return f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Setup - {h(settings["product_name"])}</title>{f'<link rel="icon" href="{h(settings["favicon"])}" type="image/x-icon">' if settings.get("favicon") else ""}<style>{OOBE_STYLE}</style></head><body><div class="page">{logo_html(settings)}<main class="wrap"><section class="card">{alerts}{content}</section></main></div>{script}</body></html>"""
 
@@ -125,6 +162,8 @@ if(serverTime&&serverDate){const d=new Date(serverTime.dataset.iso);if(!Number.i
 def handle_request():
     if not oobe_trigger_enabled() or oobe_user_count() > 0:
         return redirect("/")
+    if request.method == "GET" and oobe_stage() == "welcome":
+        session.clear()
     settings = oobe_settings()
     stage = oobe_stage()
     error = ""
@@ -164,8 +203,19 @@ def handle_request():
                 stage = "welcome"
                 error = "Please create the administrator account first."
             elif oobe_user_count() == 0:
-                execute("SET SESSION sql_mode = IF(FIND_IN_SET('NO_AUTO_VALUE_ON_ZERO', @@sql_mode), @@sql_mode, CONCAT_WS(',', @@sql_mode, 'NO_AUTO_VALUE_ON_ZERO'))")
-                execute("INSERT INTO users (id, username, email, password, salt, role, userperm, adminperm) VALUES (0,%s,%s,%s,%s,'admin','all','all')", (pending_user["username"], pending_user["email"] or None, pending_user["password"], pending_user["salt"]))
+                conn = db()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SET SESSION sql_mode = IF(FIND_IN_SET('NO_AUTO_VALUE_ON_ZERO', @@sql_mode), @@sql_mode, CONCAT_WS(',', @@sql_mode, 'NO_AUTO_VALUE_ON_ZERO'))"
+                        )
+                        cur.execute(
+                            "INSERT INTO users (id, username, email, password, salt, role, userperm, adminperm) VALUES (0,%s,%s,%s,%s,'admin','all','all')",
+                            (pending_user["username"], pending_user["email"] or None, pending_user["password"], pending_user["salt"]),
+                        )
+                    conn.commit()
+                finally:
+                    conn.close()
                 session.pop("oobe_user", None)
                 try:
                     (BASE_DIR / ".oobe").unlink(missing_ok=True)
