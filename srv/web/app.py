@@ -157,7 +157,7 @@ def truthy(value):
 
 def current_user():
     user_id = session.get("user_id")
-    if not user_id:
+    if user_id is None or user_id == "":
         return None
     return query_one("SELECT id, username, role, adminperm, userperm FROM users WHERE id=%s LIMIT 1", (user_id,))
 
@@ -222,7 +222,7 @@ def legacy_user_context(user=None):
         user = current_user()
     user = user or {}
     role = user.get("role") or ""
-    if user.get("id") and not role:
+    if user.get("id") is not None and user.get("id") != "" and not role:
         role_row = query_one("SELECT role FROM users WHERE id = %s LIMIT 1", (user.get("id"),)) or {}
         role = role_row.get("role") or ""
     data = settings()
