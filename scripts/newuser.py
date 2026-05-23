@@ -56,13 +56,13 @@ def create_user():
         verifier = hashlib.sha256(verifier_input.encode()).hexdigest()
 
         if user_id is not None:
-            sql = """INSERT INTO users (username, email, password, salt, role) 
-                     VALUES (%s, %s, %s, %s, %s)"""
-            cursor.execute(sql, (username, email, verifier, salt, role))
-        else:
             sql = """INSERT INTO users (id, username, email, password, salt, role) 
                      VALUES (%s, %s, %s, %s, %s, %s)"""
             cursor.execute(sql, (user_id, username, email, verifier, salt, role))
+        else:
+            sql = """INSERT INTO users (username, email, password, salt, role) 
+                     VALUES (%s, %s, %s, %s, %s)"""
+            cursor.execute(sql, (username, email, verifier, salt, role))
 
         conn.commit()
         print(f"\nUser '{username}' created successfully!")
