@@ -422,6 +422,11 @@ def send_report(server_id):
         message = response.headers.get("X-Message")
         if message:
             log(message)
+        save_local_setting(
+            "analytics_last_successful_report",
+            datetime.now().astimezone().isoformat(timespec="seconds"),
+            "Most recent successful analytics report upload time.",
+        )
         log("sent analytics report")
         return True
     if response.code in (401, 403):

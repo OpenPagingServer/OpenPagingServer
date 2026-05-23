@@ -25,10 +25,6 @@ def sql_string(value):
     return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
-def php_string(value):
-    return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
-
-
 def safe_endpoint_module_dir(path):
     return (
         path.is_dir()
@@ -356,6 +352,7 @@ def seed_defaults(cursor):
         ("use_logo_in_sidebar", "1", "Use a logo in the sidebar, if disabled the product name will show"),
         ("sidebar_logo_light", "/assets/OPENPAGINGSERVER-768x576-LIGHTMODE.png", "Light mode logo for the sidebar"),
         ("sidebar_logo_dark", "/assets/OPENPAGINGSERVER-768x576-DARKMODE.png", "Dark mode logo for the sidebar"),
+        ("webserver_enable", "1", "Enable access to Open Paging Server via a web browser (0/1)"),
         ("webserver_https_enable", "0", "HTTPs Enable (0/1)"),
         ("webserver_https_port", "443", "HTTPs Server Port (Default: 443)"),
         ("webserver_http_port", "80", "HTTP Server Port (Default: 80)"),
@@ -373,27 +370,6 @@ def seed_defaults(cursor):
 
 
 def write_config(db_password):
-    config_php = f"""<?php
-$host = 'localhost';
-$db   = '{DATABASE_NAME}';
-$user = '{DATABASE_USER}';
-$pass = {php_string(db_password)};
-$charset = 'utf8mb4';
-
-$dsn = "mysql:host=$host;dbname=$db;charset=$charset";
-$options = [
-    PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
-    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-    PDO::ATTR_EMULATE_PREPARES   => false,
-];
-
-try {{
-    $pdo = new PDO($dsn, $user, $pass, $options);
-}} catch (\\PDOException $e) {{
-    throw new \\PDOException($e->getMessage(), (int)$e->getCode());
-}}
-"""
-
     env_file = f"""DB_HOST='127.0.0.1'
 DB_USER='{DATABASE_USER}'
 DB_PASS={sql_string(db_password)}
@@ -401,10 +377,7 @@ DB_NAME='{DATABASE_NAME}'
 DEBUG=false
 """
 
-    os.makedirs("/opt/OpenPagingServer/web", exist_ok=True)
     os.makedirs("/var/lib/openpagingserver/assets", exist_ok=True)
-    with open("/opt/OpenPagingServer/web/config.php", "w", encoding="utf-8") as config_file:
-        config_file.write(config_php)
     with open(PROJECT_ROOT / ".env", "w", encoding="utf-8") as env_config_file:
         env_config_file.write(env_file)
     with open(PROJECT_ROOT / ".oobe", "w", encoding="utf-8"):

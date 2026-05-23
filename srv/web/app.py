@@ -1001,7 +1001,7 @@ def bells_groups():
     return dispatch_web_page("bells/groups")
 
 
-@alias("/bells/calendar")
+@alias("/bells/calendar", methods=["GET", "POST"])
 def bells_calendar():
     return dispatch_web_page("bells/calendar")
 

@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 import os
 import base64
 import hashlib
@@ -398,10 +396,10 @@ def clean_group_id(value):
     return ".".join(parts)
 
 
-def handle_websocket_client(conn, addr):
+def handle_websocket_client(conn, addr, request=None):
     session = None
     try:
-        request = recv_until(conn, b"\r\n\r\n")
+        request = request if request is not None else recv_until(conn, b"\r\n\r\n")
         path, query, headers = parse_ws_request(request)
         key = headers.get("sec-websocket-key", "")
         group_id = clean_group_id((query.get("groups") or [""])[0])

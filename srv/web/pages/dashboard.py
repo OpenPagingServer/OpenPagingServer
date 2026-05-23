@@ -1,3 +1,4 @@
+
 from srv.web.app import *
 
 def handle_request():
