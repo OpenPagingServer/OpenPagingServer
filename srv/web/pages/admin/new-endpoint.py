@@ -62,10 +62,8 @@ def handle_request():
             meta_parts = []
             if module.get("version"):
                 meta_parts.append(f"Version {h(module['version'])}")
-            if module.get("module"):
-                meta_parts.append(h(module["module"]))
             meta = f'<div class="module-meta">{" - ".join(meta_parts)}</div>' if meta_parts else ""
-            desc = f'<div class="module-description">{h(module.get("description") or "No description available.")}</div>'
+            desc = f'<div class="module-description">{h(module.get("description") or "")}</div>'
             state_badge = '<span class="module-badge disabled">Disabled</span>' if not module.get("enabled") else ""
             cards.append(
                 f"""<a class="module-card" href="/admin/new-endpoint-configure?module={h(module["module"])}">

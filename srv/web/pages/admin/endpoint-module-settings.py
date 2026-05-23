@@ -100,18 +100,12 @@ def handle_request():
                         </a>"""
         description = f'<div class="module-meta">{h(module_info.get("description") or "")}</div>' if module_info.get("description") else ""
         version = f' - Version {h(module_info.get("version"))}' if module_info.get("version") else ""
-        loaded_pill = '<span class="status-pill"><i class="fa-solid fa-circle-check"></i> Loaded</span>' if module_info.get("loaded") else '<span class="status-pill disabled"><i class="fa-solid fa-circle-pause"></i> Not loaded</span>'
-        form_pill = '<span class="status-pill">Add form available</span>' if module_info.get("has_forms") else '<span class="status-pill disabled">No add form</span>'
         cards += f"""<section class="module-card">
             <div class="module-head">
                 <div>
                     <div class="module-title">{h(module_info.get("name") or module)}</div>
                     <div class="module-meta">{h(module)}{f' - {h(module_info.get("input_type"))}' if module_info.get("input_type") else ''}{version}</div>
                     {description}
-                    <div class="module-status">
-                        {loaded_pill}
-                        {form_pill}
-                    </div>
                 </div>
                 <div class="module-controls">
                     {settings_link}
