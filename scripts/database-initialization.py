@@ -320,7 +320,6 @@ def seed_defaults(cursor):
             "",
             "Analytics secret. DO NOT SHARE.",
         ),
-        ("favicon", "/assets/favicon.svg", "Browser Favicon. Path to file within web server."),
         ("insecure_sip_port", "5060", "Port for UDP/TCP SIP"),
         ("login_banner_enabled", "1", "Enable or disable the login page banner (0/1)"),
         (
