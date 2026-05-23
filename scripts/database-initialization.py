@@ -375,6 +375,9 @@ DB_USER='{DATABASE_USER}'
 DB_PASS={sql_string(db_password)}
 DB_NAME='{DATABASE_NAME}'
 DEBUG=false
+WEB_REVERSE_PROXY_ALLOWED=127.0.0.1
+API_REVERSE_PROXY_ALLOWED=127.0.0.1
+
 """
 
     os.makedirs("/var/lib/openpagingserver/assets", exist_ok=True)
