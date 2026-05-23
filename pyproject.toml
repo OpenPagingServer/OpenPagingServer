@@ -9,5 +9,6 @@ dependencies = [
     "python-dotenv",
     "mysql-connector-python",
     "flask",
-    "waitress"
+    "waitress",
+    "argon2"
 ]
