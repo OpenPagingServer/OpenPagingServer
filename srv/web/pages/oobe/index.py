@@ -93,7 +93,7 @@ def stage_body(stage, settings, error, notice):
     modules = module_list()
     alerts = (f'<div class="error">{h(error)}</div>' if error else "") + (f'<div class="notice">{h(notice)}</div>' if notice else "")
     if stage == "welcome":
-    content = '<h1>Welcome to Open Paging Server</h1><p class="lead">You are a few steps away from getting started with your new paging system.</p><form method="post"><input type="hidden" name="stage" value="welcome"><div class="actions"><button class="button good" type="submit">Start</button></div></form>'
+        content = '<h1>Welcome to Open Paging Server</h1><p class="lead">You are a few steps away from getting started with your new paging system.</p><form method="post"><input type="hidden" name="stage" value="welcome"><div class="actions"><button class="button good" type="submit">Start</button></div></form>'
     elif stage == "account":
         content = """<h1>Create an account</h1><p class="lead">To begin, please create your user account. This will be the main administrator account, and cannot be deleted.</p>
         <form method="post"><input type="hidden" name="stage" value="account">
