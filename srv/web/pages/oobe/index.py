@@ -93,7 +93,7 @@ def stage_body(stage, settings, error, notice):
     modules = module_list()
     alerts = (f'<div class="error">{h(error)}</div>' if error else "") + (f'<div class="notice">{h(notice)}</div>' if notice else "")
     if stage == "welcome":
-        content = '<h1>Welcome to Open Paging Server</h1><p class="lead">You are a few steps away from getting started with your new paging system.</p><form method="post"><input type="hidden" name="stage" value="welcome"><div class="actions"><button class="button good" type="submit">Start</button></div></form>'
+        content = '<h1>Welcome to Open Paging Server</h1><p class="lead">You are a few steps away from getting started with your new paging system.</p><form method="post">' + form_buttons("welcome", None, "Start") + "</form>"
     elif stage == "account":
         content = """<h1>Create an account</h1><p class="lead">To begin, please create your user account. This will be the main administrator account, and cannot be deleted.</p>
         <form method="post"><input type="hidden" name="stage" value="account">
@@ -111,7 +111,7 @@ def stage_body(stage, settings, error, notice):
         content = f"""<h1>Endpoint modules</h1><p class="lead">Open Paging Server uses endpoint modules. You have the following endpoint modules installed:</p><ul class="module-list">{items}</ul><p class="lead">You can add more in /opt/openpagingserver/endpoint-modules</p>
         <form method="post"><input type="hidden" name="stage" value="modules"><div class="actions"><button class="button secondary" name="action" value="back" type="submit">Back</button><input type="hidden" name="back_stage" value="time"><button class="button" type="submit">Next</button></div></form>"""
     elif stage == "analytics":
-        content = """<h1>Would you like to enable optional analytics?</h1><p class="lead">To help the Open Paging Server project improve, you can opt-in to share optional analytics. Analytics contain mainly anonymous data such as your operating system, software versions, anonymized crash logs, etc. And may include your public IP address. You will be assigned an anymnouns identifier you can send to Open Paging Server project staff to pull analytical data. You can change this setting later. By opting in, you consent to sharing this information with the Open Paging Server project. <a href="https://www.openpagingserver.org/privacypolicy/analytics" target="_blank" rel="noopener">Privacy Policy</a></p>
+        content = """<h1>Would you like to enable optional analytics?</h1><p class="lead">To help the Open Paging Server project improve, you can opt-in to share optional analytics. Analytics contain mainly anonymous data such as your operating system, software versions, anonymized crash logs, etc. And may include your public IP address. You can change this setting later.</p>
         <form method="post"><input type="hidden" name="stage" value="analytics"><div class="actions"><button class="button secondary" name="action" value="back" type="submit">Back</button><input type="hidden" name="back_stage" value="modules"><button class="button warn" name="action" value="continue_disabled" type="submit">Continue disabled</button><button class="button good" name="action" value="opt_in" type="submit">Opt-in</button></div></form>"""
     else:
         content = '<h1>Setup complete!</h1><p class="lead">To continue, login with your username and password you just made.</p><p class="lead">Happy Paging!</p><div class="actions"><a class="button" href="/">Login</a></div>'
