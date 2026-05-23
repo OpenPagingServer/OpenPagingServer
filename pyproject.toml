@@ -8,4 +8,6 @@ dependencies = [
     "PyMySQL",
     "python-dotenv",
     "mysql-connector-python",
+    "flask",
+    "waitress"
 ]
