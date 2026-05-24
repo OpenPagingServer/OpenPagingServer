@@ -913,7 +913,7 @@ def endpoint_module_settings():
     return dispatch_web_page("admin/endpoint-module-settings")
 
 
-@alias("/admin/endpoint-module-settings-configure")
+@alias("/admin/endpoint-module-settings-configure", methods=["GET", "POST"])
 @alias("/admin/endpoint-module-settings-frame")
 def endpoint_module_settings_configure():
     return dispatch_web_page("admin/endpoint-module-settings-configure")
