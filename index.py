@@ -1,24 +1,33 @@
 #!/usr/bin/env python3
 
-import atexit
-import argparse
 import ipaddress
+import json
 import os
 import platform
+import re
+import shlex
 import shutil
 import signal
 import socket
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
+import traceback
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import datetime
+import importlib.util
 from pathlib import Path
 
-import pymysql
-from dotenv import load_dotenv
+try:
+    import pymysql
+except Exception:
+    pymysql = None
+
+try:
+    from dotenv import load_dotenv
+except Exception:
+    def load_dotenv(*args, **kwargs):
+        return False
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -28,176 +37,193 @@ DB_USER = os.getenv("DB_USER")
 DB_PASS = os.getenv("DB_PASS")
 DB_NAME = os.getenv("DB_NAME")
 
-token = None
-last_token_renewal = 0.0
-stopping = False
+MODULE_LOADER_PATH = BASE_DIR / "endpoint-modules" / "index.py"
+MODULES_DIR = BASE_DIR / "endpoint-modules"
+
+loaded_modules = {}
+messaged_proc = None
+livepaged_proc = None
+belld_proc = None
+analytics_proc = None
+webd_proc = None
+endpoint_manager = None
+sip_server = None
 
 
-def db():
-    if not DB_NAME:
-        raise RuntimeError(".env not set!")
-    return pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASS, database=DB_NAME)
+class Core:
+    def log(self, msg):
+        print(msg)
 
 
-def log(message):
-    print(f"[analyticsd] {message}", flush=True)
+core = Core()
 
 
-def load_server_id():
-    return load_local_setting("analytics_server_id")
-
-
-def load_server_secret():
-    return load_local_setting("analytics_server_secret")
-
-
-def load_local_setting(parameter):
-    conn = db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT value FROM systemsettings WHERE parameter = %s LIMIT 1", (parameter,))
-            row = cur.fetchone()
-            if row and str(row[0]).strip():
-                return str(row[0]).strip()
-            return None
-    finally:
-        conn.close()
-
-
-def save_server_id(server_id):
-    save_local_setting(
-        "analytics_server_id",
-        server_id,
-        "Analytics identifier. Reference this to Open Paging Server Project staff or in bug reports when requested."
+def get_db_connection():
+    if pymysql is None:
+        raise RuntimeError("PyMySQL is not installed")
+    return pymysql.connect(
+        host=DB_HOST,
+        user=DB_USER,
+        password=DB_PASS,
+        database=DB_NAME,
     )
 
 
-def save_server_secret(server_secret):
-    save_local_setting(
-        "analytics_server_secret",
-        server_secret,
-        "Analytics secret. DO NOT SHARE.",
-    )
-
-
-def save_local_setting(parameter, value, description):
-    conn = db()
+def analytics_enabled():
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO systemsettings (parameter, value, description)
-                VALUES (%s, %s, %s)
-                ON DUPLICATE KEY UPDATE value = VALUES(value), description = VALUES(description)
-                """,
-                (parameter, value, description),
-            )
-        conn.commit()
-
-        with conn.cursor() as cur:
-            cur.execute("SELECT value FROM systemsettings WHERE parameter = %s LIMIT 1", (parameter,))
-            row = cur.fetchone()
-            stored_id = str(row[0]).strip() if row and row[0] is not None else ""
-            if stored_id != value:
-                raise RuntimeError(f"{parameter} was not saved to the local database")
-    finally:
-        conn.close()
-
-
-def xml_bytes(root_name, values):
-    root = ET.Element(root_name)
-    for key, value in values.items():
-        child = ET.SubElement(root, key)
-        child.text = "" if value is None else str(value)
-    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
-
-
-def request(endpoint, body=None, auth_token=None):
-    headers = {
-        "User-Agent": "OpenPagingServer",
-        "Content-Type": "application/xml",
-        "Accept": "*/*",
-    }
-    if auth_token:
-        headers["Authorization"] = f"Bearer {auth_token}"
-
-    req = urllib.request.Request(
-        f"https://analytics.openpagingserver.org/{endpoint.strip('/')}/",
-        data=body,
-        headers=headers,
-        method="POST",
-    )
-    try:
-        return urllib.request.urlopen(req, timeout=30)
-    except urllib.error.HTTPError as exc:
-        return exc
-
-
-def register_token(server_id):
-    global token, last_token_renewal
-    server_secret = load_server_secret()
-    if server_id and not server_secret:
-        log("equesting a new secured server identity")
-        server_id = None
-    response = request(
-        "token/create",
-        xml_bytes("token_request", {"server_id": server_id, "server_secret": server_secret}),
-    )
-    if response.code == 204:
-        new_token = response.headers.get("X-Auth-Token")
-        if not new_token:
-            raise RuntimeError("analytics token response did not include X-Auth-Token")
-        new_server_id = response.headers.get("X-Server-Id") or server_id
-        if not new_server_id:
-            raise RuntimeError("analytics token response did not include X-Server-Id")
-        new_server_secret = response.headers.get("X-Server-Secret")
-        if not server_secret and not new_server_secret:
-            raise RuntimeError("analytics token response did not include X-Server-Secret")
-        save_server_id(new_server_id)
-        if new_server_secret:
-            save_server_secret(new_server_secret)
-        token = new_token
-        last_token_renewal = time.time()
-        log(f"registered analytics token for server id {new_server_id[:12]}...")
-        return new_server_id
-    if response.code == 403:
-        log("token registration was refused; if this install has an old analytics_server_id without a secret, clear analytics_server_id and analytics_server_secret once")
-        return False
-    raise RuntimeError(f"token registration failed with HTTP {response.code}")
-
-
-def renew_token(server_id):
-    global token, last_token_renewal
-    if not token:
-        return register_token(server_id)
-    response = request("token/renew", xml_bytes("token_request", {"server_id": server_id}), token)
-    if response.code == 204:
-        new_token = response.headers.get("X-Auth-Token")
-        if new_token:
-            token = new_token
-        last_token_renewal = time.time()
-        log("renewed analytics token")
-        return server_id
-    if response.code in (401, 403):
-        token = None
-        return register_token(server_id)
-    raise RuntimeError(f"token renewal failed with HTTP {response.code}")
-
-
-def delete_token():
-    global token
-    if not token:
-        return
-    try:
-        request("token/delete", None, token)
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM systemsettings WHERE parameter = 'analytics' LIMIT 1")
+                row = cur.fetchone()
+        finally:
+            conn.close()
     except Exception as exc:
-        log(f"token delete failed: {exc}")
-    token = None
+        core.log(f"analytics setting read error: {exc}")
+        return False
+
+    if not row:
+        return False
+
+    return str(row[0]).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def command_output(args):
+def start_analytics():
+    global analytics_proc
+    analytics_path = BASE_DIR / "analyticsd.py"
+    if analytics_proc and analytics_proc.poll() is None:
+        return
+    if not analytics_path.exists():
+        return
+
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
+        "WINDIR": os.environ.get("WINDIR", ""),
+        "DB_HOST": DB_HOST or "",
+        "DB_USER": DB_USER or "",
+        "DB_PASS": DB_PASS or "",
+        "DB_NAME": DB_NAME or "",
+        "ANALYTICS_URL": os.environ.get("ANALYTICS_URL", "https://analytics.openpagingserver.org"),
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1",
+    }
+    popen_kwargs = {
+        "cwd": BASE_DIR,
+        "env": env,
+        "close_fds": True,
+    }
+    if os.name == "posix":
+        popen_kwargs["start_new_session"] = True
+    analytics_proc = subprocess.Popen([sys.executable, str(analytics_path)], **popen_kwargs)
+    core.log(f"analytics worker started pid={analytics_proc.pid}")
+
+
+def stop_analytics():
+    global analytics_proc
+    if not analytics_proc:
+        return
+    if analytics_proc.poll() is None:
+        analytics_proc.terminate()
+        try:
+            analytics_proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            analytics_proc.kill()
+            analytics_proc.wait(timeout=5)
+    core.log("analytics worker stopped")
+    analytics_proc = None
+
+
+def sync_analytics():
+    if analytics_enabled():
+        start_analytics()
+    else:
+        stop_analytics()
+
+
+def db_enabled_modules():
+    return set()
+
+
+def discover_modules():
+    found = {}
+    if not MODULES_DIR.exists():
+        return found
+
+    for module_dir in MODULES_DIR.iterdir():
+        if not module_dir.is_dir():
+            continue
+
+        manifest = module_dir / "manifest.json"
+        if not manifest.exists():
+            continue
+
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        found[data["id"]] = module_dir / data["entry"]
+
+    return found
+
+
+def load_module(mid, entry):
+    spec = importlib.util.spec_from_file_location(mid, entry)
+    if spec is None or spec.loader is None:
+        return
+
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    if hasattr(mod, "init"):
+        mod.init(core)
+
+    loaded_modules[mid] = mod
+    core.log(f"loaded module {mid}")
+
+
+def unload_module(mid):
+    mod = loaded_modules.get(mid)
+    if mod is None:
+        return
+
+    if hasattr(mod, "shutdown"):
+        mod.shutdown()
+
+    del loaded_modules[mid]
+    core.log(f"unloaded module {mid}")
+
+
+def sync_modules():
+    enabled = db_enabled_modules()
+    discovered = discover_modules()
+
+    for mid in enabled:
+        if mid not in loaded_modules and mid in discovered:
+            load_module(mid, discovered[mid])
+
+    for mid in list(loaded_modules.keys()):
+        if mid not in enabled:
+            unload_module(mid)
+
+
+def load_endpoint_manager():
+    spec = importlib.util.spec_from_file_location("endpoint_manager", MODULE_LOADER_PATH)
+    if spec is None or spec.loader is None:
+        return None
+
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def command_output(args, timeout=10):
     try:
-        result = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5)
+        result = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
     except Exception:
         return ""
     if result.returncode != 0:
@@ -205,15 +231,204 @@ def command_output(args):
     return result.stdout.strip()
 
 
-def read_first(paths):
-    for path in paths:
+def bool_text(value):
+    return "Yes" if value else "No"
+
+
+def format_bytes(value):
+    try:
+        value = int(value)
+    except Exception:
+        return "Unknown"
+
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    number = float(value)
+    unit = units[0]
+    for unit in units:
+        if number < 1024.0 or unit == units[-1]:
+            break
+        number /= 1024.0
+    if unit in {"B", "KB"}:
+        return f"{number:.0f} {unit}"
+    return f"{number:.2f} {unit}"
+
+
+def format_uptime(seconds):
+    try:
+        total = int(seconds)
+    except Exception:
+        return "Unknown"
+
+    days, remainder = divmod(total, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, secs = divmod(remainder, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or parts:
+        parts.append(f"{hours}h")
+    if minutes or parts:
+        parts.append(f"{minutes}m")
+    parts.append(f"{secs}s")
+    return " ".join(parts)
+
+
+def read_pyproject_version():
+    pyproject_path = BASE_DIR / "pyproject.toml"
+    if not pyproject_path.exists():
+        return "Unknown"
+    try:
+        for line in pyproject_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("version"):
+                return stripped.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        return "Unknown"
+    return "Unknown"
+
+
+def is_admin_user():
+    if os.name == "nt":
         try:
-            value = Path(path).read_text(encoding="utf-8", errors="ignore").strip()
-        except OSError:
+            import ctypes
+
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None:
+        return False
+    return geteuid() == 0
+
+
+def candidate_project_pythons():
+    candidates = []
+    venv_names = [".venv", "venv", "env"]
+    for venv_name in venv_names:
+        if os.name == "nt":
+            candidates.append(BASE_DIR / venv_name / "Scripts" / "python.exe")
+        else:
+            candidates.append(BASE_DIR / venv_name / "bin" / "python")
+    return [path for path in candidates if path.exists()]
+
+
+def _windows_running_python():
+    script_path = str((BASE_DIR / "index.py").resolve()).replace("\\", "\\\\")
+    ps_script = rf"""
+$procs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {{
+    $_.ProcessId -ne {os.getpid()} -and $_.CommandLine -and $_.CommandLine -like '*index.py*'
+}} | Select-Object ProcessId, ExecutablePath, CommandLine
+$procs | ConvertTo-Json -Depth 4 -Compress
+"""
+    output = command_output(["powershell", "-NoProfile", "-Command", ps_script], timeout=15)
+    if not output:
+        return None
+    try:
+        parsed = json.loads(output)
+    except json.JSONDecodeError:
+        return None
+
+    rows = parsed if isinstance(parsed, list) else [parsed]
+    for row in rows:
+        command_line = str(row.get("CommandLine") or "")
+        executable = str(row.get("ExecutablePath") or "")
+        if str(os.getpid()) == str(row.get("ProcessId")):
             continue
-        if value:
-            return value
-    return ""
+        if script_path.lower() in command_line.lower() or "index.py" in command_line.lower():
+            if executable:
+                return executable
+    return None
+
+
+def _posix_running_python():
+    output = command_output(["ps", "-eo", "pid=,args="], timeout=15)
+    if not output:
+        return None
+    target_path = str((BASE_DIR / "index.py").resolve())
+    for line in output.splitlines():
+        match = re.match(r"^\s*(\d+)\s+(.*)$", line)
+        if not match:
+            continue
+        pid = int(match.group(1))
+        if pid == os.getpid():
+            continue
+        command_line = match.group(2)
+        if target_path not in command_line and "index.py" not in command_line:
+            continue
+        try:
+            parts = shlex.split(command_line)
+        except ValueError:
+            continue
+        if not parts:
+            continue
+        return parts[0]
+    return None
+
+
+def detect_running_python():
+    if os.name == "nt":
+        return _windows_running_python()
+    return _posix_running_python()
+
+
+def gather_python_environment_from_interpreter(interpreter):
+    if Path(interpreter).resolve() == Path(sys.executable).resolve():
+        try:
+            import importlib.metadata as metadata
+
+            packages = []
+            for dist in metadata.distributions():
+                name = dist.metadata.get("Name") or dist.metadata.get("Summary") or dist.name
+                packages.append(f"{name}=={dist.version}")
+            packages.sort(key=str.lower)
+            in_venv = (
+                hasattr(sys, "real_prefix")
+                or sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+                or bool(os.environ.get("VIRTUAL_ENV"))
+            )
+            return {
+                "python_version": platform.python_version(),
+                "in_venv": in_venv,
+                "packages": packages,
+            }
+        except Exception:
+            return {
+                "python_version": platform.python_version(),
+                "in_venv": False,
+                "packages": [],
+            }
+
+    inspector = (
+        "import importlib.metadata as m, json, os, platform, sys;"
+        "pkgs=[];"
+        "[(pkgs.append(f\"{(d.metadata.get('Name') or d.name)}=={d.version}\")) for d in m.distributions()];"
+        "pkgs.sort(key=str.lower);"
+        "print(json.dumps({"
+        "'python_version': platform.python_version(),"
+        "'in_venv': bool(getattr(sys, 'real_prefix', None)) or sys.prefix != getattr(sys, 'base_prefix', sys.prefix) or bool(os.environ.get('VIRTUAL_ENV')),"
+        "'packages': pkgs"
+        "}))"
+    )
+    result = command_output([interpreter, "-c", inspector], timeout=30)
+    if not result:
+        raise RuntimeError(f"Unable to inspect Python interpreter: {interpreter}")
+    payload = json.loads(result)
+    payload["packages"] = sorted(payload.get("packages") or [], key=str.lower)
+    return payload
+
+
+def choose_python_environment():
+    running_python = detect_running_python()
+    if running_python:
+        info = gather_python_environment_from_interpreter(running_python)
+        return running_python, info
+
+    for candidate in candidate_project_pythons():
+        info = gather_python_environment_from_interpreter(str(candidate))
+        return str(candidate), info
+
+    info = gather_python_environment_from_interpreter(sys.executable)
+    return sys.executable, info
 
 
 def distro_name():
@@ -236,25 +451,6 @@ def distro_name():
     return platform.platform()
 
 
-def host_model():
-    if sys.platform.startswith("linux"):
-        vendor = read_first(["/sys/class/dmi/id/sys_vendor", "/sys/devices/virtual/dmi/id/sys_vendor"])
-        product = read_first(["/sys/class/dmi/id/product_name", "/sys/devices/virtual/dmi/id/product_name"])
-        return " ".join(part for part in [vendor, product] if part).strip() or platform.machine()
-    if sys.platform == "darwin":
-        return command_output(["sysctl", "-n", "hw.model"]) or platform.machine()
-    if os.name == "nt":
-        value = command_output(["wmic", "computersystem", "get", "manufacturer,model", "/value"])
-        parts = []
-        for line in value.splitlines():
-            if "=" in line:
-                item = line.split("=", 1)[1].strip()
-                if item:
-                    parts.append(item)
-        return " ".join(parts) or platform.machine()
-    return platform.machine()
-
-
 def cpu_name():
     if sys.platform.startswith("linux"):
         try:
@@ -262,11 +458,15 @@ def cpu_name():
                 if line.lower().startswith("model name"):
                     return line.split(":", 1)[1].strip()
         except OSError:
-            pass
+            return platform.processor() or platform.machine()
     if sys.platform == "darwin":
         return command_output(["sysctl", "-n", "machdep.cpu.brand_string"]) or platform.processor()
     if os.name == "nt":
-        return platform.processor()
+        powershell_value = command_output(
+            ["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name)"],
+            timeout=10,
+        )
+        return powershell_value or platform.processor() or platform.machine()
     return platform.processor() or platform.machine()
 
 
@@ -277,56 +477,51 @@ def ram_bytes():
                 if line.startswith("MemTotal:"):
                     return int(line.split()[1]) * 1024
         except Exception:
-            return ""
+            return None
     if sys.platform == "darwin":
-        return command_output(["sysctl", "-n", "hw.memsize"])
+        value = command_output(["sysctl", "-n", "hw.memsize"])
+        return int(value) if value.isdigit() else None
     if os.name == "nt":
-        value = command_output(["wmic", "computersystem", "get", "TotalPhysicalMemory", "/value"])
-        for line in value.splitlines():
-            if line.startswith("TotalPhysicalMemory="):
-                return line.split("=", 1)[1].strip()
-    return ""
+        value = command_output(
+            ["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory"],
+            timeout=10,
+        )
+        return int(value) if value.isdigit() else None
+    return None
 
 
-def disk_usage():
-    usage = shutil.disk_usage(str(BASE_DIR.anchor or BASE_DIR))
-    return usage.total, usage.used
+def disk_usage_details():
+    disk_root = Path(BASE_DIR.anchor or os.path.sep)
+    usage = shutil.disk_usage(str(disk_root))
+    return str(disk_root), usage.total, usage.used
 
 
 def package_count():
     commands = [
-        (["dpkg-query", "-f", "${binary:Package}\n", "-W"], None),
-        (["rpm", "-qa"], None),
-        (["pacman", "-Qq"], None),
-        (["brew", "list", "--formula"], None),
-        (["pkgutil", "--pkgs"], None),
+        (["dpkg-query", "-f", "${binary:Package}\n", "-W"], 0),
+        (["rpm", "-qa"], 0),
+        (["pacman", "-Qq"], 0),
+        (["brew", "list", "--formula"], 0),
+        (["pkgutil", "--pkgs"], 0),
         (["winget", "list", "--disable-interactivity"], 2),
     ]
     for args, skip_lines in commands:
         if not shutil.which(args[0]):
             continue
-        output = command_output(args)
-        if output:
-            lines = [line for line in output.splitlines() if line.strip()]
-            if skip_lines:
-                lines = lines[skip_lines:]
+        output = command_output(args, timeout=20)
+        if not output:
+            continue
+        lines = [line for line in output.splitlines() if line.strip()]
+        if skip_lines:
+            lines = lines[skip_lines:]
+        if lines:
             return len(lines)
     try:
-        import importlib.metadata
+        import importlib.metadata as metadata
 
-        return len(list(importlib.metadata.distributions()))
+        return len(list(metadata.distributions()))
     except Exception:
-        return ""
-
-
-def ops_version():
-    try:
-        for line in (BASE_DIR / "pyproject.toml").read_text(encoding="utf-8", errors="ignore").splitlines():
-            if line.strip().startswith("version"):
-                return line.split("=", 1)[1].strip().strip('"').strip("'")
-    except OSError:
-        pass
-    return ""
+        return "Unknown"
 
 
 def server_uptime_seconds():
@@ -334,7 +529,7 @@ def server_uptime_seconds():
         try:
             return int(float(Path("/proc/uptime").read_text(encoding="utf-8").split()[0]))
         except Exception:
-            return ""
+            return None
     if sys.platform == "darwin":
         boot = command_output(["sysctl", "-n", "kern.boottime"])
         if "sec =" in boot:
@@ -342,155 +537,573 @@ def server_uptime_seconds():
                 sec = int(boot.split("sec =", 1)[1].split(",", 1)[0].strip())
                 return max(0, int(time.time()) - sec)
             except Exception:
-                return ""
+                return None
+        return None
     if os.name == "nt":
-        ticks = command_output(["wmic", "os", "get", "LastBootUpTime", "/value"])
-        for line in ticks.splitlines():
-            if line.startswith("LastBootUpTime="):
-                stamp = line.split("=", 1)[1].split(".", 1)[0]
-                try:
-                    boot_dt = datetime.strptime(stamp, "%Y%m%d%H%M%S")
-                    return max(0, int((datetime.now() - boot_dt).total_seconds()))
-                except Exception:
-                    return ""
-    return ""
-
-
-def ip_mix():
-    addresses = set()
-    try:
-        for info in socket.getaddrinfo(socket.gethostname(), None):
-            addresses.add(info[4][0])
-    except Exception:
-        pass
-    private_count = 0
-    public_count = 0
-    for value in addresses:
-        try:
-            ip = ipaddress.ip_address(value.split("%", 1)[0])
-        except ValueError:
-            continue
-        if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified:
-            continue
-        if ip.is_private:
-            private_count += 1
-        elif ip.is_global:
-            public_count += 1
-    if private_count and public_count:
-        ip_type = "mixed"
-    elif public_count:
-        ip_type = "public"
-    else:
-        ip_type = "private"
-    return ip_type, private_count, public_count
-
-
-def collect_report(server_id):
-    disk_total, disk_used = disk_usage()
-    ip_type, private_count, public_count = ip_mix()
-    return {
-        "server_id": server_id,
-        "linux_kernel": platform.release(),
-        "distro": distro_name(),
-        "host": host_model(),
-        "cpu": cpu_name(),
-        "ram_bytes": ram_bytes() or 0,
-        "disk_total_bytes": disk_total,
-        "disk_used_bytes": disk_used,
-        "ops_version": ops_version(),
-        "server_uptime_seconds": server_uptime_seconds() or 0,
-        "package_count": package_count() or 0,
-        "ip_type": ip_type,
-        "private_ip_count": private_count,
-        "public_ip_count": public_count,
-    }
-
-
-def seconds_until_next_report():
-    now = datetime.now()
-    target = now.replace(hour=5, minute=0, second=0, microsecond=0)
-    if now >= target:
-        target += timedelta(days=1)
-    return max(1, int((target - now).total_seconds()))
-
-
-def send_report(server_id):
-    if not token:
-        return False
-    response = request("report", xml_bytes("analytics_report", collect_report(server_id)), token)
-    if response.code == 204:
-        message = response.headers.get("X-Message")
-        if message:
-            log(message)
-        save_local_setting(
-            "analytics_last_successful_report",
-            datetime.now().astimezone().isoformat(timespec="seconds"),
-            "Most recent successful analytics report upload time.",
+        value = command_output(
+            ["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')"],
+            timeout=10,
         )
-        log("sent analytics report")
-        return True
-    if response.code in (401, 403):
-        log(f"report refused with HTTP {response.code}")
-        return False
-    raise RuntimeError(f"report failed with HTTP {response.code}")
+        if not value:
+            return None
+        try:
+            boot_dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return max(0, int((datetime.now(boot_dt.tzinfo) - boot_dt).total_seconds()))
+        except Exception:
+            return None
+    return None
 
 
-def upload_once():
-    server_id = load_server_id()
-    registered_server_id = register_token(server_id)
-    if not registered_server_id:
-        return 1
-    server_id = registered_server_id
+def prefix_to_netmask(prefix_length):
     try:
-        return 0 if send_report(server_id) else 1
+        prefix_length = int(prefix_length)
+    except Exception:
+        return "Unknown"
+    network = ipaddress.ip_network(f"0.0.0.0/{prefix_length}", strict=False)
+    return str(network.netmask)
+
+
+def is_privateish(ip_obj):
+    if ip_obj.version == 4 and ip_obj in ipaddress.ip_network("100.64.0.0/10"):
+        return True
+    return (
+        ip_obj.is_private
+        or ip_obj.is_loopback
+        or ip_obj.is_link_local
+    )
+
+
+def classify_address(ip_text):
+    try:
+        ip_obj = ipaddress.ip_address(ip_text.split("%", 1)[0])
+    except ValueError:
+        return None
+    if ip_obj.is_loopback or ip_obj.is_multicast or ip_obj.is_unspecified:
+        return None
+    if is_privateish(ip_obj):
+        return "PRIVATE IP/NAT"
+    if ip_obj.is_global:
+        return "PUBLIC IP"
+    return "UNKNOWN"
+
+
+def select_best_interface_address(addresses):
+    scored = []
+    for address in addresses:
+        addr = str(address.get("address") or "")
+        if not addr:
+            continue
+        classification = classify_address(addr)
+        if not classification:
+            continue
+        score = 2 if classification == "PUBLIC IP" else 1
+        scored.append((score, address))
+    if not scored:
+        return None
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return scored[0][1]
+
+
+def route_for_address(address, prefix):
+    try:
+        network = ipaddress.ip_network(f"{address}/{int(prefix)}", strict=False)
+    except Exception:
+        return "Unknown"
+    return str(network)
+
+
+def windows_network_info():
+    ps_script = r"""
+$items = Get-NetIPConfiguration -Detailed -ErrorAction SilentlyContinue | ForEach-Object {
+    [pscustomobject]@{
+        name = $_.InterfaceAlias
+        state = [string]$_.NetAdapter.Status
+        dhcp4 = if ($_.NetIPv4Interface) { [string]$_.NetIPv4Interface.Dhcp } else { "" }
+        dhcp6 = if ($_.NetIPv6Interface) { [string]$_.NetIPv6Interface.Dhcp } else { "" }
+        ipv4 = @($_.IPv4Address | ForEach-Object { [pscustomobject]@{ address = $_.IPAddress; prefix = $_.PrefixLength } })
+        ipv6 = @($_.IPv6Address | ForEach-Object { [pscustomobject]@{ address = $_.IPAddress; prefix = $_.PrefixLength } })
+    }
+}
+$items | ConvertTo-Json -Depth 6 -Compress
+"""
+    output = command_output(["powershell", "-NoProfile", "-Command", ps_script], timeout=20)
+    if not output:
+        return []
+    try:
+        parsed = json.loads(output)
+    except json.JSONDecodeError:
+        return []
+
+    rows = parsed if isinstance(parsed, list) else [parsed]
+    adapters = []
+    for row in rows:
+        addresses = []
+        for item in row.get("ipv4") or []:
+            addresses.append({"family": "ipv4", "address": item.get("address"), "prefix": item.get("prefix")})
+        for item in row.get("ipv6") or []:
+            addresses.append({"family": "ipv6", "address": item.get("address"), "prefix": item.get("prefix")})
+        adapters.append(
+            {
+                "name": row.get("name") or "Unknown",
+                "state": "UP" if str(row.get("state") or "").lower() == "up" else "DOWN",
+                "dhcp": "Yes" if "Enabled" in {str(row.get("dhcp4") or ""), str(row.get("dhcp6") or "")} else "No",
+                "multicast": "No" if re.search(r"loopback|isatap|teredo|tunnel", str(row.get("name") or ""), re.I) else "Yes",
+                "addresses": addresses,
+            }
+        )
+    return adapters
+
+
+def linux_network_info():
+    output = command_output(["ip", "-json", "addr", "show"], timeout=20)
+    if not output:
+        return []
+    try:
+        parsed = json.loads(output)
+    except json.JSONDecodeError:
+        return []
+
+    adapters = []
+    for row in parsed:
+        addresses = []
+        for item in row.get("addr_info") or []:
+            addresses.append(
+                {
+                    "family": item.get("family"),
+                    "address": item.get("local"),
+                    "prefix": item.get("prefixlen"),
+                    "dynamic": bool(item.get("dynamic")),
+                }
+            )
+        adapters.append(
+            {
+                "name": row.get("ifname") or "Unknown",
+                "state": "UP" if str(row.get("operstate") or "").upper() == "UP" else "DOWN",
+                "dhcp": "Yes" if any(item.get("dynamic") for item in addresses) else "No",
+                "multicast": "Yes" if "MULTICAST" in (row.get("flags") or []) else "No",
+                "addresses": addresses,
+            }
+        )
+    return adapters
+
+
+def macos_network_info():
+    adapters = []
+    try:
+        interface_names = [name for _, name in socket.if_nameindex()]
+    except OSError:
+        return adapters
+
+    for name in interface_names:
+        ifconfig_output = command_output(["ifconfig", name], timeout=10)
+        if not ifconfig_output:
+            continue
+        state = "UP" if "status: active" in ifconfig_output.lower() else "DOWN"
+        multicast = "Yes" if "MULTICAST" in ifconfig_output else "No"
+        dhcp = "Yes" if bool(command_output(["ipconfig", "getpacket", name], timeout=5)) else "No"
+        addresses = []
+        for line in ifconfig_output.splitlines():
+            line = line.strip()
+            if line.startswith("inet "):
+                parts = line.split()
+                if len(parts) >= 2:
+                    address = parts[1]
+                    netmask = ""
+                    if "netmask" in parts:
+                        netmask = parts[parts.index("netmask") + 1]
+                    prefix = 24
+                    if netmask:
+                        try:
+                            prefix = ipaddress.ip_network(f"0.0.0.0/{netmask}", strict=False).prefixlen
+                        except Exception:
+                            prefix = 24
+                    addresses.append({"family": "ipv4", "address": address, "prefix": prefix})
+            elif line.startswith("inet6 "):
+                parts = line.split()
+                if len(parts) >= 2:
+                    address = parts[1].split("%", 1)[0]
+                    prefix = 64
+                    if "prefixlen" in parts:
+                        try:
+                            prefix = int(parts[parts.index("prefixlen") + 1])
+                        except Exception:
+                            prefix = 64
+                    addresses.append({"family": "ipv6", "address": address, "prefix": prefix})
+        adapters.append(
+            {
+                "name": name,
+                "state": state,
+                "dhcp": dhcp,
+                "multicast": multicast,
+                "addresses": addresses,
+            }
+        )
+    return adapters
+
+
+def collect_network_adapters():
+    if os.name == "nt":
+        return windows_network_info()
+    if sys.platform.startswith("linux"):
+        return linux_network_info()
+    if sys.platform == "darwin":
+        return macos_network_info()
+    return []
+
+
+def read_system_settings():
+    settings = {}
+    if not all([DB_HOST, DB_USER, DB_NAME]):
+        return settings
+    try:
+        conn = get_db_connection()
+    except Exception:
+        return settings
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT parameter, value FROM systemsettings")
+            for parameter, value in cur.fetchall():
+                settings[str(parameter)] = "" if value is None else str(value)
+    except Exception:
+        return settings
     finally:
-        delete_token()
+        conn.close()
+    return settings
 
 
-def handle_signal(signum, frame):
-    global stopping
-    stopping = True
+def truthy_setting(value):
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def read_endpoint_modules():
+    discovered = {}
+    if MODULES_DIR.exists():
+        for module_dir in sorted(path for path in MODULES_DIR.iterdir() if path.is_dir()):
+            if not (module_dir / "index.py").exists():
+                continue
+            discovered[module_dir.name] = {
+                "module": module_dir.name,
+                "developer": "Unknown",
+                "version": "Unknown",
+                "enabled": "Disabled",
+            }
+            info_path = module_dir / "info.xml"
+            if info_path.exists():
+                try:
+                    root = ET.parse(info_path).getroot()
+                    for key, tags in {
+                        "developer": ("author", "developer", "vendor"),
+                        "version": ("version",),
+                    }.items():
+                        for tag in tags:
+                            node = root.find(tag)
+                            if node is not None and node.text and node.text.strip():
+                                discovered[module_dir.name][key] = node.text.strip()
+                                break
+                except Exception:
+                    pass
+
+    settings_from_db = {}
+    if all([DB_HOST, DB_USER, DB_NAME]):
+        try:
+            conn = get_db_connection()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT `dir`, enabled FROM endpointmodulesloaded")
+                    for module_dir, enabled in cur.fetchall():
+                        settings_from_db[str(module_dir)] = str(enabled or "")
+            finally:
+                conn.close()
+        except Exception:
+            settings_from_db = {}
+
+    for module_name, module_info in discovered.items():
+        module_info["enabled"] = "Enabled" if settings_from_db.get(module_name, "true").strip().lower() == "true" else "Disabled"
+
+    for module_name, enabled in settings_from_db.items():
+        if module_name not in discovered:
+            discovered[module_name] = {
+                "module": module_name,
+                "developer": "Unknown",
+                "version": "Unknown",
+                "enabled": "Enabled" if enabled.strip().lower() == "true" else "Disabled",
+            }
+
+    return [discovered[name] for name in sorted(discovered)]
+
+
+def analytics_lines(settings):
+    enabled = truthy_setting(settings.get("analytics"))
+    lines = [f"Analytics Enabled: {bool_text(enabled)}"]
+    if not enabled:
+        return lines
+
+    analytics_id = settings.get("analytics_server_id", "").strip()
+    analytics_secret = settings.get("analytics_server_secret", "").strip()
+    last_success = settings.get("analytics_last_successful_report", "").strip() or "Never recorded"
+    registered = bool(analytics_id and analytics_secret)
+    lines.extend(
+        [
+            f"Analytics Registered: {bool_text(registered)}",
+            f"Last Successful Analytics Report: {last_success}",
+            f"Analytics Identifier: {analytics_id or 'Not registered'}",
+        ]
+    )
+    return lines
+
+
+def software_lines(settings):
+    return [
+        f"Kernel: {platform.release() or 'Unknown'}",
+        f"Opreating System: {distro_name()}",
+        f"Uptime: {format_uptime(server_uptime_seconds())}",
+        f"Package Count: {package_count()}",
+    ]
+
+
+def sip_lines(settings):
+    sip_enabled = truthy_setting(settings.get("enable_insecure_sip"))
+    sip_port = settings.get("insecure_sip_port", "5060") or "5060"
+    return [
+        f"SIP ENABLED: {bool_text(sip_enabled)}",
+        f"UDP/TCP SIP PORT: {sip_port}",
+    ]
+
+
+def web_lines(settings):
+    http_port = settings.get("webserver_http_port", "80") or "80"
+    web_enabled = truthy_setting(settings.get("webserver_enable", "1"))
+    return [
+        f"WEB ENABLED: {bool_text(web_enabled)}",
+        f"HTTP WEB PORT: {http_port}",
+    ]
+
+
+def render_network_sections(adapters):
+    sections = []
+    for adapter in adapters:
+        name = adapter.get("name") or "Unknown"
+        lines = [f"--NETWORK ({name})--"]
+        lines.append(f"State: {adapter.get('state', 'Unknown')}")
+        lines.append(f"DHCP: {adapter.get('dhcp', 'No')}")
+        selected = select_best_interface_address(adapter.get("addresses") or [])
+        if selected is None:
+            lines.append("IP Type: UNKNOWN")
+            lines.append("Subnet Mask: Unknown")
+        else:
+            ip_type = classify_address(selected.get("address") or "") or "UNKNOWN"
+            lines.append(f"IP Type: {ip_type}")
+            prefix = selected.get("prefix")
+            family = str(selected.get("family") or "").lower()
+            if ip_type == "PRIVATE IP/NAT":
+                lines.append(f"Subnet: {route_for_address(selected.get('address'), prefix)}")
+            if family == "ipv4":
+                lines.append(f"Subnet Mask: {prefix_to_netmask(prefix)}")
+            elif family == "ipv6":
+                lines.append(f"Subnet Mask: /{prefix}")
+            else:
+                lines.append("Subnet Mask: Unknown")
+        lines.append(f"Multicast Capable: {adapter.get('multicast', 'Unknown')}")
+        sections.append("\n".join(lines))
+    return sections
+
+
+def build_debug_report():
+    now = datetime.now().astimezone()
+    hostname = socket.gethostname()
+    timezone_name = now.tzname() or "UTC"
+    python_path, python_info = choose_python_environment()
+    settings = read_system_settings()
+    disk_root, disk_total, disk_used = disk_usage_details()
+    modules = read_endpoint_modules()
+
+    lines = [
+        "OPEN PAGING SERVER DEBUG REPORT",
+        f"Generated at {now.strftime('%H:%M:%S')} {now.strftime('%m/%d/%Y')} {timezone_name} on {hostname}",
+        "",
+        f"Open Paging Server Verison {read_pyproject_version()}",
+        f"Python Verison {python_info.get('python_version') or platform.python_version()}",
+        "Running in a venv" if python_info.get("in_venv") else "Running outside a venv",
+        f"Python Executable: {python_path}",
+        "Installed Python Packages:",
+    ]
+
+    packages = python_info.get("packages") or []
+    if packages:
+        lines.extend(packages)
+    else:
+        lines.append("No packages found")
+
+    lines.extend(
+        [
+            "",
+            "--HARDWARE--",
+            f"CPU: {cpu_name() or 'Unknown'}",
+            f"RAM (in MB or GB): {format_bytes(ram_bytes())}",
+            f"DISK ({disk_root}): ({format_bytes(disk_used)} of {format_bytes(disk_total)} used)",
+            "",
+        ]
+    )
+
+    network_sections = render_network_sections(collect_network_adapters())
+    if network_sections:
+        lines.extend(network_sections)
+    else:
+        lines.extend(
+            [
+                "--NETWORK (Unknown)--",
+                "State: Unknown",
+                "DHCP: Unknown",
+                "IP Type: UNKNOWN",
+                "Subnet Mask: Unknown",
+                "Multicast Capable: Unknown",
+            ]
+        )
+
+    lines.extend(["", "-- SOFTWARE --", *software_lines(settings), "", "-- ANALYTICS --", *analytics_lines(settings), "", "-- ENDPOINT MODULES --"])
+    if modules:
+        for module in modules:
+            lines.append(
+                f"{module['module']} | Developer: {module['developer']} | Version: {module['version']} | {module['enabled']}"
+            )
+    else:
+        lines.append("No endpoint modules found")
+
+    lines.extend(["", "-- SIP --", *sip_lines(settings), "", "--WEB--", *web_lines(settings), "", "---- END OF DEBUG REPORT ----"])
+    return "\n".join(lines) + "\n"
+
+
+def debug_log_dir():
+    return Path.home() / "openpagingserver_debuglogs"
+
+
+def debug_log_path(now):
+    filename = now.strftime("%H-%M-%S %m-%d-%y.txt") if os.name == "nt" else now.strftime("%H:%M:%S %m-%d-%y.txt")
+    return debug_log_dir() / filename
+
+
+def write_debug_log(contents, now):
+    target_dir = debug_log_dir()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_path = debug_log_path(now)
+    target_path.write_text(contents, encoding="utf-8")
+    return target_path
+
+
+def print_failure(message):
+    red = "\033[31m"
+    reset = "\033[0m"
+    print(f"{red}{message}{reset}")
+
+
+def handle_debug_report():
+    if not is_admin_user():
+        print("Debug reports require root/admin")
+        return 1
+
+    now = datetime.now().astimezone()
+    log_path = None
+    try:
+        report = build_debug_report()
+        log_path = write_debug_log(report, now)
+        sys.stdout.write(report)
+        print("-------------------------------")
+        print(f"Saved to {log_path}")
+        return 0
+    except Exception:
+        debug_trace = traceback.format_exc()
+        try:
+            failure_contents = "Failed to generate debug report\n\n" + debug_trace
+            log_path = write_debug_log(failure_contents, now)
+        except Exception:
+            log_path = None
+        print_failure("Failed to generate debug report")
+        sys.stdout.write(debug_trace)
+        print("-------------------------------")
+        if log_path is not None:
+            print(f"Saved to {log_path}")
+        return 1
+
+
+def shutdown(sig, frame):
+    global messaged_proc, livepaged_proc, belld_proc, webd_proc, endpoint_manager
+    if endpoint_manager and hasattr(endpoint_manager, "shutdown_all"):
+        endpoint_manager.shutdown_all()
+
+    for mid in list(loaded_modules.keys()):
+        unload_module(mid)
+
+    if messaged_proc:
+        messaged_proc.terminate()
+
+    if livepaged_proc:
+        livepaged_proc.terminate()
+
+    if belld_proc:
+        belld_proc.terminate()
+
+    if webd_proc:
+        webd_proc.terminate()
+
+    stop_analytics()
+
+    if sip_server is not None and hasattr(sip_server, "shutdown"):
+        try:
+            sip_server.shutdown()
+        except Exception:
+            pass
+
+    sys.exit(0)
 
 
 def main():
-    server_id = load_server_id()
-    next_register_attempt = 0.0
-    next_report_at = time.time() + seconds_until_next_report()
+    global messaged_proc, livepaged_proc, belld_proc, webd_proc, endpoint_manager, sip_server
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
 
-    while not stopping:
-        now = time.time()
+    import sip.index as sip_module
+
+    sip_server = sip_module
+
+    endpoint_manager = load_endpoint_manager()
+    if endpoint_manager and hasattr(endpoint_manager, "init"):
+        endpoint_manager.init(core)
+
+    messaged_path = BASE_DIR / "messaged.py"
+    if messaged_path.exists():
+        messaged_proc = subprocess.Popen([sys.executable, str(messaged_path)], cwd=BASE_DIR)
+        core.log(f"message worker started pid={messaged_proc.pid}")
+
+    livepaged_path = BASE_DIR / "livepaged.py"
+    if livepaged_path.exists():
+        livepaged_proc = subprocess.Popen([sys.executable, str(livepaged_path)], cwd=BASE_DIR)
+        core.log(f"live paging websocket worker started pid={livepaged_proc.pid}")
+
+    belld_path = BASE_DIR / "belld.py"
+    if belld_path.exists():
+        belld_proc = subprocess.Popen([sys.executable, str(belld_path)], cwd=BASE_DIR)
+        core.log(f"bell scheduler worker started pid={belld_proc.pid}")
+
+    webd_path = BASE_DIR / "webd.py"
+    if webd_path.exists():
+        webd_proc = subprocess.Popen([sys.executable, str(webd_path)], cwd=BASE_DIR)
+        core.log(f"web worker started pid={webd_proc.pid}")
+
+    sip_server.start()
+    core.log("SIP server started")
+
+    while True:
         try:
-            if not token and now >= next_register_attempt:
-                registered_server_id = register_token(server_id)
-                if registered_server_id:
-                    server_id = registered_server_id
-                else:
-                    next_register_attempt = now + 24 * 60 * 60
-
-            if token and server_id and now - last_token_renewal >= 7 * 24 * 60 * 60:
-                renewed_server_id = renew_token(server_id)
-                if renewed_server_id:
-                    server_id = renewed_server_id
-
-            if token and server_id and now >= next_report_at:
-                send_report(server_id)
-                next_report_at = time.time() + seconds_until_next_report()
+            sync_modules()
+            sync_analytics()
+            if endpoint_manager and hasattr(endpoint_manager, "sync_modules"):
+                endpoint_manager.sync_modules()
         except Exception as exc:
-            log(f"loop error: {exc}")
-
-        time.sleep(30)
-
-    delete_token()
+            core.log(f"module sync error: {exc}")
+        time.sleep(5)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Open Paging Server analytics daemon")
-    parser.add_argument("-u", "--upload-now", action="store_true", help="upload one analytics report immediately")
-    args = parser.parse_args()
-
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
-    atexit.register(delete_token)
-    if args.upload_now:
-        raise SystemExit(upload_once())
+    if "--debug-report" in sys.argv or "-Dr" in sys.argv:
+        raise SystemExit(handle_debug_report())
     main()
