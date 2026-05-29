@@ -1,5 +1,7 @@
 import os
 import platform
+import re
+import socket
 import subprocess
 import urllib.request
 
@@ -43,6 +45,102 @@ def detected_public_ipv4():
     except Exception:
         pass
     return "Unknown"
+
+
+def cpu_model():
+    if os.name == "nt":
+        value = run_text(["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name)"])
+        return value or "Unknown"
+
+    if platform.system() == "Darwin":
+        value = run_text(["sysctl", "-n", "machdep.cpu.brand_string"])
+        return value or "Unknown"
+
+    try:
+        with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as handle:
+            for line in handle:
+                if line.lower().startswith("model name"):
+                    value = line.split(":", 1)[1].strip()
+                    if value:
+                        return value
+                if line.lower().startswith("hardware"):
+                    value = line.split(":", 1)[1].strip()
+                    if value:
+                        return value
+                if line.lower().startswith("processor") and ":" in line:
+                    value = line.split(":", 1)[1].strip()
+                    if value and not value.isdigit():
+                        return value
+    except OSError:
+        pass
+
+    value = run_text(["sh", "-c", "lscpu 2>/dev/null | awk -F: '/Model name|Hardware|Processor/ {gsub(/^[ \\t]+/, \"\", $2); print $2; exit}'"])
+    return value or "Unknown"
+
+
+def kernel_output():
+    if os.name == "nt":
+        version = run_text(["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_OperatingSystem).Version"])
+        return f"Windows NT {version}" if version else "Unknown"
+
+    value = run_text(["uname", "-s", "-r"])
+    return value or "Unknown"
+
+
+def os_details():
+    system = platform.system()
+    kernel = kernel_output()
+
+    if os.name == "nt":
+        caption = run_text(["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_OperatingSystem).Caption"])
+        version = run_text(["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_OperatingSystem).Version"])
+        build = run_text(["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_OperatingSystem).BuildNumber"])
+        if caption:
+            if version and build:
+                return f"{caption} {version} build {build} | {kernel}"
+            if version:
+                return f"{caption} {version} | {kernel}"
+            return f"{caption} | {kernel}"
+        return f"Unknown | {kernel}" if kernel != "Unknown" else "Unknown"
+
+    if system == "Darwin":
+        product = run_text(["sw_vers", "-productName"])
+        version = run_text(["sw_vers", "-productVersion"])
+        build = run_text(["sw_vers", "-buildVersion"])
+        name = " ".join(part for part in [product, version] if part).strip()
+        if name:
+            if build:
+                return f"{name} build {build} | {kernel}"
+            return f"{name} | {kernel}"
+        return f"Unknown | {kernel}" if kernel != "Unknown" else "Unknown"
+
+    distro = ""
+    try:
+        info = platform.freedesktop_os_release()
+        distro = info.get("PRETTY_NAME") or info.get("NAME") or ""
+    except Exception:
+        pass
+
+    if not distro:
+        try:
+            with open("/etc/os-release", "r", encoding="utf-8", errors="ignore") as handle:
+                values = {}
+                for line in handle:
+                    if "=" in line:
+                        key, value = line.rstrip().split("=", 1)
+                        values[key] = value.strip().strip('"')
+                distro = values.get("PRETTY_NAME") or values.get("NAME") or ""
+        except OSError:
+            pass
+
+    if not distro:
+        distro = run_text(["sh", "-c", "lsb_release -ds 2>/dev/null"])
+        distro = distro.strip('"')
+
+    if distro:
+        return f"{distro} | {kernel}"
+
+    return f"Unknown | {kernel}" if kernel != "Unknown" else "Unknown"
 
 
 def ipv4_addresses():
@@ -120,7 +218,7 @@ def gateway():
 def system_uptime():
     if os.name == "nt":
         boot = run_text(["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime"])
-        return boot or "Information unavailable on Windows"
+        return boot or "Unknown"
     value = run_text(["uptime", "-p"])
     return value or "Unknown"
 
@@ -128,10 +226,10 @@ def system_uptime():
 def total_memory():
     if os.name == "nt":
         value = run_text(["powershell", "-NoProfile", "-Command", "[math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1MB)"])
-        return f"{value} MB" if value else ""
+        return f"{value} MB" if value else "Unknown"
     output = run_text(["free", "-m"])
     match = re.search(r"^Mem:\s+(\d+)", output, re.MULTILINE)
-    return f"{match.group(1)} MB" if match else ""
+    return f"{match.group(1)} MB" if match else "Unknown"
 
 
 def handle_request():
@@ -141,8 +239,8 @@ def handle_request():
     ctx = legacy_user_context(user)
     version = read_version()
     hostname = socket.gethostname()
-    os_name = f"{platform.system()} {platform.release()}".strip()
-    processor = platform.processor() or platform.machine() or "Unknown"
+    os_name = os_details()
+    processor = cpu_model()
     memory = total_memory()
     private_ipv4 = []
     public_ipv4 = []
@@ -164,7 +262,7 @@ def handle_request():
         network_rows += f'<div class="info-row"><span class="info-label">DNS Servers</span><span>{h(", ".join(dns))}</span></div>'
     if ipv6:
         network_rows += f'<div class="info-row"><span class="info-label">IPv6 Addresses</span><span>{h(", ".join(ipv6))}</span></div>'
-    memory_row = f'<div class="info-row"><span class="info-label">Total Memory</span><span>{h(memory)}</span></div>' if memory else ""
+    memory_row = f'<div class="info-row"><span class="info-label">Total Memory</span><span>{h(memory)}</span></div>'
     body = f"""
     <div id="about" class="tab-content active">
         <picture>
