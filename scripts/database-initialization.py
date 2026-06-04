@@ -373,6 +373,7 @@ def write_config(db_password):
 DB_USER='{DATABASE_USER}'
 DB_PASS={sql_string(db_password)}
 DB_NAME='{DATABASE_NAME}'
+# Set DEBUG to enable logs, and to show tracebacks in the Web UI, among other things
 DEBUG=false
 WEB_REVERSE_PROXY_ALLOWED=127.0.0.1
 API_REVERSE_PROXY_ALLOWED=127.0.0.1
