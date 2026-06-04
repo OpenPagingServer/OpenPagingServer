@@ -1,9 +1,91 @@
+import time
 
 from srv.web.app import *
 
 
 def _setting_bool(data, key):
     return str(data.get(key, "0")) == "1"
+
+
+def _success_value(value):
+    if isinstance(value, bool):
+        return value
+    try:
+        return int(value) == 1
+    except Exception:
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _attempt_time_value(value):
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.strptime(str(value).split(".", 1)[0], "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def _consecutive_failed_attempts(ip):
+    rows = query_all(
+        "SELECT success FROM login_attempts WHERE ip=%s ORDER BY attempt_time DESC LIMIT 200",
+        (ip,),
+    )
+    count = 0
+    for row in rows:
+        if _success_value(row.get("success")):
+            break
+        count += 1
+    return count
+
+
+def _failed_delay_seconds(ip):
+    return min(_consecutive_failed_attempts(ip) * 0.5, 10)
+
+
+def _sleep_before_login_check(ip):
+    time.sleep(1 + _failed_delay_seconds(ip))
+
+
+def _recent_failed_attempt_times(ip):
+    cutoff = datetime.now() - timedelta(seconds=10 + 30)
+    rows = query_all(
+        "SELECT success, attempt_time FROM login_attempts WHERE ip=%s AND attempt_time >= %s ORDER BY attempt_time ASC",
+        (ip, cutoff),
+    )
+    times = []
+    for row in rows:
+        if _success_value(row.get("success")):
+            continue
+        attempt_time = _attempt_time_value(row.get("attempt_time"))
+        if attempt_time is not None:
+            times.append(attempt_time)
+    return times
+
+
+def _ip_rate_limited(ip):
+    now = datetime.now()
+    failed_times = _recent_failed_attempt_times(ip)
+    for latest in failed_times:
+        window_start = latest - timedelta(seconds=10)
+        count = sum(1 for attempt_time in failed_times if window_start <= attempt_time <= latest)
+        if count >= 3 and now < latest + timedelta(seconds=30):
+            return True
+    return False
+
+
+def _fake_salt(username):
+    return hashlib.sha256(("missing-user:" + username + ":" + app.secret_key).encode()).hexdigest()
+
+
+def _record_login_attempt(ip, username, success, user_agent):
+    execute(
+        "INSERT INTO login_attempts (ip, username, success, attempt_time, user_agent) VALUES (%s,%s,%s,NOW(),%s)",
+        (ip, username, 1 if success else 0, user_agent),
+    )
+
+
+def _invalid_login_response():
+    return jsonify(success=False, message="Invalid username or password.")
 
 
 def handle_request():
@@ -26,43 +108,40 @@ def handle_request():
     if request.method == "POST":
         ip = request.remote_addr or ""
         ua = request.headers.get("User-Agent", "unknown")
+        _sleep_before_login_check(ip)
 
-        if "get_challenge" in request.form:
-            username = request.form.get("username", "").strip()
-            try:
+        try:
+            if _ip_rate_limited(ip):
+                return _invalid_login_response()
+
+            if "get_challenge" in request.form:
+                username = request.form.get("username", "").strip()
                 user = query_one("SELECT salt FROM users WHERE username=%s OR email=%s LIMIT 1", (username, username))
-                execute(
-                    "INSERT INTO login_attempts (ip, username, success, attempt_time, user_agent) VALUES (%s,%s,0,NOW(),%s)",
-                    (ip, username, ua),
-                )
-                if not user:
-                    return jsonify(success=False, message="Invalid username or password.")
                 challenge = secrets.token_hex(32)
                 session["temp_challenge"] = challenge
                 session["temp_user"] = username
-                return jsonify(success=True, salt=user["salt"], challenge=challenge)
-            except Exception as exc:
-                return jsonify(success=False, message=str(exc))
+                salt = user["salt"] if user and user.get("salt") is not None else _fake_salt(username)
+                return jsonify(success=True, salt=salt, challenge=challenge)
 
-        if "response" in request.form:
-            try:
+            if "response" in request.form:
                 username = session.get("temp_user", "")
                 challenge = session.get("temp_challenge", "")
                 user = query_one("SELECT id, username, password FROM users WHERE username=%s OR email=%s LIMIT 1", (username, username))
                 expected = hashlib.sha256(((user or {}).get("password", "") + challenge).encode()).hexdigest() if user and challenge else ""
                 ok = bool(user and challenge and request.form.get("response") == expected)
-                execute(
-                    "INSERT INTO login_attempts (ip, username, success, attempt_time, user_agent) VALUES (%s,%s,%s,NOW(),%s)",
-                    (ip, username, 1 if ok else 0, ua),
-                )
+                _record_login_attempt(ip, username, ok, ua)
                 if ok:
                     session.clear()
                     session["user_id"] = user["id"]
                     session["username"] = user["username"]
                     return jsonify(success=True)
-                return jsonify(success=False, message="Authentication failed.")
-            except Exception as exc:
-                return jsonify(success=False, message=str(exc))
+                session.pop("temp_challenge", None)
+                session.pop("temp_user", None)
+                return _invalid_login_response()
+
+            return _invalid_login_response()
+        except Exception:
+            return _invalid_login_response()
 
     product_name = data.get("product_name") or "Open Paging Server"
     favicon = data.get("favicon") or ""
@@ -110,7 +189,8 @@ def handle_request():
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet"/>
     <script src="https://cdn.jsdelivr.net/npm/js-sha256@0.9.0/src/sha256.min.js"></script>
     <style>
-      body, html {{ margin: 0; padding: 0; font-family: "Tahoma", sans-serif; height: 100%; width: 100%; position: fixed; display: flex; align-items: center; justify-content: center; background: #e3f2fd; }}
+      *, *::before, *::after {{ box-sizing: border-box; }}
+      body, html {{ margin: 0; padding: 0; font-family: "Tahoma", sans-serif; height: 100%; width: 100%; position: fixed; display: flex; align-items: center; justify-content: center; background: #e3f2fd; overflow-x: hidden; }}
       @keyframes fadeInPage {{ from {{ opacity: 0; }} to {{ opacity: 1; }} }}
       .background-slideshow {{ position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 0; }}
       @media (max-width: 768px) {{ .background-slideshow {{ display: none; }} }}
@@ -119,16 +199,17 @@ def handle_request():
       .logo img {{ max-width: 100%; max-height: 100%; object-fit: contain; }}
       .logo-light {{ display: block; }}
       .logo-dark {{ display: none; }}
-      @media (max-width: 768px) {{ .logo {{ width: 80%; height: auto; top: 10px; padding: 10px; }} .logo img {{ width: 100%; height: auto; }} }}
+      @media (max-width: 768px) {{ .logo {{ position: relative; top: auto; left: auto; transform: none; width: min(82vw, 360px); height: auto; margin: 18px auto 12px auto; padding: 0; flex: 0 0 auto; }} .logo img {{ width: 100%; height: auto; max-height: 110px; }} }}
       .login-banner {{ background: #fff3e0; border: 1px solid #ffe0b2; border-radius: 6px; padding: 15px; margin-bottom: 15px; width: 100%; max-width: 300px; box-sizing: border-box; text-align: left; color: #e65100; box-shadow: 0 2px 4px rgba(0,0,0,0.05); animation: fadeInPage 1s ease-in-out; }}
       .login-banner h3 {{ margin: 0 0 5px 0; font-size: 15px; font-weight: 700; text-transform: uppercase; }}
       .login-banner p {{ margin: 0; font-size: 14px; line-height: 1.4; }}
       .login-box {{ background: #fff; padding: 30px; border-radius: 6px; box-shadow: 0 4px 6px rgba(0,0,0,0.1),0 1px 3px rgba(0,0,0,0.08); max-width: 300px; width: 50%; text-align: center; animation: fadeInPage 1.5s ease-in-out; }}
       @media (max-width: 768px) {{ 
-        .login-box {{ max-width: 100%; width: 100%; height: auto; border-radius: 0; padding: 20px; }} 
-        .login-banner {{ max-width: 90%; border-radius: 4px; }}
-        .center-container {{ padding: 0; align-items: center; }} 
-        body {{ background: #fff; }} 
+        body, html {{ position: static; height: auto; min-height: 100%; display: block; }}
+        body {{ background: #fff; min-height: 100vh; overflow-y: auto; }}
+        .center-container {{ width: 100%; height: auto; min-height: auto; padding: 0 16px 24px 16px; align-items: center; justify-content: flex-start; }}
+        .login-box {{ max-width: 360px; width: 100%; height: auto; border-radius: 6px; padding: 22px; }} 
+        .login-banner {{ max-width: 360px; width: 100%; border-radius: 4px; }}
       }}
       .login-box h2 {{ color: #1976d2; font-weight: 500; margin-bottom: 20px; margin-top: 0; }}
       .input-field {{ position: relative; margin-bottom: 20px; }}
@@ -152,6 +233,7 @@ def handle_request():
         .error {{ color: #ffcdd2; }}
         {dark_logo_css}
       }}
+      @media (prefers-color-scheme: dark) and (max-width: 768px) {{ body {{ background: #121212; }} }}
     </style>
   </head>
   <body>
@@ -190,7 +272,7 @@ def handle_request():
         btn.innerHTML = '<div class="loading-circle"></div>';
 
         try {{
-          const res1 = await fetch('/index', {{
+          const res1 = await fetch('/', {{
             method: 'POST',
             headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
             body: new URLSearchParams({{ get_challenge: 1, username: username }})
@@ -198,12 +280,12 @@ def handle_request():
 
           const data1 = await res1.json();
 
-          if (!data1.success) throw new Error(data1.message);
+          if (!data1.success) throw new Error(data1.message || 'Invalid username or password.');
 
           const verifier = sha256(password + data1.salt);
           const proof = sha256(verifier + data1.challenge);
 
-          const res2 = await fetch('/index', {{
+          const res2 = await fetch('/', {{
             method: 'POST',
             headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
             body: new URLSearchParams({{ response: proof }})
@@ -214,10 +296,10 @@ def handle_request():
           if (data2.success) {{
             window.location.href = '/dashboard';
           }} else {{
-            throw new Error(data2.message || 'Verification failed');
+            throw new Error(data2.message || 'Invalid username or password.');
           }}
         }} catch (e) {{
-          err.innerText = e.message;
+          err.innerText = e.message || 'Invalid username or password.';
           btn.classList.remove('loading');
           btn.innerHTML = 'Login';
         }}
