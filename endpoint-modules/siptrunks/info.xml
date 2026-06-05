@@ -1,7 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<module>
-  <name>SIP Trunks</name>
-  <type>Input + Output</type>
-  <description>Connect Open Paging Server to external VoIP systems</description>
-  <note>This is a system module and it only allows an admin to manage SIP trunks on Open Paging Server's built-in SIP stack. It does not handle SIP Trunks directly. Disabling or removing it will not remove the core functionally.</note>
-</module>
