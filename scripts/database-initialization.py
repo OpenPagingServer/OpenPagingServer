@@ -369,13 +369,18 @@ def seed_defaults(cursor):
 
 
 def write_config(db_password):
-    env_file = f"""DB_HOST='127.0.0.1'
+    env_file = f"""# Database Setup
+DB_HOST='127.0.0.1'
 DB_USER='{DATABASE_USER}'
 DB_PASS={sql_string(db_password)}
 DB_NAME='{DATABASE_NAME}'
+# Set DEBUG to enable logs, and to show tracebacks in the Web UI, among other things
 DEBUG=false
+# If you are using a external reverse proxy, you will need to add it here
 WEB_REVERSE_PROXY_ALLOWED=127.0.0.1
 API_REVERSE_PROXY_ALLOWED=127.0.0.1
+# The following settings should only be changed if you know what your doing!
+DEMO_MODE=false
 
 """
 
