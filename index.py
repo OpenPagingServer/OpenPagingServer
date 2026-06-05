@@ -13,10 +13,11 @@ import subprocess
 import sys
 import time
 import traceback
-import xml.etree.ElementTree as ET
 from datetime import datetime
 import importlib.util
 from pathlib import Path
+
+import endpoints
 
 try:
     import pymysql
@@ -37,8 +38,8 @@ DB_USER = os.getenv("DB_USER")
 DB_PASS = os.getenv("DB_PASS")
 DB_NAME = os.getenv("DB_NAME")
 
-MODULE_LOADER_PATH = BASE_DIR / "endpoint-modules" / "index.py"
-MODULES_DIR = BASE_DIR / "endpoint-modules"
+MODULE_LOADER_PATH = BASE_DIR / "endpoints.py"
+MODULES_DIR = endpoints.MODULE_STORE_DIR
 
 loaded_modules = {}
 messaged_proc = None
@@ -777,31 +778,14 @@ def truthy_setting(value):
 
 def read_endpoint_modules():
     discovered = {}
-    if MODULES_DIR.exists():
-        for module_dir in sorted(path for path in MODULES_DIR.iterdir() if path.is_dir()):
-            if not (module_dir / "index.py").exists():
-                continue
-            discovered[module_dir.name] = {
-                "module": module_dir.name,
-                "developer": "Unknown",
-                "version": "Unknown",
-                "enabled": "Disabled",
-            }
-            info_path = module_dir / "info.xml"
-            if info_path.exists():
-                try:
-                    root = ET.parse(info_path).getroot()
-                    for key, tags in {
-                        "developer": ("author", "developer", "vendor"),
-                        "version": ("version",),
-                    }.items():
-                        for tag in tags:
-                            node = root.find(tag)
-                            if node is not None and node.text and node.text.strip():
-                                discovered[module_dir.name][key] = node.text.strip()
-                                break
-                except Exception:
-                    pass
+    for module_name, package in endpoints.discover_endpoint_packages(extract_if_trusted=False).items():
+        manifest = package.get("manifest") or {}
+        discovered[module_name] = {
+            "module": module_name,
+            "developer": manifest.get("developer") or manifest.get("author") or "Unknown",
+            "version": manifest.get("version") or "Unknown",
+            "enabled": "Disabled",
+        }
 
     settings_from_db = {}
     if all([DB_HOST, DB_USER, DB_NAME]):
