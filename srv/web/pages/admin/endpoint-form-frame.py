@@ -147,69 +147,25 @@ def handle_request():
     if not frame_safe_name(module) or (form_type and not frame_safe_name(form_type)):
         return Response("Invalid endpoint form", status=400, mimetype="text/plain")
 
-    root = BASE_DIR / "endpoint-modules"
-    modules_root = root.resolve()
-
-    module_dir = (modules_root / module).resolve()
-    if modules_root not in module_dir.parents and module_dir != modules_root:
+    try:
+        mod = load_endpoint_web(module)
+    except Exception:
         return Response("Module not found", status=404, mimetype="text/plain")
-
-    if not module_dir.is_dir():
-        return Response("Module not found", status=404, mimetype="text/plain")
-
-    forms_dir = (module_dir / "endpoint-forms").resolve()
-    if not forms_dir.is_dir() or module_dir not in forms_dir.parents:
-        return Response("Endpoint forms not found", status=404, mimetype="text/plain")
-
-    registry_path = (forms_dir / "forms.py").resolve()
-    if not registry_path.is_file() or forms_dir not in registry_path.parents:
+    forms_func = getattr(mod, "forms", None)
+    if not callable(forms_func):
         return Response("Module has no endpoint forms", status=404, mimetype="text/plain")
-
-    forms = get_forms(registry_path)
+    forms = forms_func()
     if not isinstance(forms, dict):
         return Response("Endpoint forms not found", status=404, mimetype="text/plain")
 
     if not form_type:
-        index_path = (forms_dir / "index.py").resolve()
-        if index_path.is_file() and forms_dir in index_path.parents:
-            namespace, output = run_py_file(index_path, {"forms": forms, "module": module, "user": user})
-            result = call_handle_request(namespace, user, form_type)
-            response = response_from_output_or_result(output, result)
-            if response is not None and not isinstance(result, dict):
-                return response
         return chooser_response(module, forms)
 
     endpoint_form = forms.get(form_type)
     if not isinstance(endpoint_form, dict):
         return Response("Endpoint form not found", status=404, mimetype="text/plain")
 
-    form_filename = form_filename_from_entry(form_type, endpoint_form)
-    if not form_filename:
-        return Response("Invalid endpoint form file", status=400, mimetype="text/plain")
-
-    form_path = (forms_dir / form_filename).resolve()
-    if not form_path.is_file() or forms_dir not in form_path.parents:
-        return Response("Endpoint form file not found", status=404, mimetype="text/plain")
-
-    namespace, output = run_py_file(
-        form_path,
-        {
-            "endpoint_form": endpoint_form,
-            "forms": forms,
-            "module": module,
-            "type": form_type,
-            "user": user,
-        },
-    )
-
-    result = call_handle_request(namespace, user, form_type)
-
-    message = namespace.get("message", "")
-    error = namespace.get("error", "")
-    errors = namespace.get("errors", None)
-
-    if endpoint_frame_was_success(message, error, errors):
-        return endpoint_frame_success_redirect(message)
-
-    response = response_from_output_or_result(output, result)
-    return response if response is not None else Response("Endpoint form returned no response", status=500, mimetype="text/plain")
+    renderer = getattr(mod, "render_form", None)
+    if not callable(renderer):
+        return Response("Endpoint form returned no response", status=500, mimetype="text/plain")
+    return renderer(form_type, request, db, frame_response, user)
