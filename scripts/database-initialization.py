@@ -14,7 +14,7 @@ import mysql.connector
 DATABASE_NAME = "openpagingserver"
 DATABASE_USER = "openpagingserver"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-ENDPOINT_MODULES_DIR = PROJECT_ROOT / "endpoint-modules"
+ENDPOINT_MODULES_DIR = Path("/var/lib/openpagingserver/endpointmodules")
 
 
 def random_password(length=32):
@@ -25,19 +25,18 @@ def sql_string(value):
     return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
-def safe_endpoint_module_dir(path):
+def safe_endpoint_module_package(path):
     return (
-        path.is_dir()
-        and path.name not in (".", "..", "__pycache__")
-        and all(char.isalnum() or char in "-_" for char in path.name)
-        and (path / "index.py").exists()
+        path.is_file()
+        and path.suffix == ".opsepm"
+        and all(char.isalnum() or char in "-_." for char in path.name)
     )
 
 
-def discover_endpoint_module_dirs():
+def discover_endpoint_module_packages():
     if not ENDPOINT_MODULES_DIR.is_dir():
         return []
-    return sorted(path.name for path in ENDPOINT_MODULES_DIR.iterdir() if safe_endpoint_module_dir(path))
+    return sorted(path.stem for path in ENDPOINT_MODULES_DIR.iterdir() if safe_endpoint_module_package(path))
 
 
 def systemctl_available():
@@ -139,6 +138,13 @@ def execute_schema(cursor):
         CREATE TABLE endpointmodulesloaded (
             `dir` VARCHAR(100) NOT NULL,
             enabled ENUM('true','false') DEFAULT 'true',
+            `tables` TEXT DEFAULT NULL,
+            package_path TEXT DEFAULT NULL,
+            trusted VARCHAR(10) NOT NULL DEFAULT 'false',
+            signature_state VARCHAR(32) NOT NULL DEFAULT 'unsigned',
+            signer VARCHAR(255) DEFAULT NULL,
+            load_error TEXT DEFAULT NULL,
+            manifest_json LONGTEXT DEFAULT NULL,
             PRIMARY KEY (`dir`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
         """,
@@ -252,7 +258,7 @@ def execute_schema(cursor):
 
 
 def seed_defaults(cursor):
-    endpoint_module_dirs = [(module_dir, "true") for module_dir in discover_endpoint_module_dirs()]
+    endpoint_module_dirs = [(module_dir, "false") for module_dir in discover_endpoint_module_packages()]
     if endpoint_module_dirs:
         cursor.executemany(
             """
@@ -320,6 +326,7 @@ def seed_defaults(cursor):
             "",
             "Analytics secret. DO NOT SHARE.",
         ),
+        ("favicon", "/assets/favicon.svg", "Browser Favicon. Path to file within web server."),
         ("insecure_sip_port", "5060", "Port for UDP/TCP SIP"),
         ("login_banner_enabled", "1", "Enable or disable the login page banner (0/1)"),
         (
@@ -369,19 +376,11 @@ def seed_defaults(cursor):
 
 
 def write_config(db_password):
-    env_file = f"""# Database Setup
-DB_HOST='127.0.0.1'
+    env_file = f"""DB_HOST='127.0.0.1'
 DB_USER='{DATABASE_USER}'
 DB_PASS={sql_string(db_password)}
 DB_NAME='{DATABASE_NAME}'
-# Set DEBUG to enable logs, and to show tracebacks in the Web UI, among other things
 DEBUG=false
-# If you are using a external reverse proxy, you will need to add it here
-WEB_REVERSE_PROXY_ALLOWED=127.0.0.1
-API_REVERSE_PROXY_ALLOWED=127.0.0.1
-# The following settings should only be changed if you know what your doing!
-DEMO_MODE=false
-
 """
 
     os.makedirs("/var/lib/openpagingserver/assets", exist_ok=True)
