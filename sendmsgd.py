@@ -19,6 +19,7 @@ from broadcasts import (
     fetch_template,
     is_audio_type,
 )
+from endpoints import connect_endpoint_ipc
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -29,7 +30,6 @@ DB_PASS = os.getenv("DB_PASS")
 DB_NAME = os.getenv("DB_NAME")
 DEBUG = os.getenv("DEBUG", "").strip().lower() == "true"
 
-IPC_PORT = 50000
 LOG_FILE = BASE_DIR / "sendmsgd_debug.log"
 ASSET_PATH = os.getenv("ASSET_PATH", "/var/lib/openpagingserver/assets/")
 SAMPLE_RATE = 8000
@@ -40,17 +40,7 @@ FALLBACK_ASSET_DIRS = [
 ]
 
 def module_is_output_capable(module_name):
-    info_path = BASE_DIR / "endpoint-modules" / str(module_name) / "info.xml"
-    if not info_path.exists():
-        return True
-    try:
-        root = ET.parse(info_path).getroot()
-        type_node = root.find("type")
-        module_type = (type_node.text or "").strip().lower() if type_node is not None else "output"
-        return "output" in module_type and "management" not in module_type
-    except Exception as exc:
-        debug_log(f"module type check failed module={module_name}: {exc}")
-        return True
+    return str(module_name or "") != "siptrunks"
 
 def get_db_connection():
     return pymysql.connect(
@@ -71,10 +61,7 @@ def debug_log(message):
         pass
 
 def connect_ipc():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    sock.connect(('127.0.0.1', IPC_PORT))
-    return sock
+    return connect_endpoint_ipc(timeout=10)
 
 def fetch_broadcast(broadcast_id):
     return fetch_active_broadcast(broadcast_id)
@@ -96,11 +83,10 @@ def resolve_group_targets(group_id):
             target_list = set()
             if str(group_id) == "0":
                 try:
-                    cur.execute("SELECT `dir` FROM endpointmodulesloaded WHERE enabled = 'true'")
+                    cur.execute("SELECT `dir` FROM endpointmodulesloaded WHERE enabled = 'true' AND trusted = 'true'")
                     rows = cur.fetchall()
                 except Exception:
-                    module_root = BASE_DIR / "endpoint-modules"
-                    rows = [(path.name,) for path in module_root.iterdir() if (path / "index.py").exists()]
+                    rows = []
                 for row in rows:
                     if row and row[0] and module_is_output_capable(row[0]):
                         target_list.add(f"{row[0]}/all")
