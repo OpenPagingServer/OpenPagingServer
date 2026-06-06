@@ -14,6 +14,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 import pymysql
+import endpoints
 from dotenv import load_dotenv
 from flask import (
     Flask,
@@ -36,7 +37,7 @@ WEB_ROOT_DIR = BASE_DIR / "srv" / "web"
 WEB_PAGES_DIR = WEB_ROOT_DIR / "pages"
 WEB_STATIC_DIR = WEB_ROOT_DIR / "assets"
 WEB_ERROR_DIR = WEB_ROOT_DIR / "errors"
-ENDPOINT_MODULES_DIR = BASE_DIR / "endpoint-modules"
+ENDPOINT_MODULES_DIR = endpoints.MODULE_STORE_DIR
 ASSET_DIR = Path(os.getenv("ASSET_PATH", "/var/lib/openpagingserver/assets"))
 load_dotenv(BASE_DIR / ".env")
 
@@ -582,68 +583,44 @@ def safe_module_name(value):
 def load_endpoint_web(module):
     if not safe_module_name(module):
         abort(400)
-    path = ENDPOINT_MODULES_DIR / module / "web.py"
-    root = ENDPOINT_MODULES_DIR.resolve()
-    resolved = path.resolve()
-    if root not in resolved.parents or not resolved.is_file():
+    try:
+        return endpoints.load_endpoint_web_module(module)
+    except FileNotFoundError:
         abort(404)
-    spec = importlib.util.spec_from_file_location(f"endpoint_module_web_{module}", resolved)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-def endpoint_module_xml_text(root, tag, default=""):
-    node = root.find(tag)
-    return (node.text or "").strip() if node is not None and node.text is not None else default
-
-
-def endpoint_module_info_from_dir(module_dir):
-    module = module_dir.name
-    info = {
-        "module": module,
-        "name": module,
-        "description": "",
-        "input_type": "Output",
-        "version": "",
-        "has_settings_page": (module_dir / "web-settings.py").is_file() or (module_dir / "settings.php").is_file(),
-        "has_forms": (module_dir / "endpoint-forms" / "forms.py").is_file() or (module_dir / "endpoint-forms" / "forms.php").is_file(),
-    }
-    info_path = module_dir / "info.xml"
-    if info_path.is_file():
-        try:
-            import xml.etree.ElementTree as et
-
-            parsed = et.parse(info_path).getroot()
-            info["name"] = endpoint_module_xml_text(parsed, "name", module) or module
-            info["description"] = endpoint_module_xml_text(parsed, "desp") or endpoint_module_xml_text(parsed, "description")
-            info["input_type"] = endpoint_module_xml_text(parsed, "type", "Output") or "Output"
-            info["version"] = endpoint_module_xml_text(parsed, "version")
-        except Exception:
-            pass
-    return info
+    except Exception:
+        abort(404)
 
 
 def discovered_endpoint_modules():
     modules = {}
-    if ENDPOINT_MODULES_DIR.exists():
-        root = ENDPOINT_MODULES_DIR.resolve()
-        for module_dir in ENDPOINT_MODULES_DIR.iterdir():
-            if not module_dir.is_dir() or not safe_module_name(module_dir.name):
-                continue
-            resolved = module_dir.resolve()
-            if root not in resolved.parents and resolved != root:
-                continue
-            if not (module_dir / "index.py").is_file():
-                continue
-            modules[module_dir.name] = endpoint_module_info_from_dir(module_dir)
+    for module_name, package in endpoints.discover_endpoint_packages(extract_if_trusted=True).items():
+        manifest = package.get("manifest") or {}
+        verification = package.get("verification") or {}
+        trusted = bool(package.get("trusted"))
+        web_mod = endpoints.load_endpoint_web_module(module_name, missing_ok=True) if trusted else None
+        modules[module_name] = {
+            "module": module_name,
+            "name": manifest.get("name") or module_name,
+            "description": manifest.get("description") or "",
+            "developer": manifest.get("developer") or manifest.get("author") or "",
+            "input_type": manifest.get("input_type") or manifest.get("type") or "Output",
+            "version": manifest.get("version") or "",
+            "minimum_ops_version": manifest.get("minimum_ops_version") or endpoints.OPS_VERSION,
+            "requirements": manifest.get("requirements") or [],
+            "trusted": trusted,
+            "can_load": trusted,
+            "signature_state": verification.get("signature_state") or "unsigned",
+            "signature_label": verification.get("signature_label") or "",
+            "signer": verification.get("organization") or "",
+            "load_error": "" if trusted else package.get("load_error") or endpoints.UNSIGNED_ERROR,
+            "has_settings_page": bool(getattr(web_mod, "render_settings", None)) if web_mod else False,
+            "has_forms": bool(getattr(web_mod, "forms", None)) if web_mod else False,
+        }
     return dict(sorted(modules.items(), key=lambda item: (item[1]["name"].lower(), item[0].lower())))
 
 
 def ensure_endpoint_module_state_table():
-    execute(
-        "CREATE TABLE IF NOT EXISTS endpointmodulesloaded (`dir` VARCHAR(100) NOT NULL, enabled VARCHAR(10) NOT NULL DEFAULT 'true', PRIMARY KEY (`dir`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci"
-    )
+    endpoints.ensure_module_registry_table()
 
 
 def endpoint_module_state_map(modules=None):
@@ -664,7 +641,28 @@ def endpoint_module_state_map(modules=None):
     return states
 
 
-def endpoint_module_catalog():
+def builtin_endpoint_modules():
+    web_mod = endpoints.load_endpoint_web_module("siptrunks", missing_ok=True)
+    return {
+        "siptrunks": {
+            "module": "siptrunks",
+            "name": "SIP Trunks",
+            "description": "Built-in SIP trunk and SIP dialplan endpoint management.",
+            "developer": "Open Paging Server",
+            "input_type": "Input",
+            "version": endpoints.OPS_VERSION,
+            "enabled": True,
+            "loaded": True,
+            "trusted": True,
+            "can_load": True,
+            "system_builtin": True,
+            "has_settings_page": False,
+            "has_forms": bool(getattr(web_mod, "forms", None)) if web_mod else False,
+        }
+    }
+
+
+def endpoint_module_catalog(include_system=False):
     local_modules = discovered_endpoint_modules()
     states = endpoint_module_state_map(local_modules)
     payload = endpoint_ipc("LIST_ENDPOINT_MODULES")
@@ -691,6 +689,8 @@ def endpoint_module_catalog():
             merged["enabled"] = bool(merged.get("enabled", states.get(module_name)))
             merged["loaded"] = bool(merged.get("loaded"))
             modules[module_name] = merged
+    if include_system:
+        modules.update(builtin_endpoint_modules())
     return dict(sorted(modules.items(), key=lambda item: (str(item[1].get("name") or item[0]).lower(), item[0].lower())))
 
 
@@ -734,6 +734,11 @@ def bundled_asset(filename):
 @alias("/index", methods=["GET", "POST"])
 def login():
     return dispatch_web_page("index")
+
+
+@alias("/login/basic-captcha.svg")
+def login_basic_captcha():
+    return dispatch_web_page("login-captcha")
 
 
 @alias("/logout")
@@ -875,7 +880,7 @@ def manage_users():
 
 def endpoint_ipc(command):
     try:
-        with socket.create_connection(("127.0.0.1", 50000), timeout=2) as sock:
+        with endpoints.connect_endpoint_ipc(timeout=2) as sock:
             sock.sendall(command.encode() + b"\n")
             return json.loads(sock.recv(1024 * 1024).decode())
     except Exception as exc:
