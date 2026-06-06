@@ -75,9 +75,9 @@ def logo_html(settings):
     return f"""<div class="logo"><img src="{h(settings.get("login_logo_light"))}" alt="{h(settings.get("product_name"))} logo"></div>"""
 
 
-def form_buttons(stage, back_stage=None, next_label="Next"):
+def form_buttons(stage, back_stage=None, next_label="Next", next_class="button"):
     back = f'<button class="button secondary" name="action" value="back" type="submit">Back</button><input type="hidden" name="back_stage" value="{h(back_stage)}">' if back_stage else ""
-    return f'<input type="hidden" name="stage" value="{h(stage)}"><div class="actions">{back}<button class="button" type="submit">{h(next_label)}</button></div>'
+    return f'<input type="hidden" name="stage" value="{h(stage)}"><div class="actions">{back}<button class="{h(next_class)}" type="submit">{h(next_label)}</button></div>'
 
 
 def stage_body(stage, settings, error, notice):
@@ -85,7 +85,7 @@ def stage_body(stage, settings, error, notice):
     modules = module_list()
     alerts = (f'<div class="error">{h(error)}</div>' if error else "") + (f'<div class="notice">{h(notice)}</div>' if notice else "")
     if stage == "welcome":
-        content = '<h1>Welcome to Open Paging Server</h1><p class="lead">You are a few steps away from getting started with your new paging system.</p><form method="post">' + form_buttons("welcome", None, "Start") + "</form>"
+        content = '<h1>Welcome to Open Paging Server</h1><p class="lead">You are a few steps away from getting started with your new paging system.</p><form method="post">' + form_buttons("welcome", None, "Start", "button good") + "</form>"
     elif stage == "account":
         content = """<h1>Create an account</h1><p class="lead">To begin, please create your user account. This will be the main administrator account, and cannot be deleted.</p>
         <form method="post"><input type="hidden" name="stage" value="account">
@@ -97,7 +97,7 @@ def stage_body(stage, settings, error, notice):
     elif stage == "time":
         content = f"""<h1>Is this date and time correct?</h1><p class="lead">If not, ensure this system is using the correct NTP server and timezone. Correct date &amp; time is important for bells, scheduled broadcasts, history, message expiration, and general housekeeping.</p>
         <div class="timebox"><div class="time" id="serverTime" data-iso="{h(now.isoformat())}">{h(now.strftime("%I:%M %p").lstrip("0"))}</div><div class="date" id="serverDate" data-iso="{h(now.isoformat())}">{h(now.strftime("%A %b %d, %Y"))}</div></div>
-        <form method="post"><input type="hidden" name="stage" value="time"><div class="actions"><button class="button secondary" name="action" value="back" type="submit">Back</button><input type="hidden" name="back_stage" value="account"><button class="button good" name="action" value="next" type="submit">Next</button></div></form>"""
+        <form method="post"><input type="hidden" name="stage" value="time"><div class="actions"><button class="button secondary" name="action" value="back" type="submit">Back</button><input type="hidden" name="back_stage" value="account"><button class="button" name="action" value="next" type="submit">Continue</button></div></form>"""
     elif stage == "modules":
         items = "".join(f"<li>{h(item['name'])}{(' ' + h(item['version'])) if item['version'] else ''}{(' by ' + h(item['author'])) if item['author'] else ''}</li>" for item in modules) or "<li>No endpoint modules found.</li>"
         content = f"""<h1>Endpoint modules</h1><p class="lead">Open Paging Server uses endpoint modules. You have the following endpoint modules installed:</p><ul class="module-list">{items}</ul><p class="lead">You can add more in /var/lib/openpagingserver/endpointmodules</p>
