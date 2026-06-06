@@ -45,7 +45,7 @@ strong { font-weight:700; }
 .slider:before { position: absolute; content: ""; height: 20px; width: 20px; left: -2px; bottom: -3px; background-color: white; transition: .4s; border-radius: 50%; box-shadow: 0 2px 4px rgba(0,0,0,0.2); }
 input:checked + .slider { background-color: #90caf9; }
 input:checked + .slider:before { transform: translateX(20px); background-color: #1976D2; }
-.login-settings input[type="text"], .login-settings input[type="number"], .login-settings select, .login-settings textarea { width:100%; padding:10px; border-radius:6px; border:1px solid #CCC; font-family:inherit; font-size:14px; box-sizing:border-box; }
+.login-settings input[type="text"], .login-settings input[type="password"], .login-settings input[type="number"], .login-settings select, .login-settings textarea { width:100%; padding:10px; border-radius:6px; border:1px solid #CCC; font-family:inherit; font-size:14px; box-sizing:border-box; }
 .login-settings textarea { resize:vertical; min-height:80px; }
 .login-settings input:disabled, .login-settings select:disabled, .login-settings textarea:disabled { background:rgba(0,0,0,0.05); color:#999; cursor:not-allowed; }
 .login-settings button { background:#1976D2; color:#FFF; border:none; padding:10px 16px; border-radius:6px; font-size:14px; cursor:pointer; }
@@ -79,7 +79,7 @@ h2,h3,h4{ color:#BB86FC; }
 .tabs-mobile { background: #1E1E1E; color: #E0E0E0; border-color: #444; }
 input:checked + .slider { background-color: #3d2b52; }
 input:checked + .slider:before { background-color: #BB86FC; }
-.login-settings input[type="text"], .login-settings input[type="number"], .login-settings select, .login-settings textarea { background:#1E1E1E; border:1px solid #444; color:#E0E0E0; }
+.login-settings input[type="text"], .login-settings input[type="password"], .login-settings input[type="number"], .login-settings select, .login-settings textarea { background:#1E1E1E; border:1px solid #444; color:#E0E0E0; }
 .login-settings input:disabled, .login-settings select:disabled, .login-settings textarea:disabled { background:#2A2A2A; color:#777; }
 .login-settings button { background:#BB86FC; color:#000; }
 .login-settings button:hover { background:#A370F7; }
