@@ -44,8 +44,8 @@ def handle_request():
     if not isinstance(user, dict):
         return user
     module = request.args.get("module", "")
-    module_info = endpoint_module_catalog().get(module)
-    if not safe_module_name(module) or not module_info or not module_info.get("has_forms"):
+    module_info = endpoint_module_catalog(include_system=True).get(module)
+    if not safe_module_name(module) or not module_info or not module_info.get("has_forms") or not module_info.get("can_load", True):
         abort(404)
     ctx = legacy_user_context(user)
     description = f'<p class="muted">{h(module_info.get("description") or "")}</p>' if module_info.get("description") else ""
