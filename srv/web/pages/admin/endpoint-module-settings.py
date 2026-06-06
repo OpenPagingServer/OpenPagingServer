@@ -29,6 +29,8 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .status-pill{ display:inline-flex; align-items:center; gap:6px; padding:5px 10px; border-radius:999px; font-size:0.82em; background:#E3F2FD; color:#1565C0; }
 .status-pill.disabled{ background:#F1F3F4; color:#5F6368; }
 .status-pill.error{ background:#FCE8E6; color:#A50E0E; }
+.status-pill.signed{ background:#E8F5E9; color:#1B5E20; }
+.cannot-load{ color:#A50E0E; font-weight:500; }
 .muted{ color:#777; font-size:0.92em; padding:18px; display:block; }
 .success{ background:#E8F5E9; border:1px solid #A5D6A7; color:#1B5E20; padding:12px; border-radius:8px; margin-bottom:16px; }
 .error{ background:#FFEBEE; border:1px solid #EF9A9A; color:#B71C1C; padding:12px; border-radius:8px; margin-bottom:16px; }
@@ -59,10 +61,20 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 .status-pill{ background:#2A2433; color:#BB86FC; }
 .status-pill.disabled{ background:#2A2A2A; color:#9AA0A6; }
 .status-pill.error{ background:#3B1515; color:#FFCDD2; }
+.status-pill.signed{ background:#14351A; color:#C8E6C9; }
+.cannot-load{ color:#FFCDD2; }
 .success{ background:#14351A; border-color:#2E7D32; color:#C8E6C9; }
 .error{ background:#3B1515; border-color:#6D2A2A; color:#FFCDD2; }
 }
 """
+
+
+def module_has_render_settings(module):
+    try:
+        mod = load_endpoint_web(module)
+        return getattr(mod, "render_settings", None) is not None
+    except Exception:
+        return False
 
 
 def handle_request():
@@ -77,6 +89,8 @@ def handle_request():
             module = request.form.get("module", "")
             if request.form.get("action") != "toggle_module" or module not in modules:
                 raise RuntimeError("Invalid module action.")
+            if not modules[module].get("can_load", True):
+                raise RuntimeError("This module cannot be loaded.")
             ensure_endpoint_module_state_table()
             states = endpoint_module_state_map(modules)
             enabled = not bool(states.get(module))
@@ -93,22 +107,30 @@ def handle_request():
     cards = ""
     for module, module_info in modules.items():
         is_enabled = bool(module_info.get("enabled"))
+        can_load = bool(module_info.get("can_load", True))
         settings_link = ""
-        if module_info.get("has_settings_page"):
+        if can_load and module_info.get("has_settings_page") and module_has_render_settings(module):
             settings_link = f"""<a class="module-settings-button" href="/admin/endpoint-module-settings-configure?{h(urlencode({"module": module}))}">
                             <i class="fa-solid fa-sliders"></i> Module Settings
                         </a>"""
+        signature_state = str(module_info.get("signature_state") or "").lower()
+        if module_info.get("trusted"):
+            signature_html = f'<span class="status-pill signed"><i class="fa-solid fa-circle-check"></i>{h(module_info.get("signature_label") or "Signed by CA")}</span>'
+        elif signature_state == "untrusted":
+            signature_html = f'<span class="status-pill error"><i class="fa-solid fa-circle-question"></i>{h(module_info.get("load_error") or "No installed CA trusts this module. Refer to the developer for information.")}</span>'
+        else:
+            signature_html = f'<span class="status-pill error"><i class="fa-solid fa-ban"></i>{h(module_info.get("load_error") or "This module is unsigned and cannot be verified")}</span>'
+        status_html = f"""<div class="module-status">
+                    {signature_html}
+                    {f'<span class="status-pill disabled"><i class="fa-solid fa-toggle-off"></i> Disabled</span>' if can_load and not is_enabled else ''}
+                    {f'<span class="status-pill"><i class="fa-solid fa-plug-circle-check"></i> Loaded</span>' if module_info.get("loaded") else ''}
+                </div>"""
         description = f'<div class="module-meta">{h(module_info.get("description") or "")}</div>' if module_info.get("description") else ""
         version = f' - Version {h(module_info.get("version"))}' if module_info.get("version") else ""
-        cards += f"""<section class="module-card">
-            <div class="module-head">
-                <div>
-                    <div class="module-title">{h(module_info.get("name") or module)}</div>
-                    <div class="module-meta">{h(module)}{f' - {h(module_info.get("input_type"))}' if module_info.get("input_type") else ''}{version}</div>
-                    {description}
-                </div>
-                <div class="module-controls">
-                    {settings_link}
+        developer = h(module_info.get("developer") or module_info.get("author") or module_info.get("maintainer") or "Unknown Developer")
+        controls = ""
+        if can_load:
+            controls = f"""{settings_link}
                     <form method="post">
                         <input type="hidden" name="action" value="toggle_module">
                         <input type="hidden" name="module" value="{h(module)}">
@@ -116,7 +138,19 @@ def handle_request():
                             <i class="fa-solid {'fa-toggle-on' if is_enabled else 'fa-toggle-off'}"></i>
                             {'Disable' if is_enabled else 'Enable'}
                         </button>
-                    </form>
+                    </form>"""
+        else:
+            controls = '<span class="cannot-load">This module cannot be loaded</span>'
+        cards += f"""<section class="module-card">
+            <div class="module-head">
+                <div>
+                    <div class="module-title">{h(module_info.get("name") or module)}</div>
+                    <div class="module-meta">{developer}{f' - {h(module_info.get("input_type"))}' if module_info.get("input_type") else ''}{version}</div>
+                    {description}
+                    {status_html}
+                </div>
+                <div class="module-controls">
+                    {controls}
                 </div>
             </div>
         </section>"""
