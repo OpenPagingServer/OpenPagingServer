@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pymysql
 from dotenv import load_dotenv
+from endpoints import connect_endpoint_ipc
 
 from active_broadcast_store import put_active_broadcast, mark_active_broadcast_delivery
 
@@ -22,8 +23,6 @@ DB_PASS = os.getenv("DB_PASS")
 DB_NAME = os.getenv("DB_NAME")
 DEBUG = os.getenv("DEBUG", "").strip().lower() == "true"
 
-IPC_HOST = "127.0.0.1"
-IPC_PORT = 50000
 POLL_INTERVAL = max(0.2, float(os.getenv("BELL_POLL_INTERVAL", "0.5")))
 LOG_FILE = BASE_DIR / "belld_debug.log"
 last_seen_by_schedule = {}
@@ -292,7 +291,7 @@ def send_broadcast_ipc(broadcast_id):
     stream_id = uuid.uuid4().hex
     sock = None
     try:
-        sock = socket.create_connection((IPC_HOST, IPC_PORT), timeout=5)
+        sock = connect_endpoint_ipc(timeout=5)
         sock.sendall(f"BROADCAST {stream_id} {broadcast_id}\n".encode("utf-8"))
         response = sock.recv(1024)
         log(f"broadcast_id={broadcast_id} stream={stream_id} response={response!r}")
