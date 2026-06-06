@@ -1,5 +1,3 @@
-import xml.etree.ElementTree as ET
-
 from srv.web.app import *
 
 ACTION_STYLE = r"""
@@ -47,26 +45,6 @@ def safe_name(value):
     return re.fullmatch(r"[A-Za-z0-9_-]+", str(value or "")) is not None
 
 
-def xml_text(root, tag, default=""):
-    node = root.find(tag)
-    return (node.text or "").strip() if node is not None and node.text is not None else default
-
-
-def module_info(module_dir, module):
-    info = {"module": module, "name": module, "description": "", "input_type": "Output"}
-    info_path = module_dir / "info.xml"
-    if not info_path.is_file():
-        return info
-    try:
-        root = ET.parse(info_path).getroot()
-    except ET.ParseError:
-        return info
-    info["name"] = xml_text(root, "name", module) or module
-    info["description"] = xml_text(root, "desp") or xml_text(root, "description")
-    info["input_type"] = xml_text(root, "type", "Output") or "Output"
-    return info
-
-
 def render_endpoint_action_frame(action):
     user = require_admin()
     if not isinstance(user, dict):
@@ -89,16 +67,15 @@ def render_endpoint_action_page(action):
     endpoint_id = request.args.get("id", "").strip()
     if action not in {"edit", "delete"} or not safe_name(module) or endpoint_id == "" or len(endpoint_id) > 255:
         abort(400)
-    module_dir = (ENDPOINT_MODULES_DIR / module).resolve()
-    if ENDPOINT_MODULES_DIR.resolve() not in module_dir.parents or not module_dir.is_dir():
+    info = endpoint_module_catalog(include_system=True).get(module)
+    if not info or not info.get("can_load", True):
         abort(404)
-    info = module_info(module_dir, module)
     action_title = "Delete Endpoint" if action == "delete" else "Edit Endpoint"
     frame_src = "/admin/endpoint-action-frame?" + urlencode({"action": action, "module": module, "id": endpoint_id})
     content = f"""    <div class="header-actions">
         <div>
             <h1>{h(action_title)}</h1>
-            <p class="muted">{h(info["name"])}</p>
+            <p class="muted">{h(info.get("name") or module)}</p>
             <div class="endpoint-id">{h(endpoint_id)}</div>
         </div>
         <a class="back-link" href="/admin/manage-endpoints"><i class="fa-solid fa-arrow-left"></i> Endpoints</a>
