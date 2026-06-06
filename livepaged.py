@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pymysql
 from dotenv import load_dotenv
+from endpoints import connect_endpoint_ipc
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -22,8 +23,6 @@ DB_USER = os.getenv("DB_USER")
 DB_PASS = os.getenv("DB_PASS")
 DB_NAME = os.getenv("DB_NAME")
 
-IPC_HOST = "127.0.0.1"
-IPC_PORT = 50000
 WS_HOST = os.getenv("LIVEPAGED_WS_HOST", "0.0.0.0")
 WS_PORT = int(os.getenv("LIVEPAGED_WS_PORT", "50010"))
 
@@ -158,11 +157,10 @@ def resolve_targets(group_id):
             target_list = set()
             if str(group_id) == "0":
                 try:
-                    cur.execute("SELECT `dir` FROM endpointmodulesloaded WHERE enabled = 'true'")
+                    cur.execute("SELECT `dir` FROM endpointmodulesloaded WHERE enabled = 'true' AND trusted = 'true'")
                     rows = cur.fetchall()
                 except Exception:
-                    module_root = BASE_DIR / "endpoint-modules"
-                    rows = [(path.name,) for path in module_root.iterdir() if (path / "index.py").exists()]
+                    rows = []
                 page_debug(f"resolve_targets_all_modules rows={rows}")
                 for row in rows:
                     if row and row[0]:
@@ -214,14 +212,11 @@ class LivePageSession:
         if not self.targets:
             page_debug(f"preflight_no_targets stream={self.stream_id} group={self.group_id!r}")
             raise RuntimeError("503 Service Unavailable")
-        self.control_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.control_sock.settimeout(10)
+        self.control_sock = connect_endpoint_ipc(timeout=10)
         command = f"PREPARELIVE {self.stream_id} {self.group_id} {' '.join(self.targets)}\n"
         page_debug(
-            f"preflight_connect stream={self.stream_id} endpoint={IPC_HOST}:{IPC_PORT} "
-            f"command={command.strip()!r}"
+            f"preflight_connect stream={self.stream_id} command={command.strip()!r}"
         )
-        self.control_sock.connect((IPC_HOST, IPC_PORT))
         self.control_sock.sendall(command.encode("utf-8"))
         response = self.control_sock.recv(1024)
         page_debug(f"preflight_response stream={self.stream_id} response={response!r}")
