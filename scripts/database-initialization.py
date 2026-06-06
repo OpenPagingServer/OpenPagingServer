@@ -18,6 +18,8 @@ ENDPOINT_MODULES_DIR = Path("/var/lib/openpagingserver/endpointmodules")
 TRUSTED_CA_DIR = Path("/etc/openpagingserver/trustedca")
 PROJECT_CA_URL = "https://install.openpagingserver.org/rootca.crt"
 PROJECT_CA_PATH = TRUSTED_CA_DIR / "OpenPagingServerProject.crt"
+TRUSTED_CA_README_URL = "https://install.openpagingserver.org/trustedca-dir.md"
+TRUSTED_CA_README_PATH = TRUSTED_CA_DIR / "README.md"
 
 
 def random_password(length=32):
@@ -74,10 +76,18 @@ def run_systemctl(action):
 
     subprocess.run(["systemctl", action, unit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
 
+
 def install_project_root_ca():
     TRUSTED_CA_DIR.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         ["wget", "-q", "-O", str(PROJECT_CA_PATH), PROJECT_CA_URL],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=True,
+    )
+    subprocess.run(
+        ["wget", "-q", "-O", str(TRUSTED_CA_README_PATH), TRUSTED_CA_README_URL],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         text=True,
@@ -453,6 +463,7 @@ def wrapped_main():
         if service_exists:
             time.sleep(5)
             run_systemctl("start")
+
 
 if __name__ == "__main__":
     wrapped_main()
