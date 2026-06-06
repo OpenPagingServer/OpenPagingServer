@@ -16,8 +16,8 @@ DATABASE_USER = "openpagingserver"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ENDPOINT_MODULES_DIR = Path("/var/lib/openpagingserver/endpointmodules")
 TRUSTED_CA_DIR = Path("/etc/openpagingserver/trustedca")
-PROJECT_CA_URL = "https://install.openpagingserver.org/rootca.pem"
-PROJECT_CA_PATH = TRUSTED_CA_DIR / "OpenPagingServerProject.pem"
+PROJECT_CA_URL = "https://install.openpagingserver.org/rootca.crt"
+PROJECT_CA_PATH = TRUSTED_CA_DIR / "OpenPagingServerProject.crt"
 
 
 def random_password(length=32):
