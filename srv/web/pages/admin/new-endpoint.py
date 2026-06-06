@@ -55,7 +55,11 @@ def handle_request():
     if not isinstance(user, dict):
         return user
     ctx = legacy_user_context(user)
-    modules = [info for info in endpoint_module_catalog().values() if info.get("has_forms")]
+    modules = [
+        info
+        for info in endpoint_module_catalog(include_system=True).values()
+        if info.get("has_forms") and info.get("can_load", True)
+    ]
     if modules:
         cards = []
         for module in modules:
