@@ -1,5 +1,3 @@
-import xml.etree.ElementTree as ET
-
 from srv.web.app import *
 
 MODULE_CONFIGURE_STYLE = r"""
@@ -45,26 +43,6 @@ def module_safe_name(value):
     return re.fullmatch(r"[A-Za-z0-9_-]+", str(value or "")) is not None
 
 
-def module_xml_text(root, tag, default=""):
-    node = root.find(tag)
-    return (node.text or "").strip() if node is not None and node.text is not None else default
-
-
-def endpoint_module_info(module_dir, module):
-    info = {"module": module, "name": module, "description": "", "input_type": "Output", "version": ""}
-    info_path = module_dir / "info.xml"
-    if info_path.is_file():
-        try:
-            root = ET.parse(info_path).getroot()
-            info["name"] = module_xml_text(root, "name", module) or module
-            info["description"] = module_xml_text(root, "desp") or module_xml_text(root, "description")
-            info["input_type"] = module_xml_text(root, "type", "Output") or "Output"
-            info["version"] = module_xml_text(root, "version")
-        except ET.ParseError:
-            pass
-    return info
-
-
 def module_settings_response(title, body, active="endpoints", user=None, status=200):
     return Response(
         f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{h(title)}</title></head><body>{body}</body></html>""",
@@ -84,22 +62,21 @@ def handle_request():
     if not isinstance(user, dict):
         return user
     module = request.args.get("module", "")
-    module_dir = (ENDPOINT_MODULES_DIR / module).resolve()
-    if not module_safe_name(module) or ENDPOINT_MODULES_DIR.resolve() not in module_dir.parents or not module_dir.is_dir():
+    info = endpoint_module_catalog().get(module)
+    if not module_safe_name(module) or not info or not info.get("can_load", True) or not info.get("has_settings_page"):
         abort(404)
     mod = load_endpoint_web(module)
     if getattr(mod, "render_settings", None) is None:
         abort(404)
-    info = endpoint_module_info(module_dir, module)
-    description = f'<p class="muted">{h(info["description"])}</p>' if info["description"] else ""
+    description = f'<p class="muted">{h(info.get("description") or "")}</p>' if info.get("description") else ""
     rendered = mod.render_settings(request, db, module_settings_response, user)
     settings_body = response_body(rendered)
     content = f"""    <div class="header-actions">
         <div>
-            <h1>{h(info["name"])} Settings</h1>
+            <h1>{h(info.get("name") or module)} Settings</h1>
             {description}
         </div>
         <a class="back-link" href="/admin/endpoint-module-settings"><i class="fa-solid fa-arrow-left"></i> Modules</a>
     </div>
     <div class="settings-frame" style="padding:18px; overflow:auto;">{settings_body}</div>"""
-    return legacy_page(f"{info['name']} Settings", legacy_user_context(user), "endpoints", MODULE_CONFIGURE_STYLE, content)
+    return legacy_page(f"{info.get('name') or module} Settings", legacy_user_context(user), "endpoints", MODULE_CONFIGURE_STYLE, content)
