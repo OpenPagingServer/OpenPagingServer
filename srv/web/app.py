@@ -725,17 +725,26 @@ def group_member_tokens(members):
     return [token for token in re.split(r"[\s,]+", str(members or "")) if token]
 
 
-def desktop_user_choices():
-    rows = query_all(
-        "SELECT id, username, role FROM users WHERE role NOT IN ('receiver', 'tempreceiver') ORDER BY username ASC"
+def desktop_eligible_users():
+    return query_all(
+        """
+        SELECT id, username, role
+        FROM users
+        WHERE role IS NULL OR role = '' OR role NOT IN ('receiver', 'tempreceiver')
+        ORDER BY username ASC
+        """
     )
+
+
+def desktop_user_choices():
+    rows = desktop_eligible_users()
     return [
         {
             "value": desktop_member_token(row.get("id")),
             "label": str(row.get("username") or ""),
         }
         for row in rows
-        if str(row.get("id") or "").strip()
+        if str(row.get("id") if row.get("id") is not None else "").strip()
     ]
 
 
@@ -746,6 +755,14 @@ def group_member_available(member, endpoint_availability):
     if is_desktop_member_token(token):
         return user_has_connected_client(desktop_member_user_id(token))
     return bool(endpoint_availability.get(token))
+
+
+def any_desktop_recipient_available():
+    return any(user_has_connected_client(row.get("id")) for row in desktop_eligible_users())
+
+
+def any_recipient_available(endpoint_availability):
+    return any(bool(value) for value in (endpoint_availability or {}).values()) or any_desktop_recipient_available()
 
 
 def endpoint_availability_map(endpoint_payload):
