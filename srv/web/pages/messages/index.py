@@ -82,23 +82,29 @@ def handle_request():
     if not isinstance(user, dict):
         return user
     ctx = legacy_user_context(user)
+    demo = demo_mode_enabled()
     if request.args.get("delete_msgid") and ctx["is_admin"]:
+        if demo:
+            return demo_mode_iframe_html("messages")
         execute("DELETE FROM messages WHERE messageid=%s", (request.args["delete_msgid"],))
         return redirect("/messages/")
     rows = query_all("SELECT messageid, name, type FROM messages ORDER BY name ASC")
-    admin_new = '<a href="/messages/new" class="btn-primary"><i class="fa-solid fa-plus" style="margin-right:8px;"></i> New Message</a>' if ctx["is_admin"] else ""
+    admin_new = ('<a href="javascript:openDemoModePopup(\'messages\')" class="btn-primary"><i class="fa-solid fa-plus" style="margin-right:8px;"></i> New Message</a>' if demo else '<a href="/messages/new" class="btn-primary"><i class="fa-solid fa-plus" style="margin-right:8px;"></i> New Message</a>') if ctx["is_admin"] else ""
     if rows:
         rendered = []
         for row in rows:
             mid = h(row.get("messageid"))
             admin_menu = ""
             if ctx["is_admin"]:
+                edit_href = "javascript:openDemoModePopup('messages')" if demo else f"/messages/edit?msgid={mid}"
+                delete_href = "javascript:openDemoModePopup('messages')" if demo else f"?delete_msgid={mid}"
+                delete_click = "" if demo else " onclick=\"return confirm('Are you sure you want to delete this message?')\""
                 admin_menu = f"""
                         <div class="dropdown">
                             <button class="dropbtn" onclick="event.stopPropagation(); toggleDropdown(this);"><i class="fa-solid fa-ellipsis-vertical"></i></button>
                             <div class="dropdown-content">
-                                <a href="/messages/edit?msgid={mid}"><i class="fa-solid fa-pen-to-square"></i> Edit</a>
-                                <a href="?delete_msgid={mid}" onclick="return confirm('Are you sure you want to delete this message?')" style="color:#C62828;"><i class="fa-solid fa-trash"></i> Delete</a>
+                                <a href="{edit_href}"><i class="fa-solid fa-pen-to-square"></i> Edit</a>
+                                <a href="{delete_href}"{delete_click} style="color:#C62828;"><i class="fa-solid fa-trash"></i> Delete</a>
                             </div>
                         </div>"""
             rendered.append(
@@ -119,7 +125,7 @@ def handle_request():
     content = f"""    <div class="header-actions">
         <h1>Messages</h1>
         <div style="display:flex; gap:10px; align-items:center;">
-        <a href="/messages/custom" class="btn-custom-send"><i class="fa-solid fa-paper-plane" style="margin-right:8px;"></i> Send Custom Message</a>
+        <a href="{"javascript:openDemoModePopup('messages')" if demo else "/messages/custom"}" class="btn-custom-send"><i class="fa-solid fa-paper-plane" style="margin-right:8px;"></i> Send Custom Message</a>
         {admin_new}
         </div>
     </div>

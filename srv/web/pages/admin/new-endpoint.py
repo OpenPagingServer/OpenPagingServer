@@ -55,6 +55,8 @@ def handle_request():
     if not isinstance(user, dict):
         return user
     ctx = legacy_user_context(user)
+    if demo_mode_enabled():
+        return demo_mode_page("New Endpoint", ctx, "endpoints", "manage-endpoints")
     modules = [
         info
         for info in endpoint_module_catalog(include_system=True).values()

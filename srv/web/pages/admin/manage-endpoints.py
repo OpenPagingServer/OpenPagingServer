@@ -137,6 +137,7 @@ def handle_request():
     if not isinstance(user, dict):
         return user
     ctx = legacy_user_context(user)
+    demo = demo_mode_enabled()
     sort = request.args.get("sort", "alpha")
     if sort not in {"alpha", "module", "devices"}:
         sort = "alpha"
@@ -158,11 +159,12 @@ def handle_request():
     if payload.get("warning"):
         notices += f'<div class="error">{h(payload.get("warning"))}</div>'
     notices += "".join(f'<div class="error">{h(err)}</div>' for err in module_errors if err)
-
     sort_links = "".join(
         f'<a class="sort-link {"active" if sort == key else ""}" href="?sort={key}">{label}</a>'
         for key, label in (("alpha", "Alphabetical"), ("module", "Module"), ("devices", "Most Devices"))
     )
+    new_href = "javascript:openDemoModePopup('manage-endpoints')" if demo else "/admin/new-endpoint"
+    settings_href = "javascript:openDemoModePopup('manage-endpoints')" if demo else "/admin/endpoint-module-settings"
     if rows:
         rendered_rows = []
         for endpoint in rows:
@@ -176,6 +178,8 @@ def handle_request():
                 status_class = re.sub(r"[^a-z0-9]+", "-", status_token.lower())
                 status_text = h(status) + (f" ({h(address)})" if address else "")
                 status_html = f'<div class="endpoint-status"><span class="status-dot {h(status_class)}"></span><span>{status_text}</span></div>'
+            edit_href = "javascript:openDemoModePopup('manage-endpoints')" if demo else f"/admin/edit-endpoint?{h(query)}"
+            delete_href = "javascript:openDemoModePopup('manage-endpoints')" if demo else f"/admin/delete-endpoint?{h(query)}"
             rendered_rows.append(
                 f"""<li class="endpoint-item">
                         <div class="endpoint-main">
@@ -184,8 +188,8 @@ def handle_request():
                             {status_html}
                         </div>
                         <div class="endpoint-actions">
-                            <a class="icon-action" href="/admin/edit-endpoint?{h(query)}" title="Edit"><i class="fa-solid fa-pen-to-square"></i></a>
-                            <a class="icon-action delete" href="/admin/delete-endpoint?{h(query)}" title="Delete"><i class="fa-solid fa-trash"></i></a>
+                            <a class="icon-action" href="{edit_href}" title="Edit"><i class="fa-solid fa-pen-to-square"></i></a>
+                            <a class="icon-action delete" href="{delete_href}" title="Delete"><i class="fa-solid fa-trash"></i></a>
                         </div>
                     </li>"""
             )
@@ -195,8 +199,8 @@ def handle_request():
     content = f"""    <div class="header-actions">
         <h1>Manage Endpoints</h1>
         <div class="sort-actions">
-            <a class="add-button" href="/admin/new-endpoint" title="New Endpoint"><i class="fa-solid fa-plus"></i></a>
-            <a class="settings-button" href="/admin/endpoint-module-settings"><i class="fa-solid fa-sliders"></i> Endpoint Module Settings</a>
+            <a class="add-button" href="{new_href}" title="New Endpoint"><i class="fa-solid fa-plus"></i></a>
+            <a class="settings-button" href="{settings_href}"><i class="fa-solid fa-sliders"></i> Endpoint Module Settings</a>
             <span class="muted">Sort</span>
             {sort_links}
         </div>

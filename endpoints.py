@@ -918,40 +918,106 @@ def sip_split_dialplan_trigger(value):
 
 def sip_form_frame(body):
     return (
-        "<style>body{font-family:Tahoma,sans-serif;margin:0;padding:18px;color:#202124;background:#fff}"
-        ".grid{display:grid;gap:12px}.row{display:grid;gap:6px}.surface{max-width:760px;border:1px solid #e6e8eb;border-radius:8px;padding:18px;background:#fff}"
-        "label{font-weight:500}.control,input,select{padding:10px 11px;border:1px solid #ccd1d5;border-radius:6px;font:inherit;box-sizing:border-box;width:100%;background:#fff;color:#202124}.short{max-width:190px}"
+        "<style>body{font-family:Tahoma,sans-serif;margin:0;padding:20px;color:#202124;background:#fff}"
+        ".form-surface,.surface{max-width:720px;background:#fff;border:1px solid #e6e8eb;border-radius:8px;padding:18px;box-shadow:0 1px 3px rgba(0,0,0,.08)}"
+        ".grid{display:grid;gap:14px}.row{display:grid;gap:6px}label{font-weight:500}.control,input,select{padding:10px 11px;border:1px solid #ccd1d5;border-radius:6px;font:inherit;box-sizing:border-box;width:100%;background:#fff;color:#202124}.short-control,.short{max-width:180px}"
         "button,.button{background:#1976D2;color:#fff;border:0;border-radius:6px;padding:10px 14px;font:inherit;cursor:pointer;justify-self:start;text-decoration:none}.danger{background:#C62828}"
-        ".error{background:#FFEBEE;border:1px solid #EF9A9A;color:#B71C1C;padding:10px;border-radius:6px;margin-bottom:12px}.meta{color:#5f6368;margin:0 0 12px}.hint{color:#5f6368;font-size:.9em}"
-        "@media(prefers-color-scheme:dark){body{background:#1e1e1e;color:#e0e0e0}.surface{background:#232323;border-color:#333}.control,input,select{background:#171717;border-color:#3a3a3a;color:#eee}button,.button{background:#BB86FC;color:#000}.danger{background:#EF9A9A}.meta,.hint{color:#aaa}}</style>"
+        ".success{background:#E8F5E9;border:1px solid #A5D6A7;color:#1B5E20;padding:10px;border-radius:6px;margin-bottom:12px}.error{background:#FFEBEE;border:1px solid #EF9A9A;color:#B71C1C;padding:10px;border-radius:6px;margin-bottom:12px}.meta{color:#5f6368;margin:0 0 14px}"
+        ".dropdown-checklist{position:relative}.dropdown-checklist summary{list-style:none;cursor:pointer;padding:10px 11px;border:1px solid #ccd1d5;border-radius:6px;background:#fff}.dropdown-checklist summary::-webkit-details-marker{display:none}.dropdown-panel{position:absolute;top:calc(100% + 6px);left:0;right:0;z-index:20;border:1px solid #d8dde2;border-radius:6px;padding:8px;display:grid;gap:6px;max-height:220px;overflow:auto;background:#fff;box-shadow:0 8px 18px rgba(0,0,0,.14)}"
+        ".check{display:flex;gap:8px;align-items:center;font-weight:400}.check.disabled{opacity:.55}.switch-row{display:flex;align-items:center;gap:10px}.switch{position:relative;width:44px;height:24px}.switch input{opacity:0;width:0;height:0}.slider{position:absolute;cursor:pointer;inset:0;background:#9aa0a6;border-radius:999px;transition:.2s}.slider:before{content:\"\";position:absolute;height:18px;width:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 2px rgba(0,0,0,.25)}.switch input:checked + .slider{background:#1976D2}.switch input:checked + .slider:before{transform:translateX(20px)}.hint{color:#5f6368;font-size:.9em}"
+        "@media(prefers-color-scheme:dark){body{background:#1e1e1e;color:#e0e0e0}.form-surface,.surface{background:#232323;border-color:#333;box-shadow:none}.control,input,select,.dropdown-checklist summary,.dropdown-panel{background:#171717;border-color:#3a3a3a;color:#eee}button,.button{background:#BB86FC;color:#000}.danger{background:#EF9A9A}.meta,.hint{color:#aaa}.switch input:checked + .slider{background:#BB86FC}}</style>"
         + body
     )
 
 
-def sip_group_options(selected):
-    selected_groups = set(str(selected or "").split(".")) if selected else set()
-    return "".join(
-        f'<label><input type="checkbox" name="group_item" value="{h(row.get("id"))}"{" checked" if str(row.get("id")) in selected_groups else ""}> '
-        f'{h("All Recipients" if str(row.get("id")) == "0" else str(row.get("id")) + (" - " + str(row.get("name")) if row.get("name") else ""))}</label>'
+def sip_dialplan_fields(values):
+    selected_groups = set(str(values["group"] or "").split(".")) if values.get("group") else set()
+    group_options = "".join(
+        f"""<label class="check"><input type="checkbox" class="group-check" value="{h(row.get("id"))}" data-label="{h("All Recipients" if str(row.get("id")) == "0" else row.get("name") or row.get("id"))}"{" checked" if str(row.get("id")) in selected_groups else ""}> {h("All Recipients" if str(row.get("id")) == "0" else str(row.get("id")) + (" - " + str(row.get("name")) if row.get("name") else ""))}</label>"""
         for row in sip_fetch_groups()
     )
-
-
-def sip_dialplan_fields(values):
-    trigger_options = "".join(
-        f'<option value="{h(value)}"{" selected" if value == values["trigger_type"] else ""}>{h(label)}</option>'
-        for value, label in (("page", "Paging"), ("message", "Send Message"), ("#testtone", "Milliwatt Test Tone"), ("#echotest", "Echo Test"))
-    )
+    if not group_options:
+        group_options = '<span class="hint">No groups configured.</span>'
     message_options = "".join(
         f'<option value="{h(row.get("id"))}"{" selected" if str(row.get("id")) == values["message_id"] else ""}>{h(row.get("id"))} - {h(row.get("name") or "")}</option>'
         for row in sip_fetch_messages()
     )
+    trigger_options = "".join(
+        f'<option value="{h(value)}"{" selected" if value == values["trigger_type"] else ""}>{h(label)}</option>'
+        for value, label in (("page", "Paging"), ("message", "Send Message"), ("#testtone", "Milliwatt Test Tone"), ("#echotest", "Echo Test"))
+    )
     return f"""<div class="row"><label>Name</label><input class="control" name="name" value="{h(values["name"])}" required></div>
-<div class="row"><label>Extension</label><input class="control short" name="extension" value="{h(values["extension"])}" required pattern="[0-9*#]*" inputmode="tel"></div>
-<div class="row"><label>Trigger</label><select class="control" name="trigger_type">{trigger_options}</select></div>
-<div class="row"><label>Message</label><select class="control" name="message_id"><option value="">Choose a message</option>{message_options}</select></div>
-<div class="row"><label>Groups</label><div class="grid">{sip_group_options(values["group"])}</div><p class="hint">Choose All Recipients or one or more groups.</p></div>
-<div class="row"><label>Passcode</label><input class="control short" name="passcode" value="{h(values["passcode"])}" pattern="[0-9A-Da-d]*" inputmode="text"></div>"""
+<div class="row"><label>Extension</label><input class="control short-control" name="extension" id="extension" value="{h(values["extension"])}" required pattern="[0-9*#]*" inputmode="tel"></div>
+<div class="row"><label>Trigger</label><select class="control" name="trigger_type" id="triggerType">{trigger_options}</select></div>
+<div class="row trigger-extra" id="messageRow"><label>Message</label><select class="control" name="message_id"><option value="">Choose a message</option>{message_options}</select></div>
+<div class="row trigger-extra" id="groupRow"><label>Groups</label><input type="hidden" name="group" id="groupValue" value="{h(values["group"])}"><details class="dropdown-checklist" id="groupDropdown"><summary id="groupSummary">Select groups</summary><div class="dropdown-panel">{group_options}</div></details></div>
+<label class="switch-row"><span>Use a passcode</span><span class="switch"><input type="checkbox" name="require_passcode" value="1" id="requirePasscode"{" checked" if values.get("require_passcode") == "1" else ""}><span class="slider"></span></span></label>
+<div class="row" id="passcodeRow"><label>Passcode</label><input class="control short-control" name="passcode" id="passcode" value="{h(values["passcode"])}" pattern="[0-9A-D]*" inputmode="text"></div>
+<script>
+const triggerType = document.getElementById('triggerType');
+const groupRow = document.getElementById('groupRow');
+const messageRow = document.getElementById('messageRow');
+const requirePasscode = document.getElementById('requirePasscode');
+const passcodeRow = document.getElementById('passcodeRow');
+const passcode = document.getElementById('passcode');
+const extension = document.getElementById('extension');
+const groupValue = document.getElementById('groupValue');
+const groupChecks = Array.from(document.querySelectorAll('.group-check'));
+const groupSummary = document.getElementById('groupSummary');
+function syncTrigger() {{
+  const value = triggerType.value;
+  groupRow.style.display = (value === 'page' || value === 'message') ? 'grid' : 'none';
+  messageRow.style.display = value === 'message' ? 'grid' : 'none';
+}}
+function syncPasscode() {{
+  passcodeRow.style.display = requirePasscode.checked ? 'grid' : 'none';
+  if (!requirePasscode.checked) passcode.value = '';
+}}
+function syncGroupsFromChecks() {{
+  const selectedInputs = groupChecks.filter(input => input.checked);
+  const selected = selectedInputs.map(input => input.value);
+  groupValue.value = selected.join('.');
+  groupSummary.textContent = selectedInputs.length ? selectedInputs.map(input => input.dataset.label || input.value).join(', ') : 'Select groups';
+}}
+function syncAllRecipients() {{
+  const all = groupChecks.find(input => input.value === '0');
+  if (!all) {{
+    syncGroupsFromChecks();
+    return;
+  }}
+  if (all.checked) {{
+    groupChecks.forEach(input => {{
+      if (input !== all) {{
+        input.checked = false;
+        input.disabled = true;
+        input.closest('.check')?.classList.add('disabled');
+      }}
+    }});
+  }} else {{
+    groupChecks.forEach(input => {{
+      input.disabled = false;
+      input.closest('.check')?.classList.remove('disabled');
+    }});
+  }}
+  syncGroupsFromChecks();
+}}
+function blockInvalidInput(input, pattern) {{
+  input.addEventListener('beforeinput', event => {{
+    if (event.data && !pattern.test(event.data)) event.preventDefault();
+  }});
+}}
+triggerType.addEventListener('change', syncTrigger);
+requirePasscode.addEventListener('change', syncPasscode);
+passcode.addEventListener('input', () => {{ passcode.value = passcode.value.toUpperCase().replace(/[^0-9A-D]/g, ''); }});
+extension.addEventListener('input', () => {{ extension.value = extension.value.replace(/[^0-9*#]/g, ''); }});
+blockInvalidInput(extension, /^[0-9*#]+$/);
+blockInvalidInput(passcode, /^[0-9A-Da-d]+$/);
+groupChecks.forEach(input => input.addEventListener('change', syncAllRecipients));
+document.getElementById('dialplanForm').addEventListener('submit', syncGroupsFromChecks);
+syncTrigger();
+syncPasscode();
+syncAllRecipients();
+</script>"""
 
 
 class BuiltinSipTrunksWeb:
@@ -970,7 +1036,7 @@ class BuiltinSipTrunksWeb:
         values = {
             "ip": {"name": "", "ipaddr": ""},
             "auth": {"name": "", "username": "", "password": "", "ipaddr": "0.0.0.0"},
-            "dialplan": {"name": "", "extension": "", "group": "", "trigger_type": "page", "message_id": "", "passcode": ""},
+            "dialplan": {"name": "", "extension": "", "group": "", "trigger_type": "page", "message_id": "", "require_passcode": "", "passcode": ""},
         }[form_type]
         if request.method == "POST":
             if form_type == "ip":
@@ -1006,8 +1072,9 @@ class BuiltinSipTrunksWeb:
             else:
                 for key in values:
                     values[key] = request.form.get(key, values[key]).strip()
-                values["group"] = sip_clean_groups(request.form.getlist("group_item") or request.form.get("group", ""))
-                values["passcode"] = values["passcode"].upper()
+                values["require_passcode"] = "1" if request.form.get("require_passcode") else ""
+                values["group"] = sip_clean_groups(values["group"] or request.form.getlist("group_item"))
+                values["passcode"] = values["passcode"].upper() if values["require_passcode"] == "1" else ""
                 trigger = sip_dialplan_trigger(values["trigger_type"], values["message_id"])
                 if values["trigger_type"] not in {"page", "message"}:
                     values["group"] = ""
@@ -1015,6 +1082,8 @@ class BuiltinSipTrunksWeb:
                     error = "Name and extension are required."
                 elif not re.fullmatch(r"[0-9*#]+", values["extension"]):
                     error = "Extension can only contain 0-9, *, and #."
+                elif values["trigger_type"] not in {"page", "message", "#testtone", "#echotest"}:
+                    error = "Choose a valid trigger."
                 elif values["trigger_type"] == "message" and not values["message_id"]:
                     error = "Choose a message."
                 elif values["trigger_type"] in {"page", "message"} and not values["group"]:
@@ -1043,7 +1112,7 @@ class BuiltinSipTrunksWeb:
 <div class="row"><label>IP Restriction</label><input class="control" name="ipaddr" value="{h(values["ipaddr"])}" required></div>
 <button type="submit">Add Authenticated SIP Trunk</button></form>"""
         else:
-            body = f'{error_html}<form method="post" class="grid surface">{sip_dialplan_fields(values)}<button type="submit">Add SIP Dialplan Extension</button></form>'
+            body = f'{error_html}<form method="post" class="grid form-surface" id="dialplanForm">{sip_dialplan_fields(values)}<button class="button" type="submit">Add SIP Dialplan Extension</button></form>'
         return page(self.forms()[form_type]["label"], sip_form_frame(body), "endpoints", user)
 
     def render_action(self, action, endpoint_id, request, conn_factory, page, user):
@@ -1097,21 +1166,26 @@ class BuiltinSipTrunksWeb:
                 extension = request.form.get("extension", "").strip()
                 trigger_type = request.form.get("trigger_type", "page").strip()
                 message_id = request.form.get("message_id", "").strip()
-                group = sip_clean_groups(request.form.getlist("group_item") or request.form.get("group", ""))
-                passcode = request.form.get("passcode", "").strip().upper()
+                group = sip_clean_groups(request.form.get("group", "") or request.form.getlist("group_item"))
+                passcode = request.form.get("passcode", "").strip().upper() if request.form.get("require_passcode") else ""
                 trigger = sip_dialplan_trigger(trigger_type, message_id)
+                duplicate = sip_query_all(f"SELECT id FROM `{SIP_DIALPLAN_TABLE}` WHERE extension=%s AND id<>%s", (extension, row_id))
                 if trigger_type not in {"page", "message"}:
                     group = ""
                 if not name or not extension:
                     error = "Enter a name and extension."
                 elif not re.fullmatch(r"[0-9*#]+", extension):
                     error = "Extension can only contain 0-9, *, and #."
+                elif trigger_type not in {"page", "message", "#testtone", "#echotest"}:
+                    error = "Choose a valid trigger."
                 elif trigger_type == "message" and not message_id:
                     error = "Choose a message."
                 elif trigger_type in {"page", "message"} and not group:
                     error = "Choose at least one group."
                 elif passcode and not re.fullmatch(r"[0-9A-D]+", passcode):
                     error = "Passcode can only contain 0-9 and A-D."
+                elif duplicate:
+                    error = "A dialplan entry already exists for that extension."
                 else:
                     sip_execute(
                         f"UPDATE `{table}` SET name=%s, extension=%s, `group`=%s, trigger=%s, passcode=%s WHERE id=%s",
@@ -1149,9 +1223,10 @@ class BuiltinSipTrunksWeb:
                 "group": str(row.get("group") or ""),
                 "trigger_type": trigger_type,
                 "message_id": message_id,
+                "require_passcode": "1" if row.get("passcode") else "",
                 "passcode": str(row.get("passcode") or ""),
             }
-            body = f'{error_html}<form method="post" class="grid surface">{sip_dialplan_fields(values)}<button type="submit">Save SIP Dialplan Extension</button></form>'
+            body = f'{error_html}<form method="post" class="grid form-surface" id="dialplanForm">{sip_dialplan_fields(values)}<button class="button" type="submit">Save SIP Dialplan Extension</button></form>'
         return page("Endpoint Action", sip_form_frame(body), "endpoints", user)
 
     def render_settings(self, request, conn_factory, page, user):
@@ -2021,6 +2096,11 @@ def handle_sendmsg(conn, parts):
 
 
 def deliver_broadcast(stream_id, broadcast_id):
+    from clientd import (
+        send_stream_frame,
+        start_desktop_broadcast_stream,
+    )
+
     broadcast = fetch_broadcast(broadcast_id)
     if not broadcast:
         log(f"handle_broadcast missing broadcast={broadcast_id}")
@@ -2048,13 +2128,22 @@ def deliver_broadcast(stream_id, broadcast_id):
             has_audio = False
         if has_audio:
             target_map = normalize_targets(targets)
-            if not target_map:
+            desktop_sock = None
+            try:
+                desktop_sock, desktop_result = start_desktop_broadcast_stream(broadcast_id, codec="mulaw", sample_rate=8000)
+            except Exception as exc:
+                desktop_sock = None
+                desktop_result = {}
+                log(f"desktop broadcast start error broadcast={broadcast_id}: {exc}")
+            desktop_matched = int(desktop_result.get("matched") or 0)
+            if not target_map and desktop_matched <= 0:
                 log(f"handle_broadcast no_target_modules stream={stream_id} broadcast={broadcast_id} targets={targets}")
                 return False
-            state = create_stream_state(stream_id, target_map)
-            dispatch("prepare_audio", stream_id, broadcast_id, targets, metadata)
-            ready = state.ready_event.wait(10.0)
-            log(f"handle_broadcast waited stream={stream_id} ready={ready}")
+            if target_map:
+                state = create_stream_state(stream_id, target_map)
+                dispatch("prepare_audio", stream_id, broadcast_id, targets, metadata)
+                ready = state.ready_event.wait(10.0)
+                log(f"handle_broadcast waited stream={stream_id} ready={ready}")
             frame_duration = 160 / 8000
             next_send_time = time.perf_counter()
             for frame in [first_frame]:
@@ -2066,6 +2155,11 @@ def deliver_broadcast(stream_id, broadcast_id):
                             mod.receive_audio(frame, stream_id)
                         except Exception as exc:
                             log(f"receive_audio error in {module_name}: {exc}")
+                try:
+                    if desktop_sock is not None:
+                        send_stream_frame(desktop_sock, frame)
+                except Exception as exc:
+                    log(f"desktop broadcast frame error broadcast={broadcast_id}: {exc}")
             for frame in gen:
                 next_send_time += frame_duration
                 sleep_time = next_send_time - time.perf_counter()
@@ -2081,7 +2175,18 @@ def deliver_broadcast(stream_id, broadcast_id):
                             mod.receive_audio(frame, stream_id)
                         except Exception as exc:
                             log(f"receive_audio error in {module_name}: {exc}")
-            finish_stream(stream_id)
+                try:
+                    if desktop_sock is not None:
+                        send_stream_frame(desktop_sock, frame)
+                except Exception as exc:
+                    log(f"desktop broadcast frame error broadcast={broadcast_id}: {exc}")
+            try:
+                if desktop_sock is not None:
+                    desktop_sock.close()
+            except Exception:
+                pass
+            if target_map:
+                finish_stream(stream_id)
             return True
         log(f"handle_broadcast audio_type_no_audio broadcast={broadcast_id} audio={audio_files}")
     dispatch("sendmsg", stream_id, broadcast_id, targets, metadata)

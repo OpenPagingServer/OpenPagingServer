@@ -81,6 +81,8 @@ def handle_request():
     user = require_admin()
     if not isinstance(user, dict):
         return user
+    if demo_mode_enabled():
+        return demo_mode_page("Endpoint Module Settings", legacy_user_context(user), "endpoints", "manage-endpoints")
     modules = endpoint_module_catalog()
     messages = []
     errors = []

@@ -10,5 +10,7 @@ dependencies = [
     "mysql-connector-python",
     "flask",
     "waitress",
-    "argon2"
+    "argon2-cffi",
+    "av",
+    "miniaudio"
 ]

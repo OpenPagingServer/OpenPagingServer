@@ -1,5 +1,5 @@
 from srv.web.app import *
-from srv.web.pages.bells.bell_helpers import bells_page, schedule_or_404, schedule_settings_card
+from srv.web.pages.bells.bell_helpers import bells_demo_return, bells_page, schedule_or_404, schedule_settings_card
 
 
 def handle_request():
@@ -10,6 +10,8 @@ def handle_request():
     sid = int(request.values.get("id", "0") or 0)
     if sid <= 0:
         return redirect("/bells")
+    if demo_mode_enabled() and request.method == "POST":
+        return bells_demo_return()
     if request.method == "POST":
         action = request.form.get("action", "save")
         if action == "delete":
@@ -43,7 +45,7 @@ def handle_request():
     <div class="summary-item"><strong>{h(counts.get("groups") or 0)}</strong><span class="muted">Assigned Groups</span></div>
     <div class="summary-item"><strong>{h(counts.get("override_days") or 0)}</strong><span class="muted">Override Days</span></div>
 </div>""" + schedule_settings_card(schedule, "settings") + f"""
-<form class="card" method="POST" action="/bells/edit" onsubmit="return confirm('Delete this schedule?')">
+<form class="card" method="POST" action="/bells/edit" onsubmit="{"openDemoModePopup('bells'); return false;" if demo_mode_enabled() else "return confirm('Delete this schedule?')"}">
     <input type="hidden" name="id" value="{h(sid)}">
     <input type="hidden" name="action" value="delete">
     <button class="btn danger" type="submit"><i class="fa-solid fa-trash"></i> Delete Schedule</button>

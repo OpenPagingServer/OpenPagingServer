@@ -16,6 +16,8 @@ def handle_request():
         return user
     data = settings()
     if request.method == "POST":
+        if demo_mode_enabled():
+            return jsonify(status="error", message="Demo Mode is enabled.") if request.headers.get("X-Requested-With") == "XMLHttpRequest" else demo_mode_page("SIP Settings", legacy_user_context(user), "settings", "settings")
         udp_enabled = "1" if request.form.get("enable_insecure_sip") else "0"
         udp_port = request.form.get("insecure_sip_port", "5060")
         tls_enabled = data.get("enable_secure_sip", "0")

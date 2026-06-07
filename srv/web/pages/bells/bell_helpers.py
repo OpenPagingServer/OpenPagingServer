@@ -157,6 +157,10 @@ def bells_page(title, subtitle, actions, body, user, status=200):
     return response
 
 
+def bells_demo_return():
+    return demo_mode_iframe_html("bells")
+
+
 def timezone_options(selected="server"):
     selected = selected or "server"
     zones = ["server", "UTC"] + sorted(z for z in available_timezones() if z != "UTC")
@@ -182,13 +186,14 @@ def days_summary(value):
 
 def schedule_settings_card(schedule, active_tab="settings", return_to=""):
     sid = schedule["id"]
+    demo = demo_mode_enabled()
     tabs = [
         ("calendar", "Calendar", f"/bells/calendar?{urlencode({'schedule_id': sid})}", "fa-calendar-days"),
         ("bells", "Bells", f"/bells/lists?{urlencode({'schedule_id': sid})}", "fa-bell"),
         ("groups", "Groups", f"/bells/groups?{urlencode({'schedule_id': sid})}", "fa-user-group"),
     ]
     tab_links = "".join(f'<a class="{"active" if active_tab == key else ""}" href="{h(url)}"><i class="fa-solid {icon}"></i> {h(label)}</a>' for key, label, url, icon in tabs)
-    return f"""<form class="card schedule-settings-card" method="POST" action="/bells/edit">
+    return f"""<form class="card schedule-settings-card" method="POST" action="/bells/edit"{" onsubmit=\"openDemoModePopup('bells'); return false;\"" if demo else ""}>
     <input type="hidden" name="id" value="{h(sid)}">
     <input type="hidden" name="action" value="save">
     <input type="hidden" name="return_to" value="{h(return_to or request.full_path.rstrip('?'))}">

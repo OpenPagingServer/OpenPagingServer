@@ -42,7 +42,7 @@ def db():
 
 
 def read_web_settings():
-    defaults = {"webserver_enable": "1", "webserver_http_port": "80"}
+    defaults = {"webserver_enable": "1", "webserver_http_port": "80", "api_http_enable": "0", "api_http_port": "8088"}
     if not all([DB_HOST, DB_USER, DB_NAME]):
         return defaults
     try:
@@ -52,7 +52,7 @@ def read_web_settings():
         return defaults
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT parameter, value FROM systemsettings WHERE parameter IN ('webserver_enable','webserver_http_port')")
+            cur.execute("SELECT parameter, value FROM systemsettings WHERE parameter IN ('webserver_enable','webserver_http_port','api_http_enable','api_http_port')")
             for row in cur.fetchall():
                 defaults[str(row["parameter"])] = str(row["value"])
     finally:
@@ -114,6 +114,18 @@ def proxy_is_trusted(remote_addr, allowlist):
     return False
 
 
+def forwarded_for_client_ip(value):
+    for part in str(value or "").split(","):
+        token = part.strip()
+        if not token:
+            continue
+        try:
+            return str(ipaddress.ip_address(token))
+        except ValueError:
+            continue
+    return ""
+
+
 class ReverseProxyTrustMiddleware:
     def __init__(self, app, allowlist, denied_html):
         self.app = app
@@ -139,6 +151,8 @@ class ReverseProxyTrustMiddleware:
             )
         )
         remote_addr = environ.get("HTTP_X_OPS_REMOTE_ADDR") or environ.get("REMOTE_ADDR", "")
+        if remote_addr:
+            environ["REMOTE_ADDR"] = remote_addr
         if using_reverse_proxy:
             if not proxy_is_trusted(remote_addr, self.allowlist):
                 body = self.denied_html
@@ -167,6 +181,9 @@ class ReverseProxyTrustMiddleware:
                     environ["SERVER_NAME"] = forwarded_host
             elif forwarded_port and forwarded_port.isdigit():
                 environ["SERVER_PORT"] = forwarded_port
+            forwarded_for = forwarded_for_client_ip(environ.get("HTTP_X_FORWARDED_FOR"))
+            if forwarded_for:
+                environ["REMOTE_ADDR"] = forwarded_for
         return self.app(environ, start_response)
 
 
@@ -334,6 +351,11 @@ class FrontServer:
 
                 handle_websocket_client(client, addr, head)
                 return
+            if path == "/desktop/ws" and "websocket" in str(headers.get("upgrade") or "").lower():
+                from clientd import handle_desktop_websocket_client
+
+                handle_desktop_websocket_client(client, addr, head)
+                return
             upstream = socket.create_connection(("127.0.0.1", self.internal_port), timeout=10)
             upstream.sendall(rewrite_request_head(head, {"X-Ops-Remote-Addr": remote_addr}))
             t1 = threading.Thread(target=relay_stream, args=(client, upstream), daemon=True)
@@ -360,28 +382,65 @@ def create_front_server(app, port):
     return FrontServer(app, port)
 
 
+def server_ports(label, configured_port):
+    if label == "web":
+        return ports_to_try(configured_port)
+    return [port_value(configured_port)]
+
+
+def build_servers(settings):
+    servers = []
+    if enabled(settings.get("webserver_enable")):
+        from srv.web.app import app as web_app
+
+        servers.append(("web", "Open Paging Server", web_app, server_ports("web", settings.get("webserver_http_port"))))
+    if enabled(settings.get("api_http_enable")):
+        from srv.api.app import app as api_app
+
+        servers.append(("api", "Open Paging Server API", api_app, server_ports("api", settings.get("api_http_port"))))
+    return servers
+
+
 def main():
     settings = read_web_settings()
-    if not enabled(settings.get("webserver_enable")):
-        print("webd disabled by webserver_enable=0", flush=True)
+    specs = build_servers(settings)
+    if not specs:
+        print("webd disabled because both web and API listeners are off", flush=True)
         return 0
 
-    from srv.web.app import app
-
-    ports = ports_to_try(settings.get("webserver_http_port"))
-    last_error = None
+    last_errors = {}
     while True:
-        for port in ports:
-            try:
-                server = create_front_server(app, port)
-            except (OSError, socket.error) as exc:
-                last_error = exc
-                print(f"webd port {port} unavailable: {exc}", flush=True)
-                continue
-            print(f"webd serving Open Paging Server on http://0.0.0.0:{port}", flush=True)
-            server.run()
-            return 0
-        print(f"webd waiting for ports {', '.join(map(str, ports))} to become available; last error: {last_error}", flush=True)
+        running = []
+        failed = False
+        try:
+            for label, title, app, ports in specs:
+                server = None
+                for port in ports:
+                    try:
+                        server = create_front_server(app, port)
+                        print(f"webd serving {title} on http://0.0.0.0:{server.effective_port}", flush=True)
+                        break
+                    except (OSError, socket.error) as exc:
+                        last_errors[label] = exc
+                        print(f"webd {label} port {port} unavailable: {exc}", flush=True)
+                if server is None:
+                    failed = True
+                    break
+                thread = threading.Thread(target=server.run, daemon=True)
+                thread.start()
+                running.append((server, thread))
+            if not failed:
+                for _server, thread in running:
+                    thread.join()
+                return 0
+        finally:
+            for server, _thread in running:
+                server.close()
+        wait_bits = []
+        for label, _title, _app, ports in specs:
+            last_error = last_errors.get(label)
+            wait_bits.append(f"{label} ports {', '.join(map(str, ports))}: {last_error}")
+        print("webd waiting for ports to become available; " + "; ".join(wait_bits), flush=True)
         time.sleep(5)
 
 

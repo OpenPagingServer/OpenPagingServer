@@ -204,6 +204,17 @@ def fetch_active_broadcast(broadcast_id):
     return _row_to_record(row)
 
 
+def list_active_broadcasts(limit=200):
+    with _connect() as conn:
+        _prune_expired_records(conn)
+        rows = conn.execute(
+            "SELECT id, template_id, expires_rule, sender, groups_value, delivery, issued, expires, payload "
+            "FROM active_broadcasts ORDER BY issued DESC LIMIT ?",
+            (max(1, int(limit)),),
+        ).fetchall()
+    return [_row_to_record(row) for row in rows if row is not None]
+
+
 def list_pending_active_broadcast_ids(limit=20, exclude_sender="sendmsgd"):
     with _connect() as conn:
         _prune_expired_records(conn)

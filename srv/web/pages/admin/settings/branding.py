@@ -17,6 +17,8 @@ def handle_request():
         abort(403)
     data = settings()
     if request.method == "POST":
+        if demo_mode_enabled():
+            return jsonify(status="error", message="Demo Mode is enabled.") if request.headers.get("X-Requested-With") == "XMLHttpRequest" else demo_mode_page("Branding", legacy_user_context(user), "settings", "settings")
         save_setting("product_name", request.form.get("product_name", "Open Paging Server"), "Name of this server.")
         save_setting("use_logo_in_sidebar", "1" if request.form.get("use_logo_in_sidebar") else "0", "Use a logo in the sidebar, if disabled the product name will show")
         save_setting("sidebar_logo_light", request.form.get("sidebar_logo_light", "/assets/OPENPAGINGSERVER-768x576-LIGHTMODE.png").strip(), "Light mode logo for the sidebar")

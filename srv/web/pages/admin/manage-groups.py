@@ -237,6 +237,7 @@ def endpoint_choices():
             endpoint_id = str(endpoint.get("id") or "").strip()
             if module_name and endpoint_id:
                 choices.append({"value": f"{module_name}/{endpoint_id}", "label": endpoint_label(endpoint, display_name)})
+    choices.extend(desktop_user_choices())
     choices.sort(key=lambda item: item["label"].lower())
     return choices, error, warning, module_errors
 
@@ -246,10 +247,13 @@ def handle_request():
     if not isinstance(user, dict):
         return user
     ctx = legacy_user_context(user)
+    demo = demo_mode_enabled()
     choices, endpoint_error, endpoint_warning, module_errors = endpoint_choices()
     allowed = {choice["value"] for choice in choices}
 
     if request.method == "POST":
+        if demo:
+            return demo_mode_iframe_html("manage-groups")
         action = request.form.get("action")
         if action == "delete":
             gid = request.form.get("group_id", "").strip()
@@ -280,8 +284,9 @@ def handle_request():
     for text in [endpoint_error, endpoint_warning] + module_errors:
         if text:
             notices += f'<div class="error">{h(text)}</div>'
-
     if show_editor:
+        if demo:
+            return demo_mode_iframe_html("manage-groups")
         available_items = "\n".join(
             f'<div class="tl-item" draggable="true" ondragstart="dragStart(event)" onclick="selectItem(this)" data-value="{h(choice["value"])}">{h(choice["label"])}</div>'
             for choice in choices
@@ -335,6 +340,8 @@ def handle_request():
             for group in groups:
                 count = group_member_count(group.get("members"))
                 suffix = "" if count == 1 else "s"
+                edit_href = "javascript:openDemoModePopup('manage-groups')" if demo else f"/admin/manage-groups?edit={h(group.get('id'))}"
+                delete_onsubmit = "openDemoModePopup('manage-groups'); return false;" if demo else "return confirm('Delete this group?')"
                 rows.append(
                     f"""<li class="group-item">
                             <div class="group-main">
@@ -342,8 +349,8 @@ def handle_request():
                                 <div class="group-members">{h(count)} member{suffix}</div>
                             </div>
                             <div class="group-actions">
-                                <a class="icon-action" href="/admin/manage-groups?edit={h(group.get("id"))}" title="Edit"><i class="fa-solid fa-pen-to-square"></i></a>
-                                <form method="POST" action="/admin/manage-groups" onsubmit="return confirm('Delete this group?')">
+                                <a class="icon-action" href="{edit_href}" title="Edit"><i class="fa-solid fa-pen-to-square"></i></a>
+                                <form method="POST" action="/admin/manage-groups" onsubmit="{delete_onsubmit}">
                                     <input type="hidden" name="action" value="delete">
                                     <input type="hidden" name="group_id" value="{h(group.get("id"))}">
                                     <button class="icon-action delete" type="submit" title="Delete"><i class="fa-solid fa-trash"></i></button>
@@ -354,9 +361,10 @@ def handle_request():
             group_list = '<ul class="group-list">' + "\n".join(rows) + "</ul>"
         else:
             group_list = '<p class="muted">No groups yet.</p>'
+        new_href = "javascript:openDemoModePopup('manage-groups')" if demo else "/admin/manage-groups?new=1"
         content = f"""    <div class="header-actions">
         <h1>Manage Groups</h1>
-        <a class="btn-primary" href="/admin/manage-groups?new=1"><i class="fa-solid fa-plus"></i> New Group</a>
+        <a class="btn-primary" href="{new_href}"><i class="fa-solid fa-plus"></i> New Group</a>
     </div>
     {notices}
     <div class="card">

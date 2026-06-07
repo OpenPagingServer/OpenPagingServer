@@ -314,7 +314,7 @@ def user_asset_permissions(user):
     return is_admin, can_user_edit or can_admin_edit, can_admin_edit
 
 
-def render_asset_card(asset, can_edit, can_delete):
+def render_asset_card(asset, can_edit, can_delete, demo=False):
     raw_url = "/assets/?raw=" + urlencode({"": asset["name"]})[1:]
     if asset["kind"] == "image":
         preview = f'<img src="{h(raw_url)}" alt="">'
@@ -330,7 +330,11 @@ def render_asset_card(asset, can_edit, can_delete):
         icon = "file-circle-question"
     rename = ""
     if can_edit:
-        rename = f"""
+        if demo:
+            rename = """
+                            <button class="menu-action" type="button" onclick="openDemoModePopup('assets')"><i class="fa-solid fa-pen"></i> Rename</button>"""
+        else:
+            rename = f"""
                             <button class="menu-action" type="button" onclick="showRenameForm(event, this)"><i class="fa-solid fa-pen"></i> Rename</button>
                             <div class="rename-inline">
                                 <form method="post">
@@ -342,7 +346,11 @@ def render_asset_card(asset, can_edit, can_delete):
                             </div>"""
     delete = ""
     if can_delete:
-        delete = f"""
+        if demo:
+            delete = """
+                            <button class="menu-action danger" type="button" onclick="openDemoModePopup('assets')"><i class="fa-solid fa-trash"></i> Delete</button>"""
+        else:
+            delete = f"""
                             <form method="post" onsubmit="return confirm('Delete this asset?')">
                                 <input type="hidden" name="action" value="delete">
                                 <input type="hidden" name="file" value="{h(asset["name"])}">
@@ -372,6 +380,7 @@ def handle_request():
     if not isinstance(user, dict):
         return user
     ctx = legacy_user_context(user)
+    demo = demo_mode_enabled()
     is_admin, can_edit, can_delete = user_asset_permissions(user)
     ctx["is_admin"] = is_admin
 
@@ -391,7 +400,9 @@ def handle_request():
     messages = []
     if request.method == "POST":
         action = request.form.get("action", "")
-        if not can_edit:
+        if demo and action in {"upload", "rename", "delete"}:
+            return demo_mode_iframe_html("assets")
+        elif not can_edit:
             errors.append("You do not have permission to edit assets.")
         elif action == "upload":
             item = request.files.get("asset_file")
@@ -464,9 +475,9 @@ def handle_request():
 
     alerts = "".join(f'<div class="success alert-msg">{h(message)}</div>' for message in messages)
     alerts += "".join(f'<div class="error alert-msg">{h(error)}</div>' for error in errors)
-    upload_button = '<button class="button" type="button" onclick="openUploadModal()"><i class="fa-solid fa-plus"></i> Upload</button>' if can_edit else ""
+    upload_button = '<button class="button" type="button" onclick="' + ("openDemoModePopup('assets')" if demo else "openUploadModal()") + '"><i class="fa-solid fa-plus"></i> Upload</button>' if can_edit else ""
     if assets:
-        asset_grid = '<section class="asset-grid">' + "\n".join(render_asset_card(asset, can_edit, can_delete) for asset in assets) + "</section>"
+        asset_grid = '<section class="asset-grid">' + "\n".join(render_asset_card(asset, can_edit, can_delete, demo) for asset in assets) + "</section>"
     else:
         asset_grid = """<div class="empty-state">
             <i class="fa-solid fa-folder-open" style="font-size:2.2em;margin-bottom:12px;"></i>

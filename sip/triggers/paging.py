@@ -1,7 +1,8 @@
-import importlib.util
+import importlib
 import math
 import os
 import struct
+import sys
 import threading
 import time
 from pathlib import Path
@@ -18,11 +19,10 @@ def page_debug(message):
 
 
 def load_livepaged():
-    module_path = BASE_DIR / "livepaged.py"
-    spec = importlib.util.spec_from_file_location("openpaging_livepaged", module_path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    base_dir_text = str(BASE_DIR)
+    if base_dir_text not in sys.path:
+        sys.path.insert(0, base_dir_text)
+    return importlib.import_module("livepaged")
 
 
 livepaged = load_livepaged()

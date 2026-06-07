@@ -275,6 +275,19 @@ def execute_schema(cursor):
             PRIMARY KEY (parameter)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
         """,
+        """
+        CREATE TABLE api_tokens (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            user_id INT NOT NULL,
+            token_hash VARCHAR(64) NOT NULL,
+            token_prefix VARCHAR(24) NOT NULL,
+            expires_at DATETIME DEFAULT NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_used_at DATETIME DEFAULT NULL,
+            UNIQUE KEY api_tokens_hash_unique (token_hash),
+            KEY api_tokens_user_idx (user_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+        """,
     ]
 
     for statement in schema_statements:
@@ -282,7 +295,7 @@ def execute_schema(cursor):
 
 
 def seed_defaults(cursor):
-    endpoint_module_dirs = [(module_dir, "false") for module_dir in discover_endpoint_module_packages()]
+    endpoint_module_dirs = [(module_dir, "true") for module_dir in discover_endpoint_module_packages()]
     if endpoint_module_dirs:
         cursor.executemany(
             """
@@ -359,6 +372,7 @@ def seed_defaults(cursor):
             "Message text for the login page banner",
         ),
         ("login_banner_title", "Welcome to Open Paging Server Beta!!!", "Optional title for the login page banner"),
+        ("login_captcha_external_only", "1", "Require login CAPTCHA only for external IP addresses (0/1)"),
         (
             "login_logo_dark",
             "/assets/OPENPAGINGSERVER-768x576-DARKMODE.png",
@@ -386,6 +400,8 @@ def seed_defaults(cursor):
         ("webserver_https_enable", "0", "HTTPs Enable (0/1)"),
         ("webserver_https_port", "443", "HTTPs Server Port (Default: 443)"),
         ("webserver_http_port", "80", "HTTP Server Port (Default: 80)"),
+        ("api_http_enable", "0", "Enable REST API over HTTP (0/1)"),
+        ("api_http_port", "8088", "REST API HTTP port"),
     ]
     cursor.executemany(
         """
@@ -405,6 +421,12 @@ DB_USER='{DATABASE_USER}'
 DB_PASS={sql_string(db_password)}
 DB_NAME='{DATABASE_NAME}'
 DEBUG=false
+WEB_REVERSE_PROXY_ALLOWED=127.0.0.1
+API_REVERSE_PROXY_ALLOWED=127.0.0.1
+DEMO_MODE=false
+
+# Restart the applaction to have changes take effect
+
 """
 
     os.makedirs("/var/lib/openpagingserver/assets", exist_ok=True)

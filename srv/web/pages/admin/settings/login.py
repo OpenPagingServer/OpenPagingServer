@@ -12,12 +12,15 @@ def handle_request():
         captcha_provider = str(request.form.get("login_captcha_provider") or "disabled").strip().lower()
         captcha_site_key = str(request.form.get("login_captcha_site_key") or "").strip()
         captcha_secret_key = str(request.form.get("login_captcha_secret_key") or "").strip()
+        existing_secret_key = str(data.get("login_captcha_secret_key") or "").strip()
+        effective_secret_key = captcha_secret_key or existing_secret_key
+        captcha_external_only = "1" if request.form.get("login_captcha_external_only") else "0"
         valid_providers = {"disabled", "basic", "turnstile", "recaptcha"}
         errors = []
         if captcha_provider not in valid_providers:
             errors.append("Select a valid CAPTCHA provider.")
             captcha_provider = "disabled"
-        if captcha_provider in {"turnstile", "recaptcha"} and (not captcha_site_key or not captcha_secret_key):
+        if captcha_provider in {"turnstile", "recaptcha"} and (not captcha_site_key or not effective_secret_key):
             errors.append("Site key and secret key are required for the selected CAPTCHA provider.")
         if errors:
             if request.headers.get("X-Requested-With") == "XMLHttpRequest":
@@ -28,7 +31,8 @@ def handle_request():
         save_setting("login_banner_message", request.form.get("login_banner_message", ""), "Login banner message")
         save_setting("login_captcha_provider", captcha_provider, "Login CAPTCHA provider")
         save_setting("login_captcha_site_key", captcha_site_key, "Login CAPTCHA site key")
-        save_setting("login_captcha_secret_key", captcha_secret_key, "Login CAPTCHA secret key")
+        save_setting("login_captcha_secret_key", effective_secret_key if captcha_provider in {"turnstile", "recaptcha"} else "", "Login CAPTCHA secret key")
+        save_setting("login_captcha_external_only", captcha_external_only, "Require login CAPTCHA only for external IP addresses (0/1)")
         if request.headers.get("X-Requested-With") == "XMLHttpRequest":
             return jsonify(status="success")
         return redirect("/admin/settings/login")
@@ -36,6 +40,7 @@ def handle_request():
     enabled = data.get("login_banner_enabled", "0") == "1"
     checked = " checked" if enabled else ""
     disabled = "" if enabled else " disabled"
+    external_only_checked = " checked" if data.get("login_captcha_external_only", "1") == "1" else ""
     captcha_provider = str(data.get("login_captcha_provider") or "disabled").strip().lower()
     if captcha_provider not in {"disabled", "basic", "turnstile", "recaptcha"}:
         captcha_provider = "disabled"
@@ -80,7 +85,14 @@ def handle_request():
                 </div>
                 <div class="info-row captcha-key-row" id="captchaSecretKeyRow" style="flex-direction: column; align-items: flex-start; gap: 8px;">
                     <span class="info-label">Secret Key</span>
-                    <input type="password" name="login_captcha_secret_key" id="captchaSecretKey" value="{h(data.get("login_captcha_secret_key", ""))}" autocomplete="off">
+                    <input type="password" name="login_captcha_secret_key" id="captchaSecretKey" value="" autocomplete="off" placeholder="Leave blank to keep current secret key">
+                </div>
+                <div class="info-row">
+                    <span class="info-label">
+                        Require CAPTCHA only for external IP addresses
+                        <span class="info-description">Enabled by default. Private, loopback, and other non-public client IPs skip CAPTCHA.</span>
+                    </span>
+                    <span><label class="switch"><input type="checkbox" name="login_captcha_external_only" id="captchaExternalOnly"{external_only_checked}><span class="slider"></span></label></span>
                 </div>
                 <input type="hidden" name="save_login_settings" value="1">
                 <div style="margin-top:20px; display:flex; align-items:center;">

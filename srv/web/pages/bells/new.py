@@ -1,5 +1,5 @@
 from srv.web.app import *
-from srv.web.pages.bells.bell_helpers import bells_page, timezone_options
+from srv.web.pages.bells.bell_helpers import bells_demo_return, bells_page, timezone_options
 
 
 def handle_request():
@@ -7,6 +7,10 @@ def handle_request():
     if not isinstance(user, dict):
         return user
     ensure_bell_schema()
+    if demo_mode_enabled():
+        if request.method == "POST":
+            return bells_demo_return()
+        return demo_mode_page("New Schedule", legacy_user_context(user), "bells", "bells")
     if request.method == "POST":
         name = request.form.get("name", "").strip()
         enabled = 1 if request.form.get("enabled") else 0

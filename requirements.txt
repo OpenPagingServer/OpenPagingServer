@@ -3,3 +3,6 @@ python-dotenv
 mysql-connector-python
 Flask
 waitress
+argon2-cffi
+av
+miniaudio

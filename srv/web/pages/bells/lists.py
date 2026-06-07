@@ -1,5 +1,5 @@
 from srv.web.app import *
-from srv.web.pages.bells.bell_helpers import bells_page, days_summary, schedule_or_404, schedule_settings_card
+from srv.web.pages.bells.bell_helpers import bells_demo_return, bells_page, days_summary, schedule_or_404, schedule_settings_card
 import re
 from urllib.parse import urlencode
 
@@ -15,7 +15,7 @@ def normalize_days(days):
     selected = [day for day in allowed if day in set(days or [])]
     return ",".join(selected or allowed)
 
-def render_bells_ui(scope_schedule_id, post_path, hidden_fields):
+def render_bells_ui(scope_schedule_id, post_path, hidden_fields, demo=False):
     lists = query_all("SELECT id, schedule_id, name FROM bell_lists WHERE schedule_id=%s ORDER BY name ASC", (scope_schedule_id,))
     events = {}
     if lists:
@@ -37,7 +37,7 @@ def render_bells_ui(scope_schedule_id, post_path, hidden_fields):
     <div id="main-view">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
             <h2 style="margin: 0; font-weight: normal;">Bell Lists</h2>
-            <button class="btn" type="button" onclick="openModal('modal-add-list')"><i class="fa-solid fa-plus"></i> Add List</button>
+            <button class="btn" type="button" onclick="{"openDemoModePopup('bells')" if demo else "openModal('modal-add-list')"}"><i class="fa-solid fa-plus"></i> Add List</button>
         </div>
         <div class="card" style="padding: 0; overflow: hidden;">
     """
@@ -49,6 +49,7 @@ def render_bells_ui(scope_schedule_id, post_path, hidden_fields):
             list_id = int(bell_list["id"])
             bell_count = len(events.get(list_id, []))
             border = 'border-bottom: 1px solid var(--border, rgba(128,128,128,0.2));' if idx < len(lists) - 1 else ''
+            edit_list_onclick = "openDemoModePopup('bells')" if demo else f"openEditList({list_id}, {json.dumps(str(bell_list['name'] or ''))})"
             
             main_view += f"""
             <div style="display: flex; justify-content: space-between; align-items: center; padding: 15px 20px; {border}">
@@ -60,10 +61,10 @@ def render_bells_ui(scope_schedule_id, post_path, hidden_fields):
                     <button class="btn" type="button" onclick="showDetail({list_id})" title="Manage List">
                         <i class="fa-solid fa-list-ul"></i> Manage
                     </button>
-                    <button class="btn secondary" type="button" onclick="openEditList({list_id}, '{h(bell_list["name"])}')" title="Edit List">
+                    <button class="btn secondary" type="button" onclick="{h(edit_list_onclick)}" title="Edit List">
                         <i class="fa-solid fa-pen"></i>
                     </button>
-                    <form method="POST" action="{h(post_path)}" onsubmit="return confirm('Delete this list and all its bells?')" style="margin: 0;">
+                    <form method="POST" action="{h(post_path)}" onsubmit="{"openDemoModePopup('bells'); return false;" if demo else "return confirm('Delete this list and all its bells?')"}" style="margin: 0;">
                         <input type="hidden" name="action" value="delete_list">{hidden}
                         <input type="hidden" name="list_id" value="{list_id}">
                         <button class="btn danger" type="submit" title="Delete List"><i class="fa-solid fa-trash"></i></button>
@@ -85,7 +86,7 @@ def render_bells_ui(scope_schedule_id, post_path, hidden_fields):
                     <button class="btn secondary" type="button" onclick="showMain()"><i class="fa-solid fa-arrow-left"></i> Back</button>
                     <h2 style="margin: 0; font-weight: normal;">{h(bell_list["name"])}</h2>
                 </div>
-                <button class="btn" type="button" onclick="openAddBell({list_id})"><i class="fa-solid fa-plus"></i> Add Bell</button>
+                <button class="btn" type="button" onclick="{"openDemoModePopup('bells')" if demo else f"openAddBell({list_id})"}"><i class="fa-solid fa-plus"></i> Add Bell</button>
             </div>
             <div class="card" style="padding: 0; overflow: hidden;">
         """
@@ -98,6 +99,7 @@ def render_bells_ui(scope_schedule_id, post_path, hidden_fields):
                 audio_str = h(event.get("audio") or "")
                 days_str = h(event.get("days_of_week") or "")
                 border = 'border-bottom: 1px solid var(--border, rgba(128,128,128,0.2));' if idx < len(list_events) - 1 else ''
+                edit_bell_onclick = "openDemoModePopup('bells')" if demo else f"openEditBell({eid}, {json.dumps(str(event['fire_time'] or ''))}, {json.dumps(str(event.get('audio') or ''))}, {json.dumps(str(event.get('days_of_week') or ''))})"
                 
                 detail_views += f"""
                 <div style="display: flex; justify-content: space-between; align-items: center; padding: 15px 20px; {border}">
@@ -106,10 +108,10 @@ def render_bells_ui(scope_schedule_id, post_path, hidden_fields):
                         <div style="font-size: 0.9em; opacity: 0.7;">{h(days_summary(event.get("days_of_week")))} &bull; {audio_str}</div>
                     </div>
                     <div style="display: flex; gap: 8px;">
-                        <button class="btn secondary" type="button" onclick="openEditBell({eid}, '{time_str}', '{audio_str}', '{days_str}')" title="Edit Bell">
+                        <button class="btn secondary" type="button" onclick="{h(edit_bell_onclick)}" title="Edit Bell">
                             <i class="fa-solid fa-pen"></i>
                         </button>
-                        <form method="POST" action="{h(post_path)}" onsubmit="return confirm('Delete this bell?')" style="margin: 0;">
+                        <form method="POST" action="{h(post_path)}" onsubmit="{"openDemoModePopup('bells'); return false;" if demo else "return confirm('Delete this bell?')"}" style="margin: 0;">
                             <input type="hidden" name="action" value="delete_event">{hidden}
                             <input type="hidden" name="event_id" value="{eid}">
                             <button class="btn danger" type="submit" title="Delete Bell"><i class="fa-solid fa-trash"></i></button>
@@ -306,8 +308,11 @@ def handle_request():
     if not isinstance(user, dict):
         return user
     ensure_bell_schema()
+    demo = demo_mode_enabled()
     
     if request.path.rstrip("/") == "/bells/bell-lists":
+        if demo and request.method == "POST":
+            return bells_demo_return()
         if request.method == "POST":
             handle_list_post(0)
             return redirect("/bells/bell-lists")
@@ -324,12 +329,14 @@ def handle_request():
             <div class="summary-item"><strong style="font-weight: normal;">{h(query_one("SELECT COUNT(*) AS total FROM bell_lists WHERE schedule_id=0").get("total") or 0)}</strong><span class="muted">Lists</span></div>
             <div class="summary-item"><strong style="font-weight: normal;">{h(system_event_count.get("total") or 0)}</strong><span class="muted">Total Bells</span></div>
         </div>
-        {render_bells_ui(0, "/bells/bell-lists", {})}
+        {render_bells_ui(0, "/bells/bell-lists", {}, demo)}
         """
         return bells_page("System Bell Lists", "", '<a class="btn secondary" href="/bells"><i class="fa-solid fa-arrow-left"></i> Back</a>', body, user)
         
     sid = int(request.values.get("schedule_id", "0") or 0)
     schedule = schedule_or_404(sid)
+    if demo and request.method == "POST":
+        return bells_demo_return()
     if request.method == "POST":
         handle_list_post(sid)
         return redirect("/bells/lists?" + urlencode({"schedule_id": sid}))
@@ -349,6 +356,6 @@ def handle_request():
         <div class="summary-item"><strong style="font-weight: normal;">{h(counts.get("custom_bells") or 0)}</strong><span class="muted">Total Bells</span></div>
     </div>
     {schedule_settings_card(schedule, "bells")}
-    {render_bells_ui(sid, "/bells/lists", {"schedule_id": sid})}
+    {render_bells_ui(sid, "/bells/lists", {"schedule_id": sid}, demo)}
     """
     return bells_page("Bell Lists", schedule["name"], '<a class="btn secondary" href="/bells"><i class="fa-solid fa-arrow-left"></i> Back</a>', body, user)

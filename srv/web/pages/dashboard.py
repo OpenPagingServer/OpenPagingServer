@@ -45,6 +45,19 @@ def handle_request():
     online_docs = ""
     if show_online_docs == "1":
         online_docs = '<a href="https://docs.openpagingserver.org"><span class="nav-icon"><i class="fa-solid fa-book"></i></span><span class="nav-label">Online Documentation</span></a>'
+    user_settings_link = f'<a href="/user/settings" class="user-settings-link"><span class="nav-icon"><i class="fa-solid fa-user"></i></span><span class="nav-label">{h(username)}</span></a>'
+    nav_links_html = f"""
+    <div class="sidebar-nav">
+        <a href="/dashboard" class="active"><span class="nav-icon"><i class="fa-solid fa-house"></i></span><span class="nav-label">Dashboard</span></a>
+        {receiver_links}
+        {online_docs}
+    </div>"""
+    account_links_html = f"""
+    <div class="sidebar-account">
+        {user_settings_link}
+        <button class="logout-btn" onclick="logout()"><span class="nav-icon"><i class="fa-solid fa-sign-out-alt"></i></span><span class="nav-label">Logout</span></button>
+        <div class="mobile-nav-divider"></div>
+    </div>"""
 
     warning = ""
     if is_insecure:
@@ -74,7 +87,10 @@ def handle_request():
     #sidebar .nav-icon,.logout-btn .nav-icon,.admin-only .nav-icon {{ width:20px; display:inline-flex; justify-content:center; flex:0 0 20px; }}
     #sidebar .nav-label,.logout-btn .nav-label,.admin-only .nav-label {{ min-width:0; }}
     #sidebar a:hover,#sidebar a.active{{ background-color:#1565C0; }}
-    .logout-btn{{ background-color:#C62828; border:none; cursor:pointer; margin-top:auto; transition:background-color 0.3s; }}
+    .sidebar-nav{{ display:flex; flex-direction:column; }}
+    .sidebar-account{{ display:flex; flex-direction:column; margin-top:auto; }}
+    .mobile-nav-divider{{ display:none; }}
+    .logout-btn{{ background-color:#C62828; border:none; cursor:pointer; margin-top:0; transition:background-color 0.3s; }}
     .logout-btn:hover{{ background-color:#B71C1C; }}
     .logout-btn:active{{ background-color:#A51B1B; }}
     #mobile-header{{ display:flex; background-color:#1565C0; color:#FFF; padding:calc(12px + env(safe-area-inset-top)) 16px 12px 16px; align-items:center; justify-content:space-between; position:fixed; top:0; left:0; right:0; z-index:1100; }}
@@ -96,6 +112,7 @@ def handle_request():
     .flat-btn:hover{{ background-color:rgba(98,0,238,0.08); }}
     .flat-btn.delete{{ color:#c62828; }}
     .flat-btn.delete:hover{{ background-color:rgba(198,40,40,0.08); }}
+    @media(max-width:767px){{ .sidebar-account{{ margin-top:0; order:0; }} .sidebar-nav{{ order:1; }} .mobile-nav-divider{{ display:block; height:1px; background:#000; margin:0; }} }}
     @media(min-width:768px){{ #mobile-header{{ display:none; }} }}
     @media(prefers-color-scheme:dark){{ body,html{{ background-color:#121212; color:#E0E0E0; }} #sidebar{{ background-color:#424242; }} #sidebar h2{{ background-color:#303030; color:#FFF; }} #sidebar a,.logout-btn,.admin-only{{ color:#E0E0E0; }} #sidebar a.active,#sidebar a:hover{{ background-color:#505050; }} #mobile-header{{ background-color:#424242; }} #mobile-header h2{{ color:#FFF; }} #content{{ background-color:#121212; }} li.voicemail-card{{ border:1px solid #333; background-color:#1E1E1E; }} h2,h3{{ color:#BB86FC; }} .flat-btn:hover{{ background-color:rgba(187,134,252,0.1); }} }}
     .protocol-warning {{ background-color: rgba(255, 235, 59, 0.15); border: 1px solid #fbc02d; color: #856404; padding: 12px 20px; margin-bottom: 20px; border-radius: 8px; display: flex; align-items: center; gap: 12px; font-size: 0.95em; }}
@@ -111,12 +128,8 @@ def handle_request():
 <div id="overlay" onclick="closeSidebar()"></div>
 <div id="sidebar">
     {brand_html}
-    <a href="/dashboard" class="active"><span class="nav-icon"><i class="fa-solid fa-house"></i></span><span class="nav-label">Dashboard</span></a>
-    {receiver_links}
-
-    {online_docs}
-
-    <button class="logout-btn" onclick="logout()"><span class="nav-icon"><i class="fa-solid fa-sign-out-alt"></i></span><span class="nav-label">Logout</span></button>
+    {nav_links_html}
+    {account_links_html}
 </div>
 
 <div id="content" onclick="closeSidebarOnContentClick()">

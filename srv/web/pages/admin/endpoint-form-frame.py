@@ -140,6 +140,8 @@ def handle_request():
     user = require_admin()
     if not isinstance(user, dict):
         return user
+    if demo_mode_enabled():
+        return demo_mode_iframe_html("manage-endpoints")
 
     module = request.args.get("module", "")
     form_type = request.args.get("type", "")

@@ -13,6 +13,8 @@ def handle_request():
     ctx = legacy_user_context(user)
     if not ctx["is_admin"]:
         abort(403)
+    if demo_mode_enabled():
+        return demo_mode_iframe_html("messages")
 
     msgid = request.values.get("msgid", "")
     if not re.fullmatch(r"\d+", str(msgid or "")):

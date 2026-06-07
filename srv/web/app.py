@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import html
 import importlib.util
 import json
@@ -14,7 +15,28 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 import pymysql
+try:
+    from argon2 import PasswordHasher
+    from argon2.exceptions import InvalidHashError, VerificationError
+except ImportError:
+    PasswordHasher = None
+    InvalidHashError = VerificationError = Exception
 import endpoints
+from clientd import (
+    DESKTOP_CLIENT_HEADER,
+    desktop_member_user_id,
+    build_desktop_token,
+    desktop_member_token,
+    fetch_active_broadcast,
+    first_audio_name,
+    groups_for_user as desktop_groups_for_user,
+    is_desktop_member_token,
+    normalize_color,
+    product_name as desktop_product_name,
+    user_has_connected_client,
+    user_in_broadcast,
+    verify_desktop_token,
+)
 from dotenv import load_dotenv
 from flask import (
     Flask,
@@ -37,6 +59,7 @@ WEB_ROOT_DIR = BASE_DIR / "srv" / "web"
 WEB_PAGES_DIR = WEB_ROOT_DIR / "pages"
 WEB_STATIC_DIR = WEB_ROOT_DIR / "assets"
 WEB_ERROR_DIR = WEB_ROOT_DIR / "errors"
+DEMO_MODE_HTML_PATH = WEB_ROOT_DIR / "demomode.html"
 ENDPOINT_MODULES_DIR = endpoints.MODULE_STORE_DIR
 ASSET_DIR = Path(os.getenv("ASSET_PATH", "/var/lib/openpagingserver/assets"))
 load_dotenv(BASE_DIR / ".env")
@@ -47,6 +70,8 @@ DB_PASS = os.getenv("DB_PASS")
 DB_NAME = os.getenv("DB_NAME")
 APP_DEBUG = str(os.getenv("DEBUG", "")).strip().lower() in {"1", "true", "yes", "on"}
 TRACEBACKS = {}
+API_TOKEN_LABEL_LENGTH = 120
+API_TOKEN_HASHER = PasswordHasher() if PasswordHasher is not None else None
 
 app = Flask(
     __name__,
@@ -59,6 +84,7 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",
     MAX_CONTENT_LENGTH=128 * 1024 * 1024,
 )
+DEMO_MODE = str(os.getenv("DEMO_MODE", "")).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def dispatch_web_page(relative_path):
@@ -156,6 +182,72 @@ def truthy(value):
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def demo_mode_enabled():
+    return DEMO_MODE
+
+
+def api_token_hash(token):
+    return hashlib.sha256(str(token or "").encode()).hexdigest()
+
+
+def create_api_token_value():
+    return "usr_" + secrets.token_urlsafe(32)
+
+
+def hash_api_token_value(token):
+    if API_TOKEN_HASHER is None:
+        raise RuntimeError("Argon2 support is not installed. Install dependencies from requirements.txt.")
+    return API_TOKEN_HASHER.hash(str(token or ""))
+
+
+def verify_api_token_value(token, stored_hash):
+    token = str(token or "")
+    stored_hash = str(stored_hash or "")
+    if not token or not stored_hash:
+        return False
+    if stored_hash.startswith("$argon2"):
+        if API_TOKEN_HASHER is None:
+            return False
+        try:
+            return bool(API_TOKEN_HASHER.verify(stored_hash, token))
+        except (VerificationError, InvalidHashError):
+            return False
+    return hmac.compare_digest(api_token_hash(token), stored_hash)
+
+
+def ensure_api_token_schema():
+    execute_many(
+        [
+            (
+                """
+                CREATE TABLE IF NOT EXISTS api_tokens (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id INT NOT NULL,
+                    token_hash VARCHAR(255) NOT NULL,
+                    token_prefix VARCHAR(24) DEFAULT NULL,
+                    token_label VARCHAR(120) DEFAULT NULL,
+                    expires_at DATETIME DEFAULT NULL,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    last_used_at DATETIME DEFAULT NULL,
+                    UNIQUE KEY api_tokens_hash_unique (token_hash),
+                    KEY api_tokens_user_idx (user_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+                """,
+                (),
+            ),
+        ]
+    )
+    columns = table_columns("api_tokens")
+    statements = []
+    if "token_label" not in columns:
+        statements.append(("ALTER TABLE api_tokens ADD COLUMN token_label VARCHAR(120) DEFAULT NULL AFTER token_prefix", ()))
+    statements.append(("ALTER TABLE api_tokens MODIFY COLUMN token_hash VARCHAR(255) NOT NULL", ()))
+    if "token_prefix" in columns:
+        statements.append(("ALTER TABLE api_tokens MODIFY COLUMN token_prefix VARCHAR(24) DEFAULT NULL", ()))
+    if statements:
+        execute_many(statements)
+
+
 def current_user():
     user_id = session.get("user_id")
     if user_id is None or user_id == "":
@@ -208,14 +300,39 @@ def ops_sidebar_brand_html(data, product_name):
     use_logo = truthy(data.get("use_logo_in_sidebar", "1"))
     light_logo = str(data.get("sidebar_logo_light") or "/assets/OPENPAGINGSERVER-768x576-LIGHTMODE.png").strip()
     dark_logo = str(data.get("sidebar_logo_dark") or "/assets/OPENPAGINGSERVER-768x576-DARKMODE.png").strip()
+    demo_badge = ""
+    if demo_mode_enabled():
+        demo_badge = '<span class="sidebar-demo-mode"><i class="fa-solid fa-bag-shopping"></i> Demo Mode</span>'
     if not use_logo or not light_logo:
-        return f'<div class="sidebar-brand"><span>{h(product_name)}</span></div>'
+        return f'<div class="sidebar-brand"><div class="sidebar-brand-inner"><span>{h(product_name)}</span>{demo_badge}</div></div>'
     dark_source = f'<source media="(prefers-color-scheme: dark)" srcset="{h(dark_logo)}">' if dark_logo else ""
     return (
-        '<div class="sidebar-brand sidebar-brand-logo"><picture>'
+        '<div class="sidebar-brand sidebar-brand-logo"><div class="sidebar-brand-inner"><picture>'
         f'{dark_source}<img src="{h(light_logo)}" alt="{h(product_name)}">'
-        "</picture></div>"
+        f"</picture>{demo_badge}</div></div>"
     )
+
+
+def demo_mode_iframe_html(topic=""):
+    if DEMO_MODE_HTML_PATH.is_file():
+        return Response(DEMO_MODE_HTML_PATH.read_text(encoding="utf-8"), mimetype="text/html")
+    return Response('<!DOCTYPE html><html lang="en"><body><p>Demo Mode</p></body></html>', mimetype="text/html")
+
+
+def demo_mode_page(title, ctx, active, topic):
+    iframe_src = "/demo-mode?" + urlencode({"topic": topic})
+    content = f"""<h1>{h(title)}</h1>
+    <div class="card" style="padding:0; overflow:hidden;">
+        <iframe src="{h(iframe_src)}" style="width:100%; min-height:260px; border:0; border-radius:12px; display:block;" title="Demo Mode"></iframe>
+    </div>"""
+    return legacy_page(title, ctx, active, LEGACY_GENERIC_STYLE, content)
+
+
+def demo_mode_inline_notice(topic):
+    iframe_src = "/demo-mode?" + urlencode({"topic": topic})
+    return f"""<div class="card" style="padding:0; overflow:hidden; margin-bottom:16px;">
+        <iframe src="{h(iframe_src)}" style="width:100%; min-height:240px; border:0; border-radius:12px; display:block;" title="Demo Mode"></iframe>
+    </div>"""
 
 
 def legacy_user_context(user=None):
@@ -231,6 +348,7 @@ def legacy_user_context(user=None):
     return {
         "user": user,
         "role": role,
+        "username": user.get("username") or session.get("username") or "User",
         "is_admin": role in {"admin", "tempadmin"},
         "is_receiver": role in {"receiver", "tempreceiver"},
         "settings": data,
@@ -242,6 +360,9 @@ def legacy_user_context(user=None):
 
 
 def legacy_sidebar_html(ctx, active):
+    user_settings_class = ' class="active user-settings-link"' if active == "user-settings" else ' class="user-settings-link"'
+    user_settings_link = f'<a href="/user/settings"{user_settings_class}><span class="nav-icon"><i class="fa-solid fa-user"></i></span><span class="nav-label">{h(ctx.get("username") or "User")}</span></a>'
+    logout_button = '<button class="logout-btn" onclick="logout()"><span class="nav-icon"><i class="fa-solid fa-sign-out-alt"></i></span><span class="nav-label">Logout</span></button>'
     links = [
         ("/dashboard", "house", "Dashboard", "dashboard"),
         ("/paging/", "bullhorn", "Paging", "paging"),
@@ -250,10 +371,10 @@ def legacy_sidebar_html(ctx, active):
         ("/bells/", "bell", "Bells", "bells"),
         ("/assets/", "folder-open", "Assets", "assets"),
     ]
-    rendered = [ctx["brand_html"]]
+    nav_links = []
     for href, icon, label, key in links:
         cls = ' class="active"' if active == key else ""
-        rendered.append(
+        nav_links.append(
             f'<a href="{h(href)}"{cls}><span class="nav-icon"><i class="fa-solid fa-{icon}"></i></span><span class="nav-label">{h(label)}</span></a>'
         )
     if ctx.get("is_admin"):
@@ -264,16 +385,24 @@ def legacy_sidebar_html(ctx, active):
             ("/admin/settings/general", "cogs", "Server Settings"),
         ]
         for href, icon, label in admin_links:
-            rendered.append(
+            nav_links.append(
                 f'<a href="{h(href)}" class="admin-only"><span class="nav-icon"><i class="fa-solid fa-{icon}"></i></span><span class="nav-label">{h(label)}</span></a>'
             )
     if ctx.get("show_online_docs") == "1":
-        rendered.append(
+        nav_links.append(
             '<a href="https://docs.openpagingserver.org"><span class="nav-icon"><i class="fa-solid fa-book"></i></span><span class="nav-label">Online Documentation</span></a>'
         )
-    rendered.append(
-        '<button class="logout-btn" onclick="logout()"><span class="nav-icon"><i class="fa-solid fa-sign-out-alt"></i></span><span class="nav-label">Logout</span></button>'
-    )
+    rendered = [
+        ctx["brand_html"],
+        '<div class="sidebar-nav">',
+        *nav_links,
+        "</div>",
+        '<div class="sidebar-account">',
+        user_settings_link,
+        logout_button,
+        '<div class="mobile-nav-divider"></div>',
+        "</div>",
+    ]
     return "\n    ".join(rendered)
 
 
@@ -284,8 +413,41 @@ def legacy_page(title, ctx, active, style, content, extra_script="", extra_after
 #sidebar .nav-icon,.logout-btn .nav-icon,.admin-only .nav-icon{width:20px;display:inline-flex;justify-content:center;flex:0 0 20px}
 #sidebar .nav-label,.logout-btn .nav-label,.admin-only .nav-label{min-width:0}
 #sidebar a i,.logout-btn i,.admin-only i{margin-right:0!important;width:auto!important;text-align:center}
-.logout-btn{display:flex!important}
+.logout-btn{display:flex!important;width:100%}
 .logout-btn-mobile{display:none!important}
+.sidebar-nav{display:flex;flex-direction:column}
+.sidebar-account{display:flex;flex-direction:column;margin-top:auto}
+.mobile-nav-divider{display:none}
+@media (max-width:767px){.sidebar-account{margin-top:0;order:0}.sidebar-nav{order:1}.mobile-nav-divider{display:block;height:1px;background:#000;margin:0}}
+"""
+    demo_markup = ""
+    demo_script = ""
+    if demo_mode_enabled():
+        demo_markup = """
+<div id="demo-mode-overlay" onclick="closeDemoModePopupOnOverlay(event)" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.72); z-index:2500; align-items:center; justify-content:center; padding:20px; box-sizing:border-box;">
+    <button type="button" onclick="closeDemoModePopup()" aria-label="Close demo mode popup" style="position:fixed; top:12px; right:12px; width:42px; height:42px; border:none; border-radius:50%; background:transparent; color:#FFF; cursor:pointer; z-index:2502; font-size:22px;"><i class="fa-solid fa-xmark"></i></button>
+    <div style="position:relative; width:min(720px, 100%);">
+        <iframe id="demo-mode-frame" src="/demo-mode" style="width:100%; min-height:320px; border:0; border-radius:18px; background:transparent; display:block;"></iframe>
+    </div>
+</div>"""
+        demo_script = """
+function openDemoModePopup(topic) {
+  var overlay = document.getElementById('demo-mode-overlay');
+  var frame = document.getElementById('demo-mode-frame');
+  if (!overlay || !frame) return;
+  frame.src = '/demo-mode?topic=' + encodeURIComponent(topic || '');
+  overlay.style.display = 'flex';
+}
+function closeDemoModePopup() {
+  var overlay = document.getElementById('demo-mode-overlay');
+  if (overlay) overlay.style.display = 'none';
+}
+function closeDemoModePopupOnOverlay(event) {
+  if (event && event.target && event.target.id === 'demo-mode-overlay') closeDemoModePopup();
+}
+document.addEventListener('keydown', function(event) {
+  if (event.key === 'Escape') closeDemoModePopup();
+});
 """
     html_doc = f"""<!DOCTYPE html>
 <html lang="en">
@@ -329,8 +491,10 @@ function closeSidebarOnContentClick() {{
 function logout() {{
   window.location.href = "/logout";
 }}
+{demo_script}
 {extra_script}
 </script>
+{demo_markup}
 {extra_after}
 </body>
 </html>"""
@@ -561,6 +725,29 @@ def group_member_tokens(members):
     return [token for token in re.split(r"[\s,]+", str(members or "")) if token]
 
 
+def desktop_user_choices():
+    rows = query_all(
+        "SELECT id, username, role FROM users WHERE role NOT IN ('receiver', 'tempreceiver') ORDER BY username ASC"
+    )
+    return [
+        {
+            "value": desktop_member_token(row.get("id")),
+            "label": str(row.get("username") or ""),
+        }
+        for row in rows
+        if str(row.get("id") or "").strip()
+    ]
+
+
+def group_member_available(member, endpoint_availability):
+    token = str(member or "").strip()
+    if not token:
+        return False
+    if is_desktop_member_token(token):
+        return user_has_connected_client(desktop_member_user_id(token))
+    return bool(endpoint_availability.get(token))
+
+
 def endpoint_availability_map(endpoint_payload):
     availability = {}
     if not isinstance(endpoint_payload, dict):
@@ -746,6 +933,88 @@ def logout():
     return dispatch_web_page("logout")
 
 
+def desktop_authorized_user():
+    auth_header = str(request.headers.get("Authorization") or "")
+    token = auth_header.split(" ", 1)[1].strip() if auth_header.lower().startswith("bearer ") else ""
+    if not token:
+        token = str(request.args.get("token") or "").strip()
+    return verify_desktop_token(token)
+
+
+def require_desktop_client():
+    if not str(request.headers.get(DESKTOP_CLIENT_HEADER) or "").strip():
+        return jsonify(error="Desktop client header required"), 400
+    user = desktop_authorized_user()
+    if not user:
+        return jsonify(error="Unauthorized"), 401
+    return user
+
+
+@alias("/desktop/session/login", methods=["POST"])
+def desktop_session_login():
+    if not str(request.headers.get(DESKTOP_CLIENT_HEADER) or "").strip():
+        return jsonify(error="Desktop client header required"), 400
+    payload = request.get_json(silent=True) or request.form.to_dict()
+    username = str(payload.get("username") or "").strip()
+    password = str(payload.get("password") or "")
+    if not username or not password:
+        return jsonify(error="Username and password are required."), 400
+    user = query_one(
+        "SELECT id, username, email, password, salt, role, accountexpire, loginsleft FROM users WHERE username=%s OR email=%s LIMIT 1",
+        (username, username),
+    )
+    if not user:
+        return jsonify(error="Invalid username or password."), 401
+    expected_hash = hashlib.sha256((password + str(user.get("salt") or "")).encode()).hexdigest()
+    if expected_hash != str(user.get("password") or ""):
+        return jsonify(error="Invalid username or password."), 401
+    expire_date = user.get("accountexpire")
+    if expire_date and str(expire_date) not in {"0000-00-00", "None"} and str(expire_date) < datetime.now().strftime("%Y-%m-%d"):
+        return jsonify(error="This account has expired."), 403
+    token, expires_at = build_desktop_token(user)
+    return jsonify(
+        token=token,
+        expires_at=expires_at,
+        websocket_path="/desktop/ws",
+        keepalive_path="/desktop/session/ping",
+        product_name=desktop_product_name(),
+        user={"id": user.get("id"), "username": user.get("username"), "role": user.get("role")},
+        groups=desktop_groups_for_user(user.get("id")),
+    )
+
+
+@alias("/desktop/session/ping", methods=["GET", "OPTIONS"])
+def desktop_session_ping():
+    user = require_desktop_client()
+    if not isinstance(user, dict):
+        return user
+    response = jsonify(
+        ok=True,
+        product_name=desktop_product_name(),
+        server_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        user={"id": user.get("id"), "username": user.get("username"), "role": user.get("role")},
+        groups=desktop_groups_for_user(user.get("id")),
+    )
+    response.status_code = 200
+    return response
+
+
+@alias("/desktop/broadcasts/<broadcast_id>/audio")
+def desktop_broadcast_audio(broadcast_id):
+    user = require_desktop_client()
+    if not isinstance(user, dict):
+        return user
+    broadcast = fetch_active_broadcast(broadcast_id)
+    if not broadcast:
+        abort(404)
+    if not user_in_broadcast(user.get("id"), broadcast):
+        abort(403)
+    audio_name = first_audio_name(broadcast)
+    if not audio_name:
+        abort(404)
+    return send_file(asset_path(audio_name), as_attachment=False, conditional=True)
+
+
 @alias("/dashboard")
 def dashboard():
     return dispatch_web_page("dashboard")
@@ -878,6 +1147,11 @@ def manage_users():
     return dispatch_web_page("admin/manage-users")
 
 
+@alias("/user/settings", methods=["GET", "POST"])
+def user_settings():
+    return dispatch_web_page("user/settings")
+
+
 def endpoint_ipc(command):
     try:
         with endpoints.connect_endpoint_ipc(timeout=2) as sock:
@@ -947,6 +1221,16 @@ def settings_sip():
     return dispatch_web_page("admin/settings/sip")
 
 
+@alias("/admin/settings/web", methods=["GET", "POST"])
+def settings_web():
+    return dispatch_web_page("admin/settings/web")
+
+
+@alias("/admin/settings/api", methods=["GET", "POST"])
+def settings_api():
+    return dispatch_web_page("admin/settings/api")
+
+
 def read_version():
     try:
         for line in (BASE_DIR / "pyproject.toml").read_text().splitlines():
@@ -960,6 +1244,11 @@ def read_version():
 @alias("/admin/settings/about")
 def settings_about():
     return dispatch_web_page("admin/settings/about")
+
+
+@alias("/demo-mode")
+def demo_mode_info():
+    return demo_mode_iframe_html(request.args.get("topic", ""))
 
 
 def ensure_bell_schema():

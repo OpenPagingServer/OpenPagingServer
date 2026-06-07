@@ -89,6 +89,7 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 
 PAGING_SCRIPT = r"""
 const senderName = __SENDER__;
+const opsDemoMode = __OPS_DEMO_MODE__;
 const micSelect = document.getElementById('microphoneSelect');
 const micButton = document.getElementById('micButton');
 const statusText = document.getElementById('statusText');
@@ -203,6 +204,10 @@ function websocketUrl(groupId) {
   return `${protocol}//${window.location.host}/live?${params.toString()}`;
 }
 async function startPaging() {
+  if (opsDemoMode) {
+    if (window.openDemoModePopup) openDemoModePopup('paging');
+    return;
+  }
   const groupId = selectedGroupId();
   if (!groupId) {
     setStatus('Select at least one group before starting.', 'error');
@@ -353,7 +358,12 @@ def handle_request():
     endpoint_data = endpoint_ipc("LIST_ENDPOINTS")
     endpoint_error = None if endpoint_data.get("ok", True) else endpoint_data.get("error") or "Endpoint manager returned an error."
     endpoint_availability = endpoint_availability_map(endpoint_data)
-    total_online = sum(1 for value in endpoint_availability.values() if value)
+    total_online = sum(
+        1
+        for group in groups
+        for member in group_member_tokens(group.get("members"))
+        if group_member_available(member, endpoint_availability)
+    )
 
     all_unavailable = endpoint_error is None and total_online == 0
     all_disabled = " disabled" if all_unavailable else ""
@@ -362,7 +372,11 @@ def handle_request():
     if groups:
         group_rows = []
         for group in groups:
-            online = sum(1 for member in group_member_tokens(group.get("members")) if endpoint_availability.get(member))
+            online = sum(
+                1
+                for member in group_member_tokens(group.get("members"))
+                if group_member_available(member, endpoint_availability)
+            )
             has_online = endpoint_error is not None or online > 0
             row_cls = "" if has_online else " unavailable"
             disabled = "" if has_online else " disabled"
@@ -430,5 +444,5 @@ def handle_request():
             </div>
         </div>
     </div>"""
-    script = PAGING_SCRIPT.replace("__SENDER__", json.dumps(username))
+    script = PAGING_SCRIPT.replace("__SENDER__", json.dumps(username)).replace("__OPS_DEMO_MODE__", "true" if demo_mode_enabled() else "false")
     return legacy_page("Paging", ctx, "paging", PAGING_STYLE, content, script)

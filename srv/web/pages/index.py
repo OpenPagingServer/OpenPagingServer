@@ -1,4 +1,5 @@
 import hmac
+import ipaddress
 import json
 import time
 import urllib.error
@@ -120,6 +121,22 @@ def _captcha_secret_key(data):
     return str((data or {}).get("login_captcha_secret_key") or "").strip()
 
 
+def _client_ip_is_external(ip):
+    try:
+        return ipaddress.ip_address(str(ip or "").strip()).is_global
+    except ValueError:
+        return True
+
+
+def _captcha_required(data, ip):
+    provider = _configured_captcha_provider(data)
+    if not provider:
+        return ""
+    if str((data or {}).get("login_captcha_external_only", "1")) == "1" and not _client_ip_is_external(ip):
+        return ""
+    return provider
+
+
 def _configured_captcha_provider(data):
     provider = _captcha_provider(data)
     if provider in {"turnstile", "recaptcha"} and not (_captcha_site_key(data) and _captcha_secret_key(data)):
@@ -149,13 +166,14 @@ def _siteverify(url, secret, token, ip):
         "secret": secret,
         "response": token,
     }
-    if ip:
+    if ip and _client_ip_is_external(ip):
         payload["remoteip"] = ip
     request_body = urlencode(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
         data=request_body,
         headers={
+            "Accept": "application/json",
             "Content-Type": "application/x-www-form-urlencoded",
             "User-Agent": "OpenPagingServer/0.3.0",
         },
@@ -164,13 +182,13 @@ def _siteverify(url, secret, token, ip):
     try:
         with urllib.request.urlopen(req, timeout=5) as response:
             result = json.loads(response.read().decode("utf-8", errors="replace"))
-        return bool(result.get("success"))
+        return _success_value(result.get("success"))
     except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError):
         return False
 
 
 def _verify_captcha(data, ip):
-    provider = _configured_captcha_provider(data)
+    provider = _captcha_required(data, ip)
     if not provider:
         return True
     token = (
@@ -292,10 +310,18 @@ def handle_request():
     enable_login_logo = _setting_bool(data, "enable_login_logo")
     login_logo_light = data.get("login_logo_light") or ""
     login_logo_dark = data.get("login_logo_dark") or ""
-    captcha_provider = _configured_captcha_provider(data)
+    client_ip = request.remote_addr or ""
+    captcha_provider = _captcha_required(data, client_ip)
     captcha_site_key = _captcha_site_key(data)
     captcha_html = _captcha_markup(captcha_provider, captcha_site_key)
     captcha_script = _captcha_script_tag(captcha_provider)
+    demo_mode_html = ""
+    if demo_mode_enabled():
+        demo_mode_html = """
+        <div class="demo-mode-login">
+          <i class="fa-solid fa-bag-shopping"></i>
+          <span>Demo Mode</span>
+        </div>"""
 
     favicon_html = f'<link rel="icon" href="{h(favicon)}" type="image/x-icon">' if favicon else ""
     dark_logo_css = ".logo-light { display: none; }\n        .logo-dark { display: block; }" if separate_dark_logo else ""
@@ -374,6 +400,7 @@ def handle_request():
       .loading-circle {{ width: 24px; height: 24px; border: 2px solid rgba(255,255,255,0.3); border-top: 2px solid #fff; border-radius: 50%; animation: spin 1s linear infinite; position: absolute; }}
       @keyframes spin {{ from {{ transform: rotate(0deg); }} to {{ transform: rotate(360deg); }} }}
       .error {{ color: #d32f2f; font-size: 0.9em; margin-top: 10px; min-height: 1.2em; }}
+      .demo-mode-login {{ position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); z-index: 2; color: #000; font-size: 0.95em; display: flex; align-items: center; justify-content: center; gap: 8px; }}
       @media (prefers-color-scheme: dark) {{
         body, html {{ background: #121212; color: #fff; }}
         .login-banner {{ background: #3e2723; border: 1px solid #5d4037; color: #ffb74d; }}
@@ -384,9 +411,11 @@ def handle_request():
         .basic-captcha-row img {{ background: #2a2a2a; border-color: #555; }}
         .login-box button {{ background-color: #90caf9; color: #121212; }}
         .error {{ color: #ffcdd2; }}
+        .demo-mode-login {{ color: #fff; }}
         {dark_logo_css}
       }}
       @media (prefers-color-scheme: dark) and (max-width: 768px) {{ body {{ background: #121212; }} }}
+      @media (max-width: 768px) {{ .demo-mode-login {{ position: static; transform: none; margin: 16px 0 10px 0; }} }}
     </style>
   </head>
   <body>
@@ -408,6 +437,7 @@ def handle_request():
         <button id="login-button" onclick="startLogin()">Login</button>
         <p id="login-error" class="error">{h(login_error)}</p>
       </div>
+      {demo_mode_html}
     </div>
     <script>
       function rectsOverlap(a, b) {{

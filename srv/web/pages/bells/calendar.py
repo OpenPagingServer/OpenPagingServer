@@ -2,7 +2,7 @@ import calendar
 from datetime import date, datetime, timedelta
 
 from srv.web.app import *
-from srv.web.pages.bells.bell_helpers import bells_page, schedule_or_404, schedule_settings_card, weekday_short_names
+from srv.web.pages.bells.bell_helpers import bells_demo_return, bells_page, schedule_or_404, schedule_settings_card, weekday_short_names
 
 
 def month_value(raw):
@@ -43,6 +43,9 @@ def handle_request():
     month = month_value(request.values.get("month"))
     first_day = datetime.strptime(month + "-01", "%Y-%m-%d").date()
     last_day = date(first_day.year, first_day.month, calendar.monthrange(first_day.year, first_day.month)[1])
+    demo = demo_mode_enabled()
+    if demo and request.method == "POST":
+        return bells_demo_return()
     if request.method == "POST":
         action = request.form.get("action", "")
         if action == "add_day_list":
@@ -96,7 +99,7 @@ def handle_request():
     next_month = (last_day + timedelta(days=1)).strftime("%Y-%m")
     day_checks = "".join(f'<label class="weekday-chip"><input type="checkbox" name="days_of_week" value="{h(key)}" checked><span>{h(label)}</span></label>' for key, label in weekday_names().items())
     bulk = f"""<div class="card">
-        <form method="POST" action="/bells/calendar" class="bulk-grid" style="margin-top:12px;">
+        <form method="POST" action="/bells/calendar" class="bulk-grid" style="margin-top:12px;"{" onsubmit=\"openDemoModePopup('bells'); return false;\"" if demo else ""}>
         <input type="hidden" name="schedule_id" value="{h(sid)}"><input type="hidden" name="month" value="{h(month)}">
         <div class="field"><label for="start_date">Start date</label><input id="start_date" type="date" name="start_date" value="{h(first_day)}" required></div>
         <div class="field"><label for="end_date">End date</label><input id="end_date" type="date" name="end_date" value="{h(last_day)}" required></div>
@@ -112,13 +115,13 @@ def handle_request():
         assigned_html = ""
         for item in assignments.get(current_date, []):
             scope = "System" if int(item.get("schedule_id") or 0) == 0 else "Custom"
-            assigned_html += f"""<div class="day-list"><span>{h(scope + ": " + item["name"])}</span><form method="POST" action="/bells/calendar"><input type="hidden" name="action" value="remove_day_list"><input type="hidden" name="schedule_id" value="{h(sid)}"><input type="hidden" name="month" value="{h(month)}"><input type="hidden" name="bell_date" value="{h(current_date)}"><input type="hidden" name="list_id" value="{h(item["list_id"])}"><button class="btn icon danger" type="submit" title="Remove"><i class="fa-solid fa-xmark"></i></button></form></div>"""
+            assigned_html += f"""<div class="day-list"><span>{h(scope + ": " + item["name"])}</span><form method="POST" action="/bells/calendar"{" onsubmit=\"openDemoModePopup('bells'); return false;\"" if demo else ""}><input type="hidden" name="action" value="remove_day_list"><input type="hidden" name="schedule_id" value="{h(sid)}"><input type="hidden" name="month" value="{h(month)}"><input type="hidden" name="bell_date" value="{h(current_date)}"><input type="hidden" name="list_id" value="{h(item["list_id"])}"><button class="btn icon danger" type="submit" title="Remove"><i class="fa-solid fa-xmark"></i></button></form></div>"""
         if not assigned_html:
             assigned_html = '<div class="muted">Uses the normal schedule.</div>'
         cells += f"""<div class="day">
             <div class="day-number" id="day-{h(current_date)}"><span>{h(day_num)}</span><button class="btn icon secondary" type="button" onclick="toggleDayAdd(this)" title="Add List"><i class="fa-solid fa-plus"></i></button></div>
             {assigned_html}
-            <form method="POST" action="/bells/calendar" class="day-add"><input type="hidden" name="action" value="add_day_list"><input type="hidden" name="schedule_id" value="{h(sid)}"><input type="hidden" name="month" value="{h(month)}"><input type="hidden" name="bell_date" value="{h(current_date)}"><div class="row"><select name="list_id" required><option value="">List</option>{list_options(lists, False)}</select><button class="btn icon" type="submit" title="Add"><i class="fa-solid fa-check"></i></button></div></form>
+            <form method="POST" action="/bells/calendar" class="day-add"{" onsubmit=\"openDemoModePopup('bells'); return false;\"" if demo else ""}><input type="hidden" name="action" value="add_day_list"><input type="hidden" name="schedule_id" value="{h(sid)}"><input type="hidden" name="month" value="{h(month)}"><input type="hidden" name="bell_date" value="{h(current_date)}"><div class="row"><select name="list_id" required><option value="">List</option>{list_options(lists, False)}</select><button class="btn icon" type="submit" title="Add"><i class="fa-solid fa-check"></i></button></div></form>
         </div>"""
     calendar_html = f"""<div class="card">
         <div class="calendar-head"><a class="btn secondary" href="/bells/calendar?{h(urlencode({"schedule_id": sid, "month": prev_month}))}"><i class="fa-solid fa-angle-left"></i></a><strong>{h(first_day.strftime("%B %Y"))}</strong><a class="btn secondary" href="/bells/calendar?{h(urlencode({"schedule_id": sid, "month": next_month}))}"><i class="fa-solid fa-angle-right"></i></a></div>

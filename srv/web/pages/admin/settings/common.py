@@ -1,5 +1,5 @@
 
-from srv.web.app import h, legacy_page
+from srv.web.app import demo_mode_enabled, h, legacy_page
 
 SETTINGS_STYLE = r"""
 body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:300; background-color:#FFF; height:100%; }
@@ -95,6 +95,10 @@ function postSettings(formId, buttonId, statusId, successText, reloadAfter) {
     const status = document.getElementById(statusId);
     if (!button) return;
     button.addEventListener('click', function() {
+        if (window.openDemoModePopup && window.location.pathname.indexOf('/admin/settings/') === 0 && document.querySelector('[data-demo-mode="1"]')) {
+            openDemoModePopup('settings');
+            return;
+        }
         const formData = new FormData(document.getElementById(formId));
         button.disabled = true;
         status.innerText = "Saving...";
@@ -133,6 +137,8 @@ def settings_tabs(active):
         ("general", "General", "/admin/settings/general"),
         ("login", "Login", "/admin/settings/login"),
         ("sip", "SIP", "/admin/settings/sip"),
+        ("web", "Web", "/admin/settings/web"),
+        ("api", "API", "/admin/settings/api"),
         ("branding", "Branding", "/admin/settings/branding"),
         ("about", "About", "/admin/settings/about"),
     ]
@@ -152,4 +158,6 @@ def settings_tabs(active):
 
 
 def settings_page(title, ctx, active, body, extra_script=""):
-    return legacy_page(title, ctx, "settings", SETTINGS_STYLE, settings_tabs(active) + body, SETTINGS_SCRIPT + extra_script)
+    demo_attr = ' data-demo-mode="1"' if demo_mode_enabled() else ""
+    wrapped = f'<div{demo_attr}>{settings_tabs(active) + body}</div>'
+    return legacy_page(title, ctx, "settings", SETTINGS_STYLE, wrapped, SETTINGS_SCRIPT + extra_script)

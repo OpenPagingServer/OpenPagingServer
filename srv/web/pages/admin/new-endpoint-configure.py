@@ -43,6 +43,8 @@ def handle_request():
     user = require_admin()
     if not isinstance(user, dict):
         return user
+    if demo_mode_enabled():
+        return demo_mode_page("Add Endpoint", legacy_user_context(user), "endpoints", "manage-endpoints")
     module = request.args.get("module", "")
     module_info = endpoint_module_catalog(include_system=True).get(module)
     if not safe_module_name(module) or not module_info or not module_info.get("has_forms") or not module_info.get("can_load", True):

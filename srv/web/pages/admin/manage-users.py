@@ -33,7 +33,7 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .field input, .field select { border:1px solid #CCC; border-radius:4px; padding:10px; font:inherit; box-sizing:border-box; background:#FFF; }
 .hint { color:#777; font-size:0.88em; margin-top:-8px; margin-bottom:12px; }
 .btn-primary { background:#1976D2; color:#FFF; border:none; border-radius:4px; padding:10px 14px; cursor:pointer; font:inherit; text-decoration:none; display:inline-flex; align-items:center; gap:8px; }
-.btn-secondary { color:#1976D2; text-decoration:none; padding:10px 12px; display:inline-flex; align-items:center; }
+.btn-secondary { color:#1976D2; text-decoration:none; padding:10px 12px; display:inline-flex; align-items:center; justify-content:center; background:#FFF; border:1px solid #1976D2; border-radius:4px; cursor:pointer; font:inherit; }
 .user-list { list-style:none; margin:0; padding:0; }
 .user-item { display:flex; justify-content:space-between; gap:14px; padding:14px 0; border-bottom:1px solid #EEE; }
 .user-item:last-child { border-bottom:none; }
@@ -55,6 +55,24 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .editor-card { margin-top:18px; }
 .form-actions { display:flex; align-items:center; gap:12px; margin-top:8px; flex-wrap:wrap; }
 .inline-note { font-size:0.9em; color:#666; }
+.subtabs { display:flex; gap:10px; margin:0 0 18px 0; border-bottom:1px solid #EEE; flex-wrap:wrap; }
+.subtab-link { padding:10px 16px; border:1px solid transparent; border-bottom:none; border-radius:6px 6px 0 0; background:#F5F5F5; color:#555; text-decoration:none; }
+.subtab-link.active { background:#1976D2; color:#FFF; border-color:#1976D2; }
+.token-toolbar { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:14px; flex-wrap:wrap; }
+.token-list { display:grid; gap:12px; }
+.token-item { border:1px solid #E5E7EB; border-radius:12px; padding:14px; background:#FAFBFD; }
+.token-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px; flex-wrap:wrap; }
+.token-name { font-weight:500; color:#202124; }
+.token-meta { display:flex; flex-wrap:wrap; gap:12px; color:#666; font-size:0.9em; }
+.token-create-form { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; }
+.token-modal-backdrop { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:2200; align-items:center; justify-content:center; padding:20px; box-sizing:border-box; }
+.token-modal-backdrop.active { display:flex; }
+.token-modal { width:min(520px, 100%); background:#FFF; border-radius:18px; box-shadow:0 24px 60px rgba(0,0,0,0.25); padding:22px; }
+.token-modal h3 { margin:0 0 8px 0; font-weight:500; color:#1976D2; }
+.token-modal p { margin:0 0 16px 0; color:#666; }
+.token-display { display:flex; align-items:center; gap:10px; margin:16px 0; }
+.token-display input { flex:1; border:1px solid #CCC; border-radius:8px; padding:12px; font:inherit; background:#F8FAFC; }
+.token-actions { display:flex; justify-content:flex-end; gap:10px; flex-wrap:wrap; margin-top:18px; }
 @media(max-width:767px){ .header-actions{ align-items:flex-start; flex-direction:column; } .user-item{ align-items:flex-start; flex-direction:column; } .group-actions{ margin-top:4px; } }
 @media(min-width:768px){ #mobile-header{ display:none; } }
 @media(prefers-color-scheme:dark){
@@ -70,7 +88,7 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 .field label,.muted,.hint,.inline-note,.user-meta,.user-stats{ color:#BBB; }
 .field input,.field select { background:#121212; border-color:#444; color:#E0E0E0; }
 .btn-primary { background:#BB86FC; color:#000; }
-.btn-secondary { color:#BB86FC; }
+.btn-secondary { color:#BB86FC; border-color:#BB86FC; background:#1E1E1E; }
 .user-item { border-bottom:1px solid #333; }
 .user-name { color:#EDEDED; }
 .icon-action { color:#BBB; }
@@ -80,6 +98,15 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 .admin-badge { background:#3A2B1B; color:#FFCC80; }
 .flash.success { background:#12301A; border-color:#2E7D32; color:#C8E6C9; }
 .flash.error,.error { background:#3B1515; border-color:#6D2A2A; color:#FFCDD2; }
+.subtabs { border-bottom-color:#333; }
+.subtab-link { background:#2A2A2A; color:#BBB; }
+.subtab-link.active { background:#BB86FC; color:#000; border-color:#BB86FC; }
+.token-item { border-color:#333; background:#171A1F; }
+.token-name { color:#EDEDED; }
+.token-meta,.token-modal p { color:#BBB; }
+.token-modal { background:#1E1E1E; }
+.token-modal h3 { color:#BB86FC; }
+.token-display input { background:#121212; border-color:#444; color:#E0E0E0; }
 }
 """
 
@@ -123,6 +150,16 @@ def valid_date_string(value):
     return re.fullmatch(r"\d{4}-\d{2}-\d{2}", value or "") is not None
 
 
+def valid_datetime_local_string(value):
+    if value == "":
+        return True
+    try:
+        datetime.strptime(value, "%Y-%m-%dT%H:%M")
+        return True
+    except ValueError:
+        return False
+
+
 def hash_password_value(password):
     salt = secrets.token_hex(16)
     return hashlib.sha256((password + salt).encode()).hexdigest(), salt
@@ -164,17 +201,50 @@ def flash_message(message, category):
     session["manage_users_flash"] = {"message": message, "type": category}
 
 
+def fetch_api_tokens(user_id):
+    ensure_api_token_schema()
+    return query_all(
+        """
+        SELECT id, token_label, expires_at, created_at, last_used_at
+        FROM api_tokens
+        WHERE user_id=%s
+        ORDER BY created_at DESC, id DESC
+        """,
+        (user_id,),
+    )
+
+
+def format_datetime_local_value(value):
+    if not value or str(value) in {"0000-00-00 00:00:00", "None"}:
+        return ""
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%dT%H:%M")
+    try:
+        return datetime.strptime(str(value).split(".", 1)[0], "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%dT%H:%M")
+    except ValueError:
+        return ""
+
+
 def handle_request():
     user = require_admin()
     if not isinstance(user, dict):
         return user
+    ensure_api_token_schema()
     ctx = legacy_user_context(user)
+    api_enabled = str(ctx["settings"].get("api_http_enable", "0")) == "1"
     form_error = ""
     edit_user = None
     show_editor = False
+    demo = demo_mode_enabled()
+    editor_tab = "account"
 
     if request.method == "POST":
         action = request.form.get("action", "")
+        requested_tab = request.form.get("editor_tab", "").strip()
+        if requested_tab in {"account", "api-keys"}:
+            editor_tab = requested_tab
+        if demo and action in {"delete", "save", "create_api_token"}:
+            return demo_mode_iframe_html("manage-users")
         if action == "delete":
             user_id = request.form.get("user_id", "")
             target = query_one("SELECT id, username, role FROM users WHERE id=%s LIMIT 1", (user_id,))
@@ -191,7 +261,37 @@ def handle_request():
                 flash_message("User deleted.", "success")
             return redirect("/admin/manage-users")
 
+        if action == "create_api_token":
+            editor_tab = "api-keys"
+            user_id = request.form.get("user_id", "").strip()
+            token_label = str(request.form.get("api_token_label") or "").strip()[:API_TOKEN_LABEL_LENGTH]
+            expires_at = request.form.get("api_token_expires_at", "").strip()
+            if not user_id:
+                form_error = "User not found."
+            elif not valid_datetime_local_string(expires_at):
+                form_error = "API token expiration must use the local date and time picker format."
+            else:
+                target = fetch_user(user_id)
+                if not target:
+                    form_error = "User not found."
+                else:
+                    try:
+                        token_value = create_api_token_value()
+                        expires_value = None
+                        if expires_at:
+                            expires_value = datetime.strptime(expires_at, "%Y-%m-%dT%H:%M").strftime("%Y-%m-%d %H:%M:%S")
+                        execute(
+                            "INSERT INTO api_tokens (user_id, token_hash, token_label, expires_at) VALUES (%s,%s,%s,%s)",
+                            (user_id, hash_api_token_value(token_value), token_label or None, expires_value),
+                        )
+                        session["manage_users_new_api_token"] = {"value": token_value, "label": token_label}
+                        flash_message("API key created.", "success")
+                        return redirect(f"/admin/manage-users?edit={user_id}&tab=api-keys")
+                    except RuntimeError as exc:
+                        form_error = str(exc)
+
         if action == "save":
+            editor_tab = "account"
             user_id_raw = request.form.get("user_id", "").strip()
             user_id = user_id_raw or None
             username = request.form.get("username", "").strip()
@@ -259,12 +359,17 @@ def handle_request():
         elif "new" in request.args:
             edit_user = {"id": "", "username": "", "email": "", "role": "user", "loginsleft": 0, "accountexpire": "", "accountcreated": datetime.now()}
             show_editor = True
+    query_tab = request.args.get("tab", "").strip()
+    if query_tab in {"account", "api-keys"}:
+        editor_tab = query_tab
 
     flash = session.pop("manage_users_flash", None)
+    new_api_token = session.pop("manage_users_new_api_token", {})
     flash_html = f'<div class="flash {h(flash.get("type"))}">{h(flash.get("message"))}</div>' if isinstance(flash, dict) else ""
     error_html = f'<div class="error">{h(form_error)}</div>' if form_error else ""
-
     if show_editor:
+        if demo:
+            return demo_mode_iframe_html("manage-users")
         role_options = "".join(
             f'<option value="{h(value)}"{" selected" if (edit_user or {}).get("role") == value else ""}>{h(label)}</option>'
             for value, label in ROLE_OPTIONS.items()
@@ -278,15 +383,93 @@ def handle_request():
                     Last login: {h(format_datetime((edit_user or {}).get("lastlogin")))} |
                     Login count: {h((edit_user or {}).get("logincount") or 0)}
                 </div>"""
-        content = f"""    <div class="header-actions">
-        <h1>{"Edit User" if (edit_user or {}).get("id") else "New User"}</h1>
-        <a class="btn-secondary" href="/admin/manage-users"><i class="fa-solid fa-arrow-left"></i> Back</a>
+        if not (edit_user or {}).get("id"):
+            editor_tab = "account"
+        tabs_html = ""
+        if (edit_user or {}).get("id") and api_enabled:
+            edit_id = h((edit_user or {}).get("id") or "")
+            account_class = "subtab-link active" if editor_tab == "account" else "subtab-link"
+            api_class = "subtab-link active" if editor_tab == "api-keys" else "subtab-link"
+            tabs_html = f"""<div class="subtabs">
+                <a class="{account_class}" href="/admin/manage-users?edit={edit_id}&tab=account">Account</a>
+                <a class="{api_class}" href="/admin/manage-users?edit={edit_id}&tab=api-keys">API Keys</a>
+            </div>"""
+        api_token_panel = ""
+        if (edit_user or {}).get("id") and api_enabled:
+            token_rows = fetch_api_tokens((edit_user or {}).get("id"))
+            create_modal = f"""
+    <div id="apiKeyCreateModal" class="token-modal-backdrop">
+        <div class="token-modal">
+            <h3>Create API Key</h3>
+            <p>Create a one-time key for this user. You can add an optional label and expiration date.</p>
+            <form method="POST" action="/admin/manage-users">
+                <input type="hidden" name="action" value="create_api_token">
+                <input type="hidden" name="user_id" value="{h((edit_user or {}).get("id") or "")}">
+                <input type="hidden" name="editor_tab" value="api-keys">
+                <div class="token-create-form">
+                    <div class="field">
+                        <label for="api_token_label">Label</label>
+                        <input id="api_token_label" name="api_token_label" type="text" maxlength="{API_TOKEN_LABEL_LENGTH}" placeholder="Optional">
+                    </div>
+                    <div class="field">
+                        <label for="api_token_expires_at">Expiration</label>
+                        <input id="api_token_expires_at" name="api_token_expires_at" type="datetime-local">
+                    </div>
+                </div>
+                <div class="token-actions">
+                    <button class="btn-secondary" type="button" onclick="closeApiKeyCreateModal()">Close</button>
+                    <button class="btn-primary" type="submit"><i class="fa-solid fa-key"></i> Create</button>
+                </div>
+            </form>
+        </div>
+    </div>"""
+            reveal_modal = ""
+            if isinstance(new_api_token, dict) and new_api_token.get("value"):
+                reveal_modal = f"""
+    <div id="apiKeyRevealModal" class="token-modal-backdrop active">
+        <div class="token-modal">
+            <h3>API Key Created</h3>
+            <p>You will not be able to retrieve this key again.</p>
+            <div class="token-display">
+                <input id="new-api-key-value" type="password" value="{h(new_api_token.get("value"))}" readonly>
+                <button class="btn-secondary" type="button" onclick="toggleNewApiKeyVisibility()">View</button>
+            </div>
+            <div class="token-actions">
+                <button class="btn-primary" type="button" onclick="copyNewApiKey()">Copy</button>
+                <button class="btn-secondary" type="button" onclick="closeApiKeyRevealModal()">Close</button>
+            </div>
+        </div>
+    </div>"""
+            token_items = "".join(
+                f"""<div class="token-item">
+                    <div class="token-head">
+                        <div>
+                            <div class="token-name">{h(row.get("token_label") or "Untitled key")}</div>
+                        </div>
+                    </div>
+                    <div class="token-meta">
+                        <span>Created: {h(format_datetime(row.get("created_at")))}</span>
+                        <span>Last used: {h(format_datetime(row.get("last_used_at")))}</span>
+                        <span>Expires: {h(format_datetime(row.get("expires_at")))}</span>
+                    </div>
+                </div>"""
+                for row in token_rows
+            ) or '<div class="muted">No API keys yet.</div>'
+            api_token_panel = f"""
+    <div class="card editor-card">
+        <h2>API Keys</h2>
+        <div class="token-toolbar">
+            <button class="btn-primary" type="button" onclick="openApiKeyCreateModal()"><i class="fa-solid fa-plus"></i> Create</button>
+        </div>
+        <div class="token-list">{token_items}</div>
     </div>
-    {flash_html}{error_html}
-    <form class="card editor-card" method="POST" action="/admin/manage-users">
+    {create_modal}
+    {reveal_modal}"""
+        account_panel = f"""<form class="card editor-card" method="POST" action="/admin/manage-users">
         <h2>{"Edit User" if (edit_user or {}).get("id") else "New User"}</h2>
         <input type="hidden" name="action" value="save">
         <input type="hidden" name="user_id" value="{h((edit_user or {}).get("id") or "")}">
+        <input type="hidden" name="editor_tab" value="account">
         <div class="field-grid">
             <div class="field"><label for="username">Username</label><input id="username" name="username" value="{h((edit_user or {}).get("username") or "")}" required></div>
             <div class="field"><label for="email">Email</label><input id="email" name="email" type="email" value="{h((edit_user or {}).get("email") or "")}" placeholder="Optional"></div>
@@ -304,6 +487,52 @@ def handle_request():
             <a class="btn-secondary" href="/admin/manage-users">Cancel</a>
         </div>
     </form>"""
+        modal_script = """
+    <script>
+    function openApiKeyCreateModal() {
+      const modal = document.getElementById('apiKeyCreateModal');
+      if (modal) modal.classList.add('active');
+    }
+    function closeApiKeyCreateModal() {
+      const modal = document.getElementById('apiKeyCreateModal');
+      if (modal) modal.classList.remove('active');
+    }
+    function closeApiKeyRevealModal() {
+      const modal = document.getElementById('apiKeyRevealModal');
+      if (modal) modal.classList.remove('active');
+    }
+    function toggleNewApiKeyVisibility() {
+      const input = document.getElementById('new-api-key-value');
+      if (!input) return;
+      input.type = input.type === 'password' ? 'text' : 'password';
+    }
+    async function copyNewApiKey() {
+      const input = document.getElementById('new-api-key-value');
+      if (!input) return;
+      try {
+        await navigator.clipboard.writeText(input.value);
+      } catch (_error) {
+        input.type = 'text';
+        input.select();
+        document.execCommand('copy');
+        input.type = 'password';
+      }
+    }
+    document.addEventListener('click', function(event) {
+      if (event.target && event.target.classList && event.target.classList.contains('token-modal-backdrop')) {
+        event.target.classList.remove('active');
+      }
+    });
+    </script>"""
+        content = f"""    <div class="header-actions">
+        <h1>{"Edit User" if (edit_user or {}).get("id") else "New User"}</h1>
+        <a class="btn-secondary" href="/admin/manage-users"><i class="fa-solid fa-arrow-left"></i> Back</a>
+    </div>
+    {flash_html}{error_html}
+    {tabs_html}
+    {account_panel if editor_tab == "account" else ""}
+    {api_token_panel if editor_tab == "api-keys" and api_enabled else ""}"""
+        content += modal_script
     else:
         user_items = []
         for row in users:
@@ -312,12 +541,18 @@ def handle_request():
             email = row.get("email") or "No email address"
             can_delete = int(row.get("id") or 0) != 0 and str(row.get("id")) != str(user.get("id")) and not (is_admin_role(role) and admin_users <= 1)
             delete_form = ""
+            delete_onsubmit = "openDemoModePopup('manage-users'); return false;" if demo else "return confirm('Delete this user?')"
             if can_delete:
-                delete_form = f"""<form method="POST" action="/admin/manage-users" onsubmit="return confirm('Delete this user?')">
+                delete_form = f"""<form method="POST" action="/admin/manage-users" onsubmit="{delete_onsubmit}">
                                         <input type="hidden" name="action" value="delete">
                                         <input type="hidden" name="user_id" value="{h(row.get("id"))}">
                                         <button class="icon-action delete" type="submit" title="Delete"><i class="fa-solid fa-trash"></i></button>
                                     </form>"""
+            edit_href = "javascript:openDemoModePopup('manage-users')" if demo else f"/admin/manage-users?edit={h(row.get('id'))}"
+            api_keys_link = ""
+            if api_enabled:
+                api_href = "javascript:openDemoModePopup('manage-users')" if demo else f"/admin/manage-users?edit={h(row.get('id'))}&tab=api-keys"
+                api_keys_link = f'<a class="icon-action" href="{api_href}" title="API Keys"><i class="fa-solid fa-key"></i></a>'
             user_items.append(
                 f"""<li class="user-item">
                             <div class="user-main">
@@ -335,14 +570,16 @@ def handle_request():
                                 </div>
                             </div>
                             <div class="group-actions">
-                                <a class="icon-action" href="/admin/manage-users?edit={h(row.get("id"))}" title="Edit"><i class="fa-solid fa-pen-to-square"></i></a>
+                                <a class="icon-action" href="{edit_href}" title="Edit"><i class="fa-solid fa-pen-to-square"></i></a>
+                                {api_keys_link}
                                 {delete_form}
                             </div>
                         </li>"""
             )
+        new_href = "javascript:openDemoModePopup('manage-users')" if demo else "/admin/manage-users?new=1"
         content = f"""    <div class="header-actions">
         <h1>Manage Users</h1>
-        <a class="btn-primary" href="/admin/manage-users?new=1"><i class="fa-solid fa-plus"></i> New User</a>
+        <a class="btn-primary" href="{new_href}"><i class="fa-solid fa-plus"></i> New User</a>
     </div>
     {flash_html}{error_html}
     <div class="summary-grid">

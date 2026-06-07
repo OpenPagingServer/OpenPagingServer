@@ -14,6 +14,8 @@ def handle_request():
     ctx = legacy_user_context(user)
     if not ctx["is_admin"]:
         abort(403)
+    if demo_mode_enabled():
+        return demo_mode_iframe_html("messages")
 
     message_types = {
         "text+audio": "Audio & visual message",

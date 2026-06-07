@@ -49,6 +49,8 @@ def render_endpoint_action_frame(action):
     user = require_admin()
     if not isinstance(user, dict):
         return user
+    if demo_mode_enabled():
+        return demo_mode_iframe_html("manage-endpoints")
     module = request.args.get("module", "")
     endpoint_id = request.args.get("id", "").strip()
     if action not in {"edit", "delete"} or not safe_name(module) or endpoint_id == "" or len(endpoint_id) > 255:
@@ -63,6 +65,8 @@ def render_endpoint_action_page(action):
     user = require_admin()
     if not isinstance(user, dict):
         return user
+    if demo_mode_enabled():
+        return demo_mode_page("Manage Endpoints", legacy_user_context(user), "endpoints", "manage-endpoints")
     module = request.args.get("module", "")
     endpoint_id = request.args.get("id", "").strip()
     if action not in {"edit", "delete"} or not safe_name(module) or endpoint_id == "" or len(endpoint_id) > 255:

@@ -1,5 +1,5 @@
 from srv.web.app import *
-from srv.web.pages.bells.bell_helpers import bells_page, schedule_or_404, schedule_settings_card
+from srv.web.pages.bells.bell_helpers import bells_demo_return, bells_page, schedule_or_404, schedule_settings_card
 
 
 def handle_request():
@@ -9,6 +9,9 @@ def handle_request():
     ensure_bell_schema()
     sid = int(request.values.get("schedule_id", "0") or 0)
     schedule = schedule_or_404(sid)
+    demo = demo_mode_enabled()
+    if demo and request.method == "POST":
+        return bells_demo_return()
     if request.method == "POST":
         execute("DELETE FROM bell_schedule_groups WHERE schedule_id=%s", (sid,))
         for gid in request.form.getlist("groups"):
@@ -22,7 +25,7 @@ def handle_request():
     <div class="summary-item"><strong>{h(len(groups))}</strong><span class="muted">Available Groups</span></div>
 </div>""" + schedule_settings_card(schedule, "groups") + f"""
 
-<form class="card" method="POST" action="/bells/groups">
+<form class="card" method="POST" action="/bells/groups"{" onsubmit=\"openDemoModePopup('bells'); return false;\"" if demo else ""}>
     <input type="hidden" name="schedule_id" value="{h(sid)}">
     <div class="field"><label>Endpoint groups</label><div class="weekday-row">{checks or '<span class="muted">No groups configured.</span>'}</div></div>
     <button class="btn" type="submit"><i class="fa-solid fa-floppy-disk"></i> Save Groups</button>

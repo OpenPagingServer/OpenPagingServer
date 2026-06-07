@@ -8,6 +8,8 @@ def handle_request():
         return user
     data = settings()
     if request.method == "POST":
+        if demo_mode_enabled():
+            return jsonify(status="error", message="Demo Mode is enabled.") if request.headers.get("X-Requested-With") == "XMLHttpRequest" else demo_mode_page("General Settings", legacy_user_context(user), "settings", "settings")
         show_docs = "1" if request.form.get("show_online_docs") else "0"
         analytics = "1" if request.form.get("analytics") else "0"
         save_setting("show_online_docs", show_docs, "Show GUI links to docs.openpagingserver.org (0/1)")

@@ -42,7 +42,8 @@ def handle_request():
     list_count = int((list_row or {}).get("total") or 0)
     exception_row = query_one("SELECT COUNT(DISTINCT bell_date) AS total FROM bell_calendar_lists")
     exception_count = int((exception_row or {}).get("total") or 0)
-    actions = '<a class="btn secondary" href="/bells/bell-lists"><i class="fa-solid fa-list-check"></i> System Lists</a><a class="btn" href="/bells/new"><i class="fa-solid fa-plus"></i> New Schedule</a>'
+    demo = demo_mode_enabled()
+    actions = '<a class="btn secondary" href="/bells/bell-lists"><i class="fa-solid fa-list-check"></i> System Lists</a><a class="btn" href="' + ("javascript:openDemoModePopup('bells')" if demo else "/bells/new") + '"><i class="fa-solid fa-plus"></i> New Schedule</a>'
     rows = []
     for schedule in schedules:
         enabled = int(schedule.get("enabled") or 0) == 1
@@ -57,7 +58,7 @@ def handle_request():
                         <a class="btn secondary" href="/bells/calendar?{h(urlencode({'schedule_id': schedule['id']}))}"><i class="fa-solid fa-calendar-days"></i> Calendar</a>
                         <a class="btn secondary" href="/bells/lists?{h(urlencode({'schedule_id': schedule['id']}))}"><i class="fa-solid fa-bell"></i> Bells</a>
                         <a class="btn secondary" href="/bells/groups?{h(urlencode({'schedule_id': schedule['id']}))}"><i class="fa-solid fa-user-group"></i> Groups</a>
-                        <a class="btn icon secondary" href="/bells/edit?{h(urlencode({'id': schedule['id']}))}" title="Edit Schedule"><i class="fa-solid fa-pen-to-square"></i></a>
+                        <a class="btn icon secondary" href="{"javascript:openDemoModePopup('bells')" if demo else f"/bells/edit?{h(urlencode({'id': schedule['id']}))}"}" title="Edit Schedule"><i class="fa-solid fa-pen-to-square"></i></a>
                     </div>
                 </li>"""
         )

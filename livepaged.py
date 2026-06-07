@@ -13,6 +13,13 @@ from pathlib import Path
 import pymysql
 from dotenv import load_dotenv
 from endpoints import connect_endpoint_ipc
+from clientd import (
+    desktop_member_user_id,
+    is_desktop_member_token,
+    send_stream_frame,
+    start_desktop_livepage,
+    user_has_connected_client,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -55,8 +62,10 @@ def sip_extension_candidates(extension):
     candidates = [token]
     lowered = token.lower()
     if token.startswith("#"):
+        candidates.append(token[1:])
         candidates.append("%23" + token[1:])
     elif lowered.startswith("%23"):
+        candidates.append(token[3:])
         candidates.append("#" + token[3:])
     return unique_tokens(candidates)
 
@@ -130,6 +139,17 @@ def page_group_from_sip_input(cur, extension):
     return ""
 
 
+def resolve_group_value(cur, group_id):
+    raw = str(group_id or "").strip()
+    if raw == "0":
+        return raw
+    direct_members = fetch_group_members(cur, raw)
+    if direct_members:
+        return raw
+    stored_group = page_group_from_sip_input(cur, raw)
+    return str(stored_group or raw).strip()
+
+
 def parse_rtp_payload(packet):
     if len(packet) < 12:
         return b""
@@ -154,8 +174,9 @@ def resolve_targets(group_id):
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
+            resolved_group = resolve_group_value(cur, group_id)
             target_list = set()
-            if str(group_id) == "0":
+            if str(resolved_group) == "0":
                 try:
                     cur.execute("SELECT `dir` FROM endpointmodulesloaded WHERE enabled = 'true' AND trusted = 'true'")
                     rows = cur.fetchall()
@@ -166,18 +187,42 @@ def resolve_targets(group_id):
                     if row and row[0]:
                         target_list.add(f"{row[0]}/all")
             else:
-                target_list.update(fetch_group_members(cur, group_id))
-                if not target_list:
-                    stored_group = page_group_from_sip_input(cur, group_id)
-                    if stored_group:
-                        page_debug(f"resolve_targets_sip_input_group extension={group_id!r} stored_group={stored_group!r}")
-                        target_list.update(fetch_group_members(cur, stored_group))
+                if resolved_group != str(group_id or "").strip():
+                    page_debug(f"resolve_targets_sip_input_group extension={group_id!r} stored_group={resolved_group!r}")
+                target_list.update(fetch_group_members(cur, resolved_group))
             targets = sorted(target_list)
-            page_debug(f"resolve_targets_done group={group_id!r} targets={targets}")
-            return targets
+            page_debug(f"resolve_targets_done group={group_id!r} resolved_group={resolved_group!r} targets={targets}")
+            return resolved_group, targets
     except Exception as exc:
         page_debug(f"resolve_targets_error group={group_id!r} error={exc.__class__.__name__}: {exc}")
         raise
+    finally:
+        conn.close()
+
+
+def endpoint_targets_only(targets):
+    filtered = []
+    for target in targets or []:
+        token = str(target or "").strip()
+        if not token:
+            continue
+        if is_desktop_member_token(token):
+            continue
+        filtered.append(token)
+    return filtered
+
+
+def connected_desktop_count(group_id):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            resolved_group = resolve_group_value(cur, group_id)
+            if resolved_group == "0":
+                cur.execute("SELECT id FROM users WHERE role NOT IN ('receiver', 'tempreceiver') ORDER BY username ASC")
+                rows = cur.fetchall()
+                return sum(1 for row in rows if row and row[0] and user_has_connected_client(row[0]))
+            members = fetch_group_members(cur, resolved_group)
+        return sum(1 for member in members if is_desktop_member_token(member) and user_has_connected_client(desktop_member_user_id(member)))
     finally:
         conn.close()
 
@@ -195,10 +240,13 @@ class LivePageSession:
         self.local_sock.settimeout(0.5)
         self.local_port = self.local_sock.getsockname()[1]
         self.control_sock = None
+        self.desktop_stream_sock = None
         self.stream_id = uuid.uuid4().hex
         self.stop_event = threading.Event()
         self.thread = None
+        self.resolved_group_id = self.group_id
         self.targets = []
+        self.desktop_clients = 0
         self.cleanup_lock = threading.Lock()
         self.cleaned_up = False
         page_debug(
@@ -208,20 +256,45 @@ class LivePageSession:
 
     def preflight(self):
         page_debug(f"preflight_start stream={self.stream_id} group={self.group_id!r}")
-        self.targets = resolve_targets(self.group_id)
-        if not self.targets:
+        self.resolved_group_id, self.targets = resolve_targets(self.group_id)
+        try:
+            self.desktop_clients = connected_desktop_count(self.group_id)
+        except Exception as exc:
+            self.desktop_clients = 0
+            page_debug(
+                f"desktop_count_error stream={self.stream_id} group={self.group_id!r} "
+                f"resolved_group={self.resolved_group_id!r} error={exc.__class__.__name__}: {exc}"
+            )
+        endpoint_targets = endpoint_targets_only(self.targets)
+        if not endpoint_targets and self.desktop_clients <= 0:
             page_debug(f"preflight_no_targets stream={self.stream_id} group={self.group_id!r}")
             raise RuntimeError("503 Service Unavailable")
-        self.control_sock = connect_endpoint_ipc(timeout=10)
-        command = f"PREPARELIVE {self.stream_id} {self.group_id} {' '.join(self.targets)}\n"
-        page_debug(
-            f"preflight_connect stream={self.stream_id} command={command.strip()!r}"
-        )
-        self.control_sock.sendall(command.encode("utf-8"))
-        response = self.control_sock.recv(1024)
-        page_debug(f"preflight_response stream={self.stream_id} response={response!r}")
-        if b"OK" not in response:
-            raise RuntimeError("503 Service Unavailable")
+        if endpoint_targets:
+            self.control_sock = connect_endpoint_ipc(timeout=10)
+            command = f"PREPARELIVE {self.stream_id} {self.group_id} {' '.join(endpoint_targets)}\n"
+            page_debug(
+                f"preflight_connect stream={self.stream_id} command={command.strip()!r}"
+            )
+            self.control_sock.sendall(command.encode("utf-8"))
+            response = self.control_sock.recv(1024)
+            page_debug(f"preflight_response stream={self.stream_id} response={response!r}")
+            if b"OK" not in response:
+                raise RuntimeError("503 Service Unavailable")
+        try:
+            self.desktop_stream_sock, result = start_desktop_livepage(
+                self.stream_id,
+                self.resolved_group_id,
+                self.sender or "Live Page",
+                codec="mulaw",
+                sample_rate=8000,
+            )
+            self.desktop_clients = int((result or {}).get("matched") or 0)
+        except Exception as exc:
+            page_debug(
+                f"desktop_start_error stream={self.stream_id} group={self.group_id!r} "
+                f"resolved_group={self.resolved_group_id!r} error={exc.__class__.__name__}: {exc}"
+            )
+            self.desktop_clients = 0
         page_debug(f"preflight_ok stream={self.stream_id}")
 
     def start(self):
@@ -248,13 +321,21 @@ class LivePageSession:
                 try:
                     if self.control_sock is not None:
                         self.control_sock.sendall(payload)
-                        packets += 1
-                        bytes_sent += len(payload)
-                        if packets == 1 or packets % 50 == 0:
-                            page_debug(
-                                f"audio_forward stream={self.stream_id} packets={packets} "
-                                f"bytes={bytes_sent} last_payload={len(payload)}"
-                            )
+                    try:
+                        if self.desktop_stream_sock is not None:
+                            send_stream_frame(self.desktop_stream_sock, payload)
+                    except Exception as exc:
+                        page_debug(
+                            f"desktop_audio_error stream={self.stream_id} resolved_group={self.resolved_group_id!r} "
+                            f"error={exc.__class__.__name__}: {exc}"
+                        )
+                    packets += 1
+                    bytes_sent += len(payload)
+                    if packets == 1 or packets % 50 == 0:
+                        page_debug(
+                            f"audio_forward stream={self.stream_id} packets={packets} "
+                            f"bytes={bytes_sent} last_payload={len(payload)} desktop_clients={self.desktop_clients}"
+                        )
                 except OSError:
                     break
         finally:
@@ -282,6 +363,12 @@ class LivePageSession:
         except OSError:
             pass
         self.control_sock = None
+        try:
+            if self.desktop_stream_sock is not None:
+                self.desktop_stream_sock.close()
+        except OSError:
+            pass
+        self.desktop_stream_sock = None
         if self.on_finish is not None:
             try:
                 self.on_finish()
@@ -295,12 +382,20 @@ class WebLivePageSession(LivePageSession):
         return
 
     def send_payload(self, payload):
-        if self.stop_event.is_set() or self.control_sock is None:
+        if self.stop_event.is_set():
             return
         if not payload:
             return
-        self.control_sock.sendall(payload)
-
+        if self.control_sock is not None:
+            self.control_sock.sendall(payload)
+        try:
+            if self.desktop_stream_sock is not None:
+                send_stream_frame(self.desktop_stream_sock, payload)
+        except Exception as exc:
+            page_debug(
+                f"desktop_audio_error stream={self.stream_id} resolved_group={self.resolved_group_id!r} "
+                f"error={exc.__class__.__name__}: {exc}"
+            )
 
 def recv_until(sock, marker, limit=8192):
     data = b""
