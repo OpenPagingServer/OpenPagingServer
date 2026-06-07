@@ -218,9 +218,16 @@ def connected_desktop_count(group_id):
         with conn.cursor() as cur:
             resolved_group = resolve_group_value(cur, group_id)
             if resolved_group == "0":
-                cur.execute("SELECT id FROM users WHERE role NOT IN ('receiver', 'tempreceiver') ORDER BY username ASC")
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM users
+                    WHERE role IS NULL OR role = '' OR role NOT IN ('receiver', 'tempreceiver')
+                    ORDER BY username ASC
+                    """
+                )
                 rows = cur.fetchall()
-                return sum(1 for row in rows if row and row[0] and user_has_connected_client(row[0]))
+                return sum(1 for row in rows if row and row[0] is not None and user_has_connected_client(row[0]))
             members = fetch_group_members(cur, resolved_group)
         return sum(1 for member in members if is_desktop_member_token(member) and user_has_connected_client(desktop_member_user_id(member)))
     finally:
