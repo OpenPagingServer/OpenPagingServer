@@ -358,14 +358,7 @@ def handle_request():
     endpoint_data = endpoint_ipc("LIST_ENDPOINTS")
     endpoint_error = None if endpoint_data.get("ok", True) else endpoint_data.get("error") or "Endpoint manager returned an error."
     endpoint_availability = endpoint_availability_map(endpoint_data)
-    total_online = sum(
-        1
-        for group in groups
-        for member in group_member_tokens(group.get("members"))
-        if group_member_available(member, endpoint_availability)
-    )
-
-    all_unavailable = endpoint_error is None and total_online == 0
+    all_unavailable = endpoint_error is None and not any_recipient_available(endpoint_availability)
     all_disabled = " disabled" if all_unavailable else ""
     all_unavailable_cls = " recipient-row unavailable" if all_unavailable else ""
     all_note = '<span class="recipient-note">No available recipients</span>' if all_unavailable else ""
