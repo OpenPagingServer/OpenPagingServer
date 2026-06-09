@@ -193,14 +193,19 @@ def schedule_settings_card(schedule, active_tab="settings", return_to=""):
         ("groups", "Groups", f"/bells/groups?{urlencode({'schedule_id': sid})}", "fa-user-group"),
     ]
     tab_links = "".join(f'<a class="{"active" if active_tab == key else ""}" href="{h(url)}"><i class="fa-solid {icon}"></i> {h(label)}</a>' for key, label, url, icon in tabs)
-    return f"""<form class="card schedule-settings-card" method="POST" action="/bells/edit"{" onsubmit=\"openDemoModePopup('bells'); return false;\"" if demo else ""}>
+    onsubmit_attr = " onsubmit=\"openDemoModePopup('bells'); return false;\"" if demo else ""
+    return_to_value = h(return_to or request.full_path.rstrip("?"))
+    schedule_name = h(schedule.get("name") or "")
+    schedule_timezone = timezone_options(schedule.get("timezone") or "server")
+    enabled_checked = " checked" if int(schedule.get("enabled") or 0) == 1 else ""
+    return f"""<form class="card schedule-settings-card" method="POST" action="/bells/edit"{onsubmit_attr}>
     <input type="hidden" name="id" value="{h(sid)}">
     <input type="hidden" name="action" value="save">
-    <input type="hidden" name="return_to" value="{h(return_to or request.full_path.rstrip('?'))}">
+    <input type="hidden" name="return_to" value="{return_to_value}">
     <div class="schedule-settings-grid">
-        <div class="field"><label for="schedule_name">Schedule name</label><input id="schedule_name" name="name" value="{h(schedule['name'])}" required></div>
-        <div class="field"><label for="schedule_timezone">Time zone</label><select id="schedule_timezone" name="timezone">{timezone_options(schedule.get("timezone") or "server")}</select></div>
-        <label class="checkbox-row schedule-enabled"><input type="checkbox" name="enabled"{" checked" if int(schedule.get("enabled") or 0) == 1 else ""}><span>Enabled</span></label>
+        <div class="field"><label for="schedule_name">Schedule name</label><input id="schedule_name" name="name" value="{schedule_name}" required></div>
+        <div class="field"><label for="schedule_timezone">Time zone</label><select id="schedule_timezone" name="timezone">{schedule_timezone}</select></div>
+        <label class="checkbox-row schedule-enabled"><input type="checkbox" name="enabled"{enabled_checked}><span>Enabled</span></label>
         <button class="btn" type="submit"><i class="fa-solid fa-floppy-disk"></i> Save Schedule</button>
     </div>
     <div class="schedule-tabs">{tab_links}</div>
