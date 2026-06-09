@@ -325,11 +325,6 @@ def handle_request():
             """
         ) or {}
         body = f"""
-        <div class="summary-grid" style="margin-bottom: 20px;">
-            <div class="summary-item"><strong style="font-weight: normal;">{h(query_one("SELECT COUNT(*) AS total FROM bell_lists WHERE schedule_id=0").get("total") or 0)}</strong><span class="muted">Lists</span></div>
-            <div class="summary-item"><strong style="font-weight: normal;">{h(system_event_count.get("total") or 0)}</strong><span class="muted">Total Bells</span></div>
-        </div>
-        {render_bells_ui(0, "/bells/bell-lists", {}, demo)}
         """
         return bells_page("System Bell Lists", "", '<a class="btn secondary" href="/bells"><i class="fa-solid fa-arrow-left"></i> Back</a>', body, user)
         
@@ -351,10 +346,6 @@ def handle_request():
     ) or {}
     
     body = f"""
-    <div class="summary-grid" style="margin-bottom: 20px;">
-        <div class="summary-item"><strong style="font-weight: normal;">{h(counts.get("custom_lists") or 0)}</strong><span class="muted">Lists</span></div>
-        <div class="summary-item"><strong style="font-weight: normal;">{h(counts.get("custom_bells") or 0)}</strong><span class="muted">Total Bells</span></div>
-    </div>
     {schedule_settings_card(schedule, "bells")}
     {render_bells_ui(sid, "/bells/lists", {"schedule_id": sid}, demo)}
     """
