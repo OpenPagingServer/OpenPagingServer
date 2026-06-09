@@ -198,7 +198,7 @@ def schedule_settings_card(schedule, active_tab="settings", return_to=""):
     <input type="hidden" name="action" value="save">
     <input type="hidden" name="return_to" value="{h(return_to or request.full_path.rstrip('?'))}">
     <div class="schedule-settings-grid">
-        <div class="field"><label for="schedule_name">Schedule name</label><input id="schedule_name" name="name" value="{h(schedule["name"])}" required></div>
+        <div class="field"><label for="schedule_name">Schedule name</label><input id="schedule_name" name="name" value="{h(schedule['name'])}" required></div>
         <div class="field"><label for="schedule_timezone">Time zone</label><select id="schedule_timezone" name="timezone">{timezone_options(schedule.get("timezone") or "server")}</select></div>
         <label class="checkbox-row schedule-enabled"><input type="checkbox" name="enabled"{" checked" if int(schedule.get("enabled") or 0) == 1 else ""}><span>Enabled</span></label>
         <button class="btn" type="submit"><i class="fa-solid fa-floppy-disk"></i> Save Schedule</button>
