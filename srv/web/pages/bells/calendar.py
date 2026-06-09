@@ -44,6 +44,7 @@ def handle_request():
     first_day = datetime.strptime(month + "-01", "%Y-%m-%d").date()
     last_day = date(first_day.year, first_day.month, calendar.monthrange(first_day.year, first_day.month)[1])
     demo = demo_mode_enabled()
+    demo_submit = ' onsubmit="openDemoModePopup(\'bells\'); return false;"' if demo else ""
     if demo and request.method == "POST":
         return bells_demo_return()
     if request.method == "POST":
@@ -97,9 +98,12 @@ def handle_request():
         assignments.setdefault(str(row["bell_date"]), []).append(row)
     prev_month = (first_day - timedelta(days=1)).strftime("%Y-%m")
     next_month = (last_day + timedelta(days=1)).strftime("%Y-%m")
+    prev_url = urlencode({"schedule_id": sid, "month": prev_month})
+    next_url = urlencode({"schedule_id": sid, "month": next_month})
+    back_url = urlencode({"id": sid})
     day_checks = "".join(f'<label class="weekday-chip"><input type="checkbox" name="days_of_week" value="{h(key)}" checked><span>{h(label)}</span></label>' for key, label in weekday_names().items())
     bulk = f"""<div class="card">
-        <form method="POST" action="/bells/calendar" class="bulk-grid" style="margin-top:12px;"{" onsubmit=\"openDemoModePopup('bells'); return false;\"" if demo else ""}>
+        <form method="POST" action="/bells/calendar" class="bulk-grid" style="margin-top:12px;"{demo_submit}>
         <input type="hidden" name="schedule_id" value="{h(sid)}"><input type="hidden" name="month" value="{h(month)}">
         <div class="field"><label for="start_date">Start date</label><input id="start_date" type="date" name="start_date" value="{h(first_day)}" required></div>
         <div class="field"><label for="end_date">End date</label><input id="end_date" type="date" name="end_date" value="{h(last_day)}" required></div>
@@ -115,17 +119,19 @@ def handle_request():
         assigned_html = ""
         for item in assignments.get(current_date, []):
             scope = "System" if int(item.get("schedule_id") or 0) == 0 else "Custom"
-            assigned_html += f"""<div class="day-list"><span>{h(scope + ": " + item["name"])}</span><form method="POST" action="/bells/calendar"{" onsubmit=\"openDemoModePopup('bells'); return false;\"" if demo else ""}><input type="hidden" name="action" value="remove_day_list"><input type="hidden" name="schedule_id" value="{h(sid)}"><input type="hidden" name="month" value="{h(month)}"><input type="hidden" name="bell_date" value="{h(current_date)}"><input type="hidden" name="list_id" value="{h(item["list_id"])}"><button class="btn icon danger" type="submit" title="Remove"><i class="fa-solid fa-xmark"></i></button></form></div>"""
+            item_name = item["name"]
+            item_list_id = item["list_id"]
+            assigned_html += f"""<div class="day-list"><span>{h(scope + ": " + item_name)}</span><form method="POST" action="/bells/calendar"{demo_submit}><input type="hidden" name="action" value="remove_day_list"><input type="hidden" name="schedule_id" value="{h(sid)}"><input type="hidden" name="month" value="{h(month)}"><input type="hidden" name="bell_date" value="{h(current_date)}"><input type="hidden" name="list_id" value="{h(item_list_id)}"><button class="btn icon danger" type="submit" title="Remove"><i class="fa-solid fa-xmark"></i></button></form></div>"""
         if not assigned_html:
             assigned_html = '<div class="muted">Uses the normal schedule.</div>'
         cells += f"""<div class="day">
             <div class="day-number" id="day-{h(current_date)}"><span>{h(day_num)}</span><button class="btn icon secondary" type="button" onclick="toggleDayAdd(this)" title="Add List"><i class="fa-solid fa-plus"></i></button></div>
             {assigned_html}
-            <form method="POST" action="/bells/calendar" class="day-add"{" onsubmit=\"openDemoModePopup('bells'); return false;\"" if demo else ""}><input type="hidden" name="action" value="add_day_list"><input type="hidden" name="schedule_id" value="{h(sid)}"><input type="hidden" name="month" value="{h(month)}"><input type="hidden" name="bell_date" value="{h(current_date)}"><div class="row"><select name="list_id" required><option value="">List</option>{list_options(lists, False)}</select><button class="btn icon" type="submit" title="Add"><i class="fa-solid fa-check"></i></button></div></form>
+            <form method="POST" action="/bells/calendar" class="day-add"{demo_submit}><input type="hidden" name="action" value="add_day_list"><input type="hidden" name="schedule_id" value="{h(sid)}"><input type="hidden" name="month" value="{h(month)}"><input type="hidden" name="bell_date" value="{h(current_date)}"><div class="row"><select name="list_id" required><option value="">List</option>{list_options(lists, False)}</select><button class="btn icon" type="submit" title="Add"><i class="fa-solid fa-check"></i></button></div></form>
         </div>"""
     calendar_html = f"""<div class="card">
-        <div class="calendar-head"><a class="btn secondary" href="/bells/calendar?{h(urlencode({"schedule_id": sid, "month": prev_month}))}"><i class="fa-solid fa-angle-left"></i></a><strong>{h(first_day.strftime("%B %Y"))}</strong><a class="btn secondary" href="/bells/calendar?{h(urlencode({"schedule_id": sid, "month": next_month}))}"><i class="fa-solid fa-angle-right"></i></a></div>
+        <div class="calendar-head"><a class="btn secondary" href="/bells/calendar?{h(prev_url)}"><i class="fa-solid fa-angle-left"></i></a><strong>{h(first_day.strftime("%B %Y"))}</strong><a class="btn secondary" href="/bells/calendar?{h(next_url)}"><i class="fa-solid fa-angle-right"></i></a></div>
         <div class="calendar-grid">{cells}</div>
     </div><script>function toggleDayAdd(button) {{ button.closest('.day').classList.toggle('adding'); }}</script>"""
     body = schedule_settings_card(schedule, "calendar") + bulk + calendar_html
-    return bells_page("Bell Calendar", schedule["name"], f'<a class="btn secondary" href="/bells/edit?{h(urlencode({"id": sid}))}"><i class="fa-solid fa-arrow-left"></i> Back</a>', body, user)
+    return bells_page("Bell Calendar", schedule["name"], f'<a class="btn secondary" href="/bells/edit?{h(back_url)}"><i class="fa-solid fa-arrow-left"></i> Back</a>', body, user)
