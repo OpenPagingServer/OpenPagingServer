@@ -1,6 +1,7 @@
 import importlib
 import math
 import os
+import select
 import struct
 import sys
 import threading
@@ -16,6 +17,14 @@ DEBUG = os.getenv("DEBUG", "").strip().lower() == "true"
 def page_debug(message):
     if DEBUG:
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] sip.triggers.paging {message}")
+
+
+def socket_name(sock):
+    try:
+        host, port = sock.getsockname()[:2]
+        return f"{host}:{port}"
+    except Exception:
+        return "unknown"
 
 
 def load_livepaged():
@@ -98,20 +107,66 @@ class SipLivePageSession(livepaged.LivePageSession):
         super().__init__(remote_ip, remote_port, group_id=group_id, generator=generator, on_finish=on_finish, sender=sender)
         self.seq = 1000
         self.ts = 1000
+        self.rtp_packets_sent = 0
+        self.rtp_send_errors = 0
+        self.rtp_keepalive_payload = None
         page_debug(
             f"session_init stream={self.stream_id} remote={remote_ip}:{remote_port} "
             f"group={self.group_id!r} sender={self.sender!r} local_port={self.local_port}"
         )
 
-    def send_rtp(self, payload):
+    def poll_rtp_source(self, max_packets=4):
+        if self.local_sock is None:
+            return
+        for _ in range(max(1, int(max_packets or 1))):
+            try:
+                ready, _, _ = select.select([self.local_sock], [], [], 0)
+            except Exception:
+                return
+            if not ready:
+                return
+            try:
+                packet, addr = self.local_sock.recvfrom(4096)
+            except Exception:
+                return
+            self.rtp_packets_received = int(getattr(self, "rtp_packets_received", 0) or 0) + 1
+            if self.rtp_packets_received <= 3 or self.rtp_packets_received % 50 == 0:
+                page_debug(
+                    f"rtp_poll_recv stream={self.stream_id} packet={self.rtp_packets_received} "
+                    f"local={socket_name(self.local_sock)} remote={addr[0]}:{addr[1]} bytes={len(packet)}"
+                )
+            try:
+                self.learn_rtp_source(addr, packet)
+            except Exception:
+                pass
+
+    def send_rtp(self, payload, poll_source=True):
         if getattr(self, "rtp_paused", False):
             return
         packet = make_rtp_packet(self.seq, self.ts, payload, pt=0)
         try:
             if self.local_sock is not None:
+                if poll_source:
+                    self.poll_rtp_source()
                 self.local_sock.sendto(packet, (self.remote_ip, self.remote_port))
-        except Exception:
-            pass
+                self.rtp_packets_sent += 1
+                if self.rtp_packets_sent <= 3 or self.rtp_packets_sent % 50 == 0:
+                    page_debug(
+                        f"rtp_send stream={self.stream_id} packet={self.rtp_packets_sent} "
+                        f"local={socket_name(self.local_sock)} remote={self.remote_ip}:{self.remote_port} bytes={len(packet)}"
+                    )
+            else:
+                if self.rtp_send_errors == 0:
+                    page_debug(f"rtp_send_no_socket stream={self.stream_id} remote={self.remote_ip}:{self.remote_port}")
+                self.rtp_send_errors += 1
+        except Exception as exc:
+            self.rtp_send_errors += 1
+            if self.rtp_send_errors <= 3 or self.rtp_send_errors % 50 == 0:
+                page_debug(
+                    f"rtp_send_error stream={self.stream_id} errors={self.rtp_send_errors} "
+                    f"local={socket_name(self.local_sock)} remote={self.remote_ip}:{self.remote_port} "
+                    f"error={exc.__class__.__name__}: {exc}"
+                )
         self.seq = (self.seq + 1) & 0xFFFF
         self.ts = (self.ts + 160) & 0xFFFFFFFF
 
@@ -184,12 +239,14 @@ class SipLivePageSession(livepaged.LivePageSession):
                 self.local_sock.setblocking(False)
                 try:
                     while True:
-                        self.local_sock.recvfrom(4096)
+                        packet, addr = self.local_sock.recvfrom(4096)
+                        self.learn_rtp_source(addr, packet)
                 except Exception:
                     pass
                 self.local_sock.setblocking(True)
                 self.local_sock.settimeout(0.5)
-            page_debug(f"run_live_audio_start stream={self.stream_id}")
+            self.rtp_keepalive_payload = SILENCE_FRAME
+            page_debug(f"run_live_audio_start stream={self.stream_id} keepalive=20ms")
             super().run()
         finally:
             page_debug(f"run_cleanup stream={self.stream_id}")

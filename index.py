@@ -47,6 +47,7 @@ livepaged_proc = None
 belld_proc = None
 analytics_proc = None
 webd_proc = None
+multicastgateway_proc = None
 endpoint_manager = None
 sip_server = None
 
@@ -313,6 +314,53 @@ def candidate_project_pythons():
     return [path for path in candidates if path.exists()]
 
 
+def project_dotvenv_python():
+    if os.name == "nt":
+        candidates = [
+            BASE_DIR / ".venv" / "Scripts" / "python.exe",
+            BASE_DIR / ".venv" / "Scripts" / "python",
+        ]
+    else:
+        candidates = [
+            BASE_DIR / ".venv" / "bin" / "python",
+            BASE_DIR / ".venv" / "bin" / "python3",
+        ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def same_python_path(left, right):
+    try:
+        return Path(left).resolve() == Path(right).resolve()
+    except OSError:
+        return os.path.abspath(str(left)) == os.path.abspath(str(right))
+
+
+def maybe_rerun_debug_report_in_dotvenv():
+    venv_python = project_dotvenv_python()
+    if venv_python is None:
+        return
+    os.environ.setdefault("OPS_DEBUG_REPORT_PYTHON", str(venv_python))
+    if os.environ.get("OPS_DEBUG_REPORT_VENV_REEXEC") == "1":
+        return
+    if same_python_path(venv_python, sys.executable):
+        return
+
+    env = os.environ.copy()
+    env["OPS_DEBUG_REPORT_VENV_REEXEC"] = "1"
+    env["OPS_DEBUG_REPORT_PYTHON"] = str(venv_python)
+    env["VIRTUAL_ENV"] = str(BASE_DIR / ".venv")
+    env["PATH"] = str(venv_python.parent) + os.pathsep + env.get("PATH", "")
+    completed = subprocess.run(
+        [str(venv_python), str((BASE_DIR / "index.py").resolve()), *sys.argv[1:]],
+        cwd=BASE_DIR,
+        env=env,
+    )
+    raise SystemExit(completed.returncode)
+
+
 def _windows_running_python():
     script_path = str((BASE_DIR / "index.py").resolve()).replace("\\", "\\\\")
     ps_script = rf"""
@@ -372,6 +420,17 @@ def detect_running_python():
     return _posix_running_python()
 
 
+def already_running_message():
+    return "Open Paging Server is already running...\n\nCLI interface is coming soon!"
+
+
+def refuse_second_server_launch():
+    if not detect_running_python():
+        return False
+    print(already_running_message())
+    return True
+
+
 def gather_python_environment_from_interpreter(interpreter):
     if Path(interpreter).resolve() == Path(sys.executable).resolve():
         try:
@@ -419,6 +478,11 @@ def gather_python_environment_from_interpreter(interpreter):
 
 
 def choose_python_environment():
+    preferred_python = os.getenv("OPS_DEBUG_REPORT_PYTHON", "").strip()
+    if preferred_python and Path(preferred_python).exists():
+        info = gather_python_environment_from_interpreter(preferred_python)
+        return preferred_python, info
+
     running_python = detect_running_python()
     if running_python:
         info = gather_python_environment_from_interpreter(running_python)
@@ -1010,7 +1074,7 @@ def handle_debug_report():
 
 
 def shutdown(sig, frame):
-    global messaged_proc, livepaged_proc, belld_proc, webd_proc, endpoint_manager
+    global messaged_proc, livepaged_proc, belld_proc, webd_proc, multicastgateway_proc, endpoint_manager
     if endpoint_manager and hasattr(endpoint_manager, "shutdown_all"):
         endpoint_manager.shutdown_all()
 
@@ -1029,6 +1093,9 @@ def shutdown(sig, frame):
     if webd_proc:
         webd_proc.terminate()
 
+    if multicastgateway_proc:
+        multicastgateway_proc.terminate()
+
     stop_analytics()
 
     if sip_server is not None and hasattr(sip_server, "shutdown"):
@@ -1041,7 +1108,7 @@ def shutdown(sig, frame):
 
 
 def main():
-    global messaged_proc, livepaged_proc, belld_proc, webd_proc, endpoint_manager, sip_server
+    global messaged_proc, livepaged_proc, belld_proc, webd_proc, multicastgateway_proc, endpoint_manager, sip_server
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
@@ -1073,6 +1140,11 @@ def main():
         webd_proc = subprocess.Popen([sys.executable, str(webd_path)], cwd=BASE_DIR)
         core.log(f"web worker started pid={webd_proc.pid}")
 
+    multicastgateway_path = BASE_DIR / "multicastgatewayd.py"
+    if multicastgateway_path.exists():
+        multicastgateway_proc = subprocess.Popen([sys.executable, str(multicastgateway_path)], cwd=BASE_DIR)
+        core.log(f"multicast gateway worker started pid={multicastgateway_proc.pid}")
+
     sip_server.start()
     core.log("SIP server started")
 
@@ -1089,5 +1161,8 @@ def main():
 
 if __name__ == "__main__":
     if "--debug-report" in sys.argv or "-Dr" in sys.argv:
+        maybe_rerun_debug_report_in_dotvenv()
         raise SystemExit(handle_debug_report())
+    if refuse_second_server_launch():
+        raise SystemExit(0)
     main()

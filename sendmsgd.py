@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import re
 import socket
 import sys
 import time
@@ -19,7 +20,13 @@ from broadcasts import (
     fetch_template,
     is_audio_type,
 )
-from endpoints import connect_endpoint_ipc
+from endpoints import (
+    MULTICAST_RTP_MODULE,
+    connect_endpoint_ipc,
+    discover_endpoint_packages,
+    module_type_has_output,
+    multicast_rtp_endpoint_count,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -40,7 +47,16 @@ FALLBACK_ASSET_DIRS = [
 ]
 
 def module_is_output_capable(module_name):
-    return str(module_name or "") != "siptrunks"
+    module_name = str(module_name or "").strip()
+    if not module_name or module_name == "siptrunks":
+        return False
+    if module_name == MULTICAST_RTP_MODULE:
+        return multicast_rtp_endpoint_count() > 0
+    package = discover_endpoint_packages(extract_if_trusted=False).get(module_name)
+    if not package or not package.get("trusted"):
+        return False
+    manifest = package.get("manifest") or {}
+    return module_type_has_output(manifest.get("input_type") or manifest.get("type") or "Output")
 
 def get_db_connection():
     return pymysql.connect(
@@ -90,6 +106,8 @@ def resolve_group_targets(group_id):
                 for row in rows:
                     if row and row[0] and module_is_output_capable(row[0]):
                         target_list.add(f"{row[0]}/all")
+                if module_is_output_capable(MULTICAST_RTP_MODULE):
+                    target_list.add(f"{MULTICAST_RTP_MODULE}/all")
             else:
                 for gid in str(group_id or "").split("."):
                     gid = gid.strip()
@@ -117,11 +135,26 @@ def resolve_audio_file(audio_file):
     candidate = Path(audio_file)
     if candidate.is_file():
         return str(candidate)
+    raw = str(audio_file or "").replace("\0", "").replace("\\", "/").split("/")[-1].strip()
+    candidates = []
+    if raw:
+        candidates.append(raw)
+        secure = re.sub(r"[^A-Za-z0-9_.-]", "_", raw).strip("._")
+        if secure and secure not in candidates:
+            candidates.append(secure)
     search_roots = [Path(ASSET_PATH), *FALLBACK_ASSET_DIRS]
     for root in search_roots:
-        path = root / audio_file
-        if path.exists():
-            return str(path)
+        for name in candidates:
+            path = root / name
+            if path.exists():
+                return str(path)
+        lowered = {name.lower() for name in candidates}
+        try:
+            for path in root.iterdir():
+                if path.is_file() and path.name.lower() in lowered:
+                    return str(path)
+        except OSError:
+            continue
     return None
 
 def get_all_audio_frames(audio_files_str):
@@ -279,7 +312,7 @@ def main():
                 sys.exit(1)
             broadcast_id, expires_rule = create_broadcast_from_template(cur, template, group_id, sender="sendmsgd")
             expire_message_rule_broadcasts(cur, expires_rule, exclude_broadcast_ids=[broadcast_id])
-            expire_broadcasts_triggered_by_template(cur, message_id)
+            expire_broadcasts_triggered_by_template(cur, message_id, exclude_broadcast_ids=[broadcast_id])
         conn.commit()
     finally:
         conn.close()

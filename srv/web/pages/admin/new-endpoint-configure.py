@@ -38,6 +38,31 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 }
 """
 
+FRAME_SCRIPT = r"""
+(function() {
+  const frame = document.getElementById('endpointFrame');
+  function applyHeight(height) {
+    if (!frame) return;
+    const numeric = Number(height);
+    if (!Number.isFinite(numeric) || numeric <= 0) return;
+    frame.style.height = Math.max(360, Math.ceil(numeric) + 8) + 'px';
+  }
+  window.addEventListener('message', function(event) {
+    if (event.origin !== window.location.origin) return;
+    if (!event.data || event.data.type !== 'ops-frame-height') return;
+    applyHeight(event.data.height);
+  });
+  if (frame) {
+    frame.addEventListener('load', function() {
+      try {
+        applyHeight(frame.contentWindow.document.documentElement.scrollHeight);
+      } catch (_error) {
+      }
+    });
+  }
+})();
+"""
+
 
 def handle_request():
     user = require_admin()
@@ -60,6 +85,6 @@ def handle_request():
         <a class="back-link" href="/admin/new-endpoint"><i class="fa-solid fa-arrow-left"></i> Modules</a>
     </div>
     <div class="frame-shell">
-        <iframe class="form-frame" sandbox="allow-forms allow-same-origin allow-scripts allow-top-navigation" src="{h(frame_src)}" title="{h(module_info.get("name") or module)} endpoint form"></iframe>
+        <iframe id="endpointFrame" class="form-frame" sandbox="allow-forms allow-same-origin allow-scripts allow-top-navigation" src="{h(frame_src)}" title="{h(module_info.get("name") or module)} endpoint form"></iframe>
     </div>"""
-    return legacy_page(f"Add {module_info.get('name') or module} Endpoint", ctx, "endpoints", CONFIGURE_STYLE, content)
+    return legacy_page(f"Add {module_info.get('name') or module} Endpoint", ctx, "endpoints", CONFIGURE_STYLE, content, FRAME_SCRIPT)

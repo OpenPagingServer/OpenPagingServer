@@ -3,7 +3,13 @@ from srv.web.pages.messages.form_common import (
     MESSAGE_FORM_SCRIPT,
     MESSAGE_FORM_STYLE,
     audio_transfer_html,
+    message_expiration_field_html,
+    message_expiration_from_form,
+    message_variable_field_html,
+    message_variable_guide_html,
     message_multiline_text,
+    vendor_specific_editor_html,
+    vendor_specific_from_form,
 )
 
 def handle_request():
@@ -15,6 +21,7 @@ def handle_request():
         abort(403)
     if demo_mode_enabled():
         return demo_mode_iframe_html("messages")
+    ensure_message_vendor_schema()
 
     msgid = request.values.get("msgid", "")
     if not re.fullmatch(r"\d+", str(msgid or "")):
@@ -49,7 +56,11 @@ def handle_request():
             if show_audio and "audio" in columns:
                 updates["audio"] = ":".join([v.strip() for v in request.form.getlist("audio_files[]") if v.strip()])
             if "expires" in columns:
-                updates["expires"] = request.form.get("expires", "manual").strip() or "manual"
+                updates["expires"] = message_expiration_from_form(request.form)
+            if "priority" in columns:
+                updates["priority"] = request.form.get("priority", "Normal")
+            if "vendor_specific" in columns:
+                updates["vendor_specific"] = vendor_specific_from_form(request.form, row.get("vendor_specific"))
             if updates:
                 execute(
                     f"UPDATE messages SET {', '.join('`'+k+'`=%s' for k in updates)} WHERE messageid=%s",
@@ -61,6 +72,10 @@ def handle_request():
             row.update(request.form.to_dict())
 
     selected_audio = [item for item in str(row.get("audio") or "").split(":") if item.strip()]
+    expiration_messages = query_all(
+        "SELECT messageid, name FROM messages WHERE messageid <> %s ORDER BY name ASC, messageid ASC",
+        (msgid,),
+    )
     color_value = str(row.get("color") or "").strip().lstrip("#").upper()
     color_picker = "#" + color_value if re.fullmatch(r"[A-Fa-f0-9]{6}", color_value) else "#000000"
     error_html = f'<div class="error">{h(error)}</div>' if error else ""
@@ -68,18 +83,18 @@ def handle_request():
     if show_visual:
         visual_html = f"""
             <div id="visual-fields">
-                <div class="form-group">
-                    <label class="main-label" for="shortmessage">Short Message</label>
-                    <p class="help-text">Enter the short text message. Usually shown on previews and on wall-mounted devices. This should be brief. You can use variables.</p>
-                    <input type="text" name="shortmessage" id="shortmessage" class="form-control" value="{h(row.get("shortmessage"))}">
-                </div>
-
-                <div class="form-group">
-                    <label class="main-label" for="longmessage">Long Message</label>
-                    <p class="help-text">Enter the long text message. Usually shown on apps, and in a "more details" section. This should contain as much information as a user would need to know about the situation or incident associated with the message.</p>
-                    <textarea name="longmessage" id="longmessage" class="form-control textarea-long" rows="7" wrap="soft">{h(row.get("longmessage"))}</textarea>
-                </div>
-
+{message_variable_field_html(
+    "shortmessage",
+    "Short Message",
+    f'<input type="text" name="shortmessage" id="shortmessage" class="form-control" value="{h(row.get("shortmessage"))}">',
+    "Enter the short text message. Usually shown on previews and on wall-mounted devices. This should be brief. You can use variables.",
+)}
+{message_variable_field_html(
+    "longmessage",
+    "Long Message",
+    f'<textarea name="longmessage" id="longmessage" class="form-control textarea-long" rows="7" wrap="soft">{h(row.get("longmessage"))}</textarea>',
+    'Enter the long text message. Usually shown on apps, and in a "more details" section. This should contain as much information as a user would need to know about the situation or incident associated with the message.',
+)}
                 <div class="form-group">
                     <label class="main-label">Color</label>
                     <p class="help-text">Certain endpoints can show a color-coded message.</p>
@@ -97,6 +112,11 @@ def handle_request():
                 <p class="help-text">Select audio files to include in this message. The files will play in the order listed in the selected column. You can click to select and use buttons, or drag and drop to move and reorder.</p>
                 {audio_transfer_html(audio_files(), selected_audio)}
             </div>"""
+    vendor_specific_html = vendor_specific_editor_html(
+        row.get("vendor_specific") or "",
+        message=row,
+        context={"mode": "message_edit", "message_id": msgid},
+    )
     content = f"""    <div class="header-actions">
         <h1>Edit Message</h1>
     </div>
@@ -115,16 +135,25 @@ def handle_request():
             {visual_html}
             {audio_html}
 
+            {message_expiration_field_html(expiration_messages, row.get("expires") or "manual")}
+
             <div class="form-group">
-                <label class="main-label" for="expires">Expiration</label>
-                <p class="help-text">Use 30m or 15m, msg=3 or msg=3.4, or manual for no automatic expiration.</p>
-                <input type="text" name="expires" id="expires" class="form-control" value="{h(row.get("expires") or "manual")}">
+                <label class="main-label" for="priority">Priority</label>
+                <select name="priority" id="priority" class="form-control">
+                    <option value="Low"{" selected" if str(row.get("priority") or "Normal") == "Low" else ""}>Low</option>
+                    <option value="Normal"{" selected" if str(row.get("priority") or "Normal") == "Normal" else ""}>Normal</option>
+                    <option value="High"{" selected" if str(row.get("priority") or "Normal") == "High" else ""}>High</option>
+                    <option value="Emergency"{" selected" if str(row.get("priority") or "Normal") == "Emergency" else ""}>Emergency</option>
+                </select>
             </div>
+
+            {vendor_specific_html}
 
             <div style="margin-top: 20px;">
                 <button type="submit" class="btn-primary">Save Message</button>
                 <a href="/messages/" style="margin-left:10px; color:#777; text-decoration:none;">Cancel</a>
             </div>
         </form>
-    </div>"""
+    </div>
+{message_variable_guide_html() if show_visual else ""}"""
     return legacy_page("Edit Message", ctx, "messages", MESSAGE_FORM_STYLE, content, MESSAGE_FORM_SCRIPT)

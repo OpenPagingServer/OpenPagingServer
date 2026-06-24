@@ -2,6 +2,7 @@ import os
 import base64
 import hashlib
 import json
+import select
 import socket
 import struct
 import threading
@@ -37,6 +38,23 @@ WS_PORT = int(os.getenv("LIVEPAGED_WS_PORT", "50010"))
 def page_debug(message):
     if DEBUG:
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] livepaged {message}")
+
+
+def rtp_socket_name(sock):
+    try:
+        host, port = sock.getsockname()[:2]
+        return f"{host}:{port}"
+    except Exception:
+        return "unknown"
+
+
+def latchable_rtp_packet(packet):
+    if len(packet) < 12:
+        return False
+    if ((packet[:1] or b"\x00")[0] >> 6) != 2:
+        return False
+    packet_type = packet[1] if len(packet) > 1 else 0
+    return not (192 <= packet_type <= 223)
 
 
 def get_db_connection():
@@ -256,10 +274,39 @@ class LivePageSession:
         self.desktop_clients = 0
         self.cleanup_lock = threading.Lock()
         self.cleaned_up = False
+        self.rtp_packets_received = 0
         page_debug(
             f"session_init stream={self.stream_id} remote={self.remote_ip}:{self.remote_port} "
             f"group={self.group_id!r} sender={self.sender!r} local_port={self.local_port}"
         )
+
+    def learn_rtp_source(self, addr, packet):
+        if not getattr(self, "rtp_latching_enabled", False):
+            return False
+        if not addr or len(addr) < 2 or not latchable_rtp_packet(packet):
+            return False
+        source_ip = str(addr[0] or "").strip()
+        try:
+            source_port = int(addr[1] or 0)
+        except Exception:
+            source_port = 0
+        current_port = int(getattr(self, "remote_port", 0) or 0)
+        if (
+            not source_ip
+            or source_port <= 0
+            or (current_port > 0 and current_port % 2 == 0 and source_port == current_port + 1 and source_port % 2 == 1)
+        ):
+            return False
+        old_ip = str(getattr(self, "remote_ip", "") or "")
+        old_port = int(getattr(self, "remote_port", 0) or 0)
+        self.remote_ip = source_ip
+        self.remote_port = source_port
+        if (old_ip, old_port) != (source_ip, source_port):
+            page_debug(
+                f"rtp_latch stream={self.stream_id} local={rtp_socket_name(self.local_sock)} "
+                f"old={old_ip}:{old_port} new={source_ip}:{source_port}"
+            )
+        return True
 
     def preflight(self):
         page_debug(f"preflight_start stream={self.stream_id} group={self.group_id!r}")
@@ -312,14 +359,48 @@ class LivePageSession:
     def run(self):
         packets = 0
         bytes_sent = 0
+        keepalive_payload = getattr(self, "rtp_keepalive_payload", None)
+        next_keepalive = time.monotonic()
+        if keepalive_payload and hasattr(self, "send_rtp"):
+            try:
+                self.local_sock.setblocking(False)
+            except OSError:
+                pass
         try:
             while not self.stop_event.is_set():
                 try:
-                    packet, _ = self.local_sock.recvfrom(4096)
+                    local_sock = self.local_sock
+                    if local_sock is None:
+                        break
+                    if keepalive_payload and hasattr(self, "send_rtp"):
+                        now = time.monotonic()
+                        wait = max(0.0, min(0.02, next_keepalive - now))
+                        ready, _, _ = select.select([local_sock], [], [], wait)
+                        if not ready:
+                            now = time.monotonic()
+                            if now >= next_keepalive:
+                                try:
+                                    self.send_rtp(keepalive_payload, poll_source=False)
+                                except TypeError:
+                                    self.send_rtp(keepalive_payload)
+                                next_keepalive = now + 0.02
+                            continue
+                    packet, addr = local_sock.recvfrom(4096)
+                except (AttributeError, ValueError):
+                    break
                 except socket.timeout:
+                    continue
+                except BlockingIOError:
                     continue
                 except OSError:
                     break
+                self.rtp_packets_received += 1
+                if self.rtp_packets_received <= 3 or self.rtp_packets_received % 50 == 0:
+                    page_debug(
+                        f"rtp_recv stream={self.stream_id} packet={self.rtp_packets_received} "
+                        f"local={rtp_socket_name(self.local_sock)} remote={addr[0]}:{addr[1]} bytes={len(packet)}"
+                    )
+                self.learn_rtp_source(addr, packet)
                 payload = parse_rtp_payload(packet)
                 if not payload:
                     continue
@@ -346,7 +427,10 @@ class LivePageSession:
                 except OSError:
                     break
         finally:
-            page_debug(f"run_end stream={self.stream_id} packets={packets} bytes={bytes_sent}")
+            page_debug(
+                f"run_end stream={self.stream_id} packets={packets} bytes={bytes_sent} "
+                f"rtp_sent={getattr(self, 'rtp_packets_sent', 0)} rtp_recv={getattr(self, 'rtp_packets_received', 0)}"
+            )
             self.cleanup()
 
     def stop(self):

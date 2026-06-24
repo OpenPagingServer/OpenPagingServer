@@ -8,8 +8,11 @@ import re
 import secrets
 import socket
 import sys
+import threading
+import time
 import traceback
 import uuid
+from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlencode
@@ -72,6 +75,10 @@ APP_DEBUG = str(os.getenv("DEBUG", "")).strip().lower() in {"1", "true", "yes", 
 TRACEBACKS = {}
 API_TOKEN_LABEL_LENGTH = 120
 API_TOKEN_HASHER = PasswordHasher() if PasswordHasher is not None else None
+MESSAGE_VENDOR_SCHEMA_READY = False
+WEB_RATE_LIMIT_BUCKETS = {}
+WEB_RATE_LIMIT_LOCK = threading.Lock()
+WEB_RATE_LIMIT_EXEMPT_PREFIXES = ("/bundled-assets/", "/assets/file/", "/favicon.ico")
 
 app = Flask(
     __name__,
@@ -85,6 +92,73 @@ app.config.update(
     MAX_CONTENT_LENGTH=128 * 1024 * 1024,
 )
 DEMO_MODE = str(os.getenv("DEMO_MODE", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def int_env(name, default):
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def client_ip():
+    return str(request.remote_addr or "unknown")
+
+
+def rate_limit_exceeded(scope, key, limit, window_seconds, buckets=WEB_RATE_LIMIT_BUCKETS, lock=WEB_RATE_LIMIT_LOCK):
+    if limit <= 0 or window_seconds <= 0:
+        return False, 0
+    now = time.monotonic()
+    bucket_key = (scope, str(key or "unknown"))
+    with lock:
+        bucket = buckets.setdefault(bucket_key, deque())
+        cutoff = now - window_seconds
+        while bucket and bucket[0] <= cutoff:
+            bucket.popleft()
+        if len(bucket) >= limit:
+            retry_after = max(1, int(window_seconds - (now - bucket[0])))
+            return True, retry_after
+        bucket.append(now)
+    return False, 0
+
+
+def rate_limited_response(retry_after):
+    response = Response("Too many requests. Please wait and try again.", status=429, mimetype="text/plain")
+    response.headers["Retry-After"] = str(max(1, int(retry_after or 1)))
+    return response
+
+
+def check_rate_limit(scope, key, limit, window_seconds):
+    limited, retry_after = rate_limit_exceeded(scope, key, limit, window_seconds)
+    if limited:
+        return rate_limited_response(retry_after)
+    return None
+
+
+@app.before_request
+def enforce_web_rate_limits():
+    if str(os.getenv("WEB_RATE_LIMIT_ENABLE", "1")).strip().lower() in {"0", "false", "no", "off"}:
+        return None
+    path = request.path or ""
+    if any(path.startswith(prefix) for prefix in WEB_RATE_LIMIT_EXEMPT_PREFIXES):
+        return None
+    ip_key = client_ip()
+    checks = [
+        ("web-ip-minute", ip_key, int_env("WEB_RATE_LIMIT_IP_PER_MINUTE", 240), 60),
+        ("web-ip-hour", ip_key, int_env("WEB_RATE_LIMIT_IP_PER_HOUR", 3000), 3600),
+    ]
+    user_id = session.get("user_id")
+    if user_id not in (None, ""):
+        checks.append(("web-user-minute", user_id, int_env("WEB_RATE_LIMIT_USER_PER_MINUTE", 300), 60))
+    if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        checks.append(("web-post-ip-minute", ip_key, int_env("WEB_RATE_LIMIT_POST_IP_PER_MINUTE", 60), 60))
+        if user_id not in (None, ""):
+            checks.append(("web-post-user-minute", user_id, int_env("WEB_RATE_LIMIT_POST_USER_PER_MINUTE", 45), 60))
+    for scope, key, limit, window_seconds in checks:
+        response = check_rate_limit(scope, key, limit, window_seconds)
+        if response is not None:
+            return response
+    return None
 
 
 def dispatch_web_page(relative_path):
@@ -176,6 +250,24 @@ def save_setting(parameter, value, description):
 def table_columns(table_name):
     rows = query_all(f"SHOW COLUMNS FROM `{table_name}`")
     return {row["Field"] for row in rows if row.get("Field")}
+
+
+def ensure_message_vendor_schema():
+    global MESSAGE_VENDOR_SCHEMA_READY
+    if MESSAGE_VENDOR_SCHEMA_READY:
+        return
+    statements = []
+    message_columns = table_columns("messages")
+    if "vendor_specific" not in message_columns:
+        statements.append(("ALTER TABLE messages ADD COLUMN vendor_specific TEXT DEFAULT NULL", ()))
+    broadcast_columns = table_columns("broadcasts")
+    if "vendor_specific" not in broadcast_columns:
+        statements.append(("ALTER TABLE broadcasts ADD COLUMN vendor_specific TEXT DEFAULT NULL", ()))
+    else:
+        statements.append(("ALTER TABLE broadcasts MODIFY COLUMN vendor_specific TEXT DEFAULT NULL", ()))
+    if statements:
+        execute_many(statements)
+    MESSAGE_VENDOR_SCHEMA_READY = True
 
 
 def truthy(value):
@@ -718,6 +810,8 @@ def endpoint_output_capable(endpoint):
 def endpoint_is_available(endpoint):
     if not endpoint_output_capable(endpoint):
         return False
+    if "available" in endpoint:
+        return bool(endpoint.get("available"))
     return str(endpoint.get("status") or "").strip().lower() in {"online", "configured", "ready", "ok", "up"}
 
 
@@ -813,6 +907,8 @@ def discovered_endpoint_modules():
             "requirements": manifest.get("requirements") or [],
             "trusted": trusted,
             "can_load": trusted,
+            "input_capable": endpoints.module_type_has_input(manifest.get("input_type") or manifest.get("type") or "Output"),
+            "output_capable": endpoints.module_type_has_output(manifest.get("input_type") or manifest.get("type") or "Output"),
             "signature_state": verification.get("signature_state") or "unsigned",
             "signature_label": verification.get("signature_label") or "",
             "signer": verification.get("organization") or "",
@@ -846,23 +942,43 @@ def endpoint_module_state_map(modules=None):
 
 
 def builtin_endpoint_modules():
-    web_mod = endpoints.load_endpoint_web_module("siptrunks", missing_ok=True)
+    sip_web_mod = endpoints.load_endpoint_web_module("siptrunks", missing_ok=True)
+    multicast_web_mod = endpoints.load_endpoint_web_module(endpoints.MULTICAST_RTP_MODULE, missing_ok=True)
     return {
         "siptrunks": {
             "module": "siptrunks",
             "name": "SIP Trunks",
-            "description": "Built-in SIP trunk and SIP dialplan endpoint management.",
+            "description": "Built-in SIP trunk, SIP dialplan, and SIP number endpoint management.",
             "developer": "Open Paging Server",
-            "input_type": "Input",
+            "input_type": "Input+Output",
             "version": endpoints.OPS_VERSION,
             "enabled": True,
             "loaded": True,
             "trusted": True,
             "can_load": True,
             "system_builtin": True,
+            "input_capable": True,
+            "output_capable": True,
             "has_settings_page": False,
-            "has_forms": bool(getattr(web_mod, "forms", None)) if web_mod else False,
-        }
+            "has_forms": bool(getattr(sip_web_mod, "forms", None)) if sip_web_mod else False,
+        },
+        endpoints.MULTICAST_RTP_MODULE: {
+            "module": endpoints.MULTICAST_RTP_MODULE,
+            "name": endpoints.MULTICAST_RTP_NAME,
+            "description": endpoints.MULTICAST_RTP_DESCRIPTION,
+            "developer": "Open Paging Server",
+            "input_type": "Output",
+            "version": endpoints.OPS_VERSION,
+            "enabled": True,
+            "loaded": True,
+            "trusted": True,
+            "can_load": True,
+            "system_builtin": True,
+            "input_capable": False,
+            "output_capable": True,
+            "has_settings_page": False,
+            "has_forms": bool(getattr(multicast_web_mod, "forms", None)) if multicast_web_mod else False,
+        },
     }
 
 
@@ -1096,19 +1212,25 @@ def messages_edit():
     return dispatch_web_page("messages/edit")
 
 
-def create_broadcast(message_id, groups, sender):
+def create_broadcast(message_id, groups, sender, overrides=None):
     sys.path.insert(0, str(BASE_DIR))
-    from broadcasts import create_broadcast_from_template, expire_broadcasts_triggered_by_template, expire_message_rule_broadcasts, fetch_template
+    from broadcasts import (
+        create_broadcast_from_template,
+        expire_broadcasts_triggered_by_template,
+        expire_message_rule_broadcasts,
+        fetch_template,
+    )
 
+    ensure_message_vendor_schema()
     conn = db()
     try:
         with conn.cursor() as cur:
             template = fetch_template(cur, message_id)
             if not template:
                 raise RuntimeError("Message not found")
-            broadcast_id, expires_rule = create_broadcast_from_template(cur, template, groups, sender)
+            broadcast_id, expires_rule = create_broadcast_from_template(cur, template, groups, sender, overrides=overrides)
             expire_message_rule_broadcasts(cur, expires_rule, [broadcast_id])
-            expire_broadcasts_triggered_by_template(cur, message_id)
+            expire_broadcasts_triggered_by_template(cur, message_id, [broadcast_id])
         conn.commit()
     finally:
         conn.close()
@@ -1124,20 +1246,50 @@ def messages_custom():
     return dispatch_web_page("messages/custom")
 
 
+@alias("/messages/variable-api-test", methods=["POST"])
+def messages_variable_api_test():
+    return dispatch_web_page("messages/variable-api-test")
+
+
 def asset_filename(name):
-    clean = secure_filename(str(name or ""))
-    if not clean or clean.startswith("."):
+    raw = str(name or "").replace("\0", "").replace("\\", "/").split("/")[-1].strip()
+    if not raw or raw.startswith("."):
         return ""
-    return clean
+    return raw
+
+
+def asset_lookup_names(name):
+    raw = asset_filename(name)
+    if not raw:
+        return []
+    names = [raw]
+    secure = secure_filename(raw)
+    if secure and secure not in names:
+        names.append(secure)
+    return names
 
 
 def asset_path(name):
-    clean = asset_filename(name)
-    if not clean:
+    names = asset_lookup_names(name)
+    if not names:
         abort(400)
     ASSET_DIR.mkdir(parents=True, exist_ok=True)
-    path = (ASSET_DIR / clean).resolve()
-    if ASSET_DIR.resolve() not in path.parents and path != ASSET_DIR.resolve():
+    base = ASSET_DIR.resolve()
+    for candidate_name in names:
+        path = (base / candidate_name).resolve()
+        if base not in path.parents:
+            abort(400)
+        if path.is_file():
+            return path
+    wanted = {candidate.lower() for candidate in names}
+    try:
+        for path in base.iterdir():
+            if path.is_file() and path.name.lower() in wanted:
+                return path.resolve()
+    except OSError:
+        pass
+    path = (base / names[0]).resolve()
+    if base not in path.parents:
         abort(400)
     return path
 
@@ -1238,6 +1390,11 @@ def settings_sip():
     return dispatch_web_page("admin/settings/sip")
 
 
+@alias("/admin/sip-dns-check")
+def admin_sip_dns_check():
+    return dispatch_web_page("admin/sip-dns-check")
+
+
 @alias("/admin/settings/web", methods=["GET", "POST"])
 def settings_web():
     return dispatch_web_page("admin/settings/web")
@@ -1312,7 +1469,7 @@ def bells_groups():
     return dispatch_web_page("bells/groups")
 
 
-@alias("/bells/calendar")
+@alias("/bells/calendar", methods=["GET", "POST"])
 def bells_calendar():
     return dispatch_web_page("bells/calendar")
 

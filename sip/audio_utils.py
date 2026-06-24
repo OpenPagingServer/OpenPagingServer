@@ -56,31 +56,31 @@ def generate_wav(filepath):
     if not os.path.exists(full_path):
         print(f"[Warning] Audio file not found: {full_path}")
         return
-        
+
     try:
         with wave.open(full_path, 'rb') as wf:
             channels = wf.getnchannels()
             sampwidth = wf.getsampwidth()
             framerate = wf.getframerate()
-            
+
             chunk_size = int(framerate * 0.02)
-            
+
             while True:
                 raw_frames = wf.readframes(chunk_size)
                 if not raw_frames:
                     break
-                
+
                 actual_frames = len(raw_frames) // (sampwidth * channels)
                 payload = bytearray()
-                
+
                 for i in range(160):
                     if actual_frames > 0:
                         orig_idx = int(i * actual_frames / 160)
                         if orig_idx >= actual_frames:
                             orig_idx = actual_frames - 1
-                            
+
                         byte_idx = orig_idx * sampwidth * channels
-                        
+
                         if sampwidth == 2:
                             sample = struct.unpack('<h', raw_frames[byte_idx:byte_idx+2])[0]
                         elif sampwidth == 1:
@@ -89,9 +89,9 @@ def generate_wav(filepath):
                             sample = 0
                     else:
                         sample = 0
-                        
+
                     payload.append(linear2ulaw(sample))
-                    
+
                 yield bytes(payload)
     except Exception as e:
         print(f"[Warning] Error reading WAV {full_path}: {e}")
@@ -140,12 +140,34 @@ class EchoRTPSession:
         except:
             pass
 
+    def _learn_source(self, addr, data=b""):
+        if not getattr(self, "rtp_latching_enabled", False):
+            return
+        if not addr or len(addr) < 2:
+            return
+        source_ip = str(addr[0] or "").strip()
+        try:
+            source_port = int(addr[1] or 0)
+        except Exception:
+            source_port = 0
+        packet_type = data[1] if len(data) > 1 else 0
+        if (
+            not source_ip
+            or source_port <= 0
+            or 192 <= packet_type <= 223
+            or ((data[:1] or b"\x00")[0] >> 6) != 2
+            or (self.remote_port > 0 and self.remote_port % 2 == 0 and source_port == self.remote_port + 1 and source_port % 2 == 1)
+        ):
+            return
+        self.remote_ip = source_ip
+        self.remote_port = source_port
+
     def _check_dtmf(self, data=None):
         is_dtmf = False
         if self.dtmf_event_flag:
             self.dtmf_event_flag = False
             is_dtmf = True
-            
+
         if not is_dtmf and data:
             try:
                 if len(data) >= 12:
@@ -173,7 +195,7 @@ class EchoRTPSession:
                             is_dtmf = True
             except:
                 pass
-        
+
         if is_dtmf:
             now = time.time()
             if now - self.last_dtmf_time > 0.5:
@@ -191,11 +213,11 @@ class EchoRTPSession:
                 return
             if self._check_dtmf():
                 return
-                
+
             self._send_rtp(chunk, pt=0)
             self.ts = (self.ts + len(chunk)) & 0xFFFFFFFF
             next_time += 0.02
-            
+
             while not self.stopped:
                 now = time.time()
                 timeout = next_time - now
@@ -205,6 +227,7 @@ class EchoRTPSession:
                     r, _, _ = select.select([self.sock], [], [], timeout)
                     if r:
                         data, addr = self.sock.recvfrom(4096)
+                        self._learn_source(addr, data)
                         if self._check_dtmf(data):
                             return
                 except:
@@ -218,6 +241,7 @@ class EchoRTPSession:
                 r, _, _ = select.select([self.sock], [], [], 0.05)
                 if r:
                     data, addr = self.sock.recvfrom(4096)
+                    self._learn_source(addr, data)
                     if self._check_dtmf(data):
                         return
                     pt = data[1] & 0x7F
@@ -240,11 +264,11 @@ class EchoRTPSession:
         for chunk in gen:
             if self.stopped:
                 return
-                
+
             self._send_rtp(chunk, pt=0)
             self.ts = (self.ts + len(chunk)) & 0xFFFFFFFF
             next_time += 0.02
-            
+
             while not self.stopped:
                 now = time.time()
                 timeout = next_time - now
@@ -261,12 +285,12 @@ class EchoRTPSession:
 
     def _run(self):
         self._play_intro()
-        
+
         if not self.stopped:
             self._echo_loop()
-            
+
         if not self.stopped:
             self._play_outro()
-            
+
         if self.on_finish and not self.stopped:
             self.on_finish()

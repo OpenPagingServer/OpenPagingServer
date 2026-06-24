@@ -20,10 +20,7 @@ This document is still in progress and will be updated and finished over time.
 Open Paging Server is a free & open source public address, bell, and mass notification system that runs on existing VoIP infrastructure.
 
 ### What is it programmed in?
-Open Paging Server's core is based on Python, with a PHP-based web interface. It also uses MySQL for its database.
-
-### What's the endpoint SDK
-The endpoint SDK in Open Paging Server uses TCP-based Inter-Process Communication (IPC) to allow the installation of different first and third-party modules. These modules communicate directly with endpoints to send broadcasts. We are currently working on documentation for the SDK, which will be made once we add security. 
+Open Paging Server's is written in Python.
 
 ## How do I get involved and contribute?
 Our community is mainly on [Discord](https://discord.openpagingserver.org), and we will also expand to more places in the future.

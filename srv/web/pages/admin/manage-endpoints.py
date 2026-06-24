@@ -40,10 +40,14 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .endpoint-name { font-size:1.05em; font-weight:500; color:#202124; overflow-wrap:anywhere; }
 .endpoint-meta { color:#555; margin-top:4px; }
 .endpoint-status { display:flex; align-items:center; gap:7px; margin-top:6px; color:#666; font-size:0.92em; }
-.status-dot { width:10px; height:10px; border-radius:50%; background:#9E9E9E; flex:0 0 10px; }
-.status-dot.online, .status-dot.configured { background:#2E7D32; }
-.status-dot.offline { background:#C62828; }
-.status-dot.unchecked, .status-dot.unknown { background:#9E9E9E; }
+.status-indicator { width:10px; height:10px; flex:0 0 10px; display:inline-flex; align-items:center; justify-content:center; color:#9E9E9E; }
+.status-indicator.status-triangle-indicator { width:14px; height:14px; flex:0 0 14px; }
+.status-indicator.status-online, .status-indicator.status-configured { color:#2E7D32; }
+.status-indicator.status-offline, .status-indicator.status-error { color:#C62828; }
+.status-indicator.status-unchecked, .status-indicator.status-unknown { color:#9E9E9E; }
+.status-dot { width:10px; height:10px; border-radius:50%; background:currentColor; display:block; }
+.status-triangle { width:14px; height:13px; background:currentColor; clip-path:polygon(50% 0%, 0% 100%, 100% 100%); display:block; position:relative; }
+.status-triangle::after { content:"!"; position:absolute; left:50%; top:60%; transform:translate(-50%, -50%); color:#FFF; font-size:8px; font-weight:700; line-height:1; clip-path:none; }
 .endpoint-actions { display:flex; align-items:center; gap:4px; flex:0 0 auto; }
 .icon-action { width:36px; height:36px; border-radius:50%; color:#555; display:inline-flex; align-items:center; justify-content:center; text-decoration:none; transition:background-color 0.2s, color 0.2s; }
 .icon-action:hover { background:rgba(25,118,210,0.08); color:#1976D2; }
@@ -104,6 +108,14 @@ def endpoint_display_line(endpoint):
     if model_suffix and model_suffix.lower() not in label.lower():
         label = f"{label} {model_suffix}".strip()
     return f"{label} ({module})" if module else label
+
+
+def endpoint_status_indicator(endpoint, status_class):
+    classes = h(status_class)
+    endpoint_id = str(endpoint.get("id") or "")
+    if endpoint.get("module") == "siptrunks" and endpoint_id.startswith("trunk-") and status_class == "status-error":
+        return f'<span class="status-indicator status-triangle-indicator {classes}"><span class="status-triangle" aria-hidden="true"></span></span>'
+    return f'<span class="status-indicator {classes}"><span class="status-dot"></span></span>'
 
 
 def endpoint_rows(payload):
@@ -172,19 +184,22 @@ def handle_request():
             query = urlencode({"module": endpoint.get("module"), "id": endpoint_id})
             status = str(endpoint.get("status") or "")
             address = endpoint.get("address")
+            meta_line = endpoint_display_line(endpoint)
+            if address and not status:
+                meta_line = f"{meta_line} - {address}" if meta_line else address
             status_html = ""
             if status:
                 status_token = status.split(" ", 1)[0].strip("(),")
-                status_class = re.sub(r"[^a-z0-9]+", "-", status_token.lower())
+                status_class = "status-" + re.sub(r"[^a-z0-9]+", "-", status_token.lower()).strip("-")
                 status_text = h(status) + (f" ({h(address)})" if address else "")
-                status_html = f'<div class="endpoint-status"><span class="status-dot {h(status_class)}"></span><span>{status_text}</span></div>'
+                status_html = f'<div class="endpoint-status">{endpoint_status_indicator(endpoint, status_class)}<span>{status_text}</span></div>'
             edit_href = "javascript:openDemoModePopup('manage-endpoints')" if demo else f"/admin/edit-endpoint?{h(query)}"
             delete_href = "javascript:openDemoModePopup('manage-endpoints')" if demo else f"/admin/delete-endpoint?{h(query)}"
             rendered_rows.append(
                 f"""<li class="endpoint-item">
                         <div class="endpoint-main">
                             <div class="endpoint-name">{h(endpoint.get("name") or endpoint_id)}</div>
-                            <div class="endpoint-meta">{h(endpoint_display_line(endpoint))}</div>
+                            <div class="endpoint-meta">{h(meta_line)}</div>
                             {status_html}
                         </div>
                         <div class="endpoint-actions">
@@ -200,7 +215,7 @@ def handle_request():
         <h1>Manage Endpoints</h1>
         <div class="sort-actions">
             <a class="add-button" href="{new_href}" title="New Endpoint"><i class="fa-solid fa-plus"></i></a>
-            <a class="settings-button" href="{settings_href}"><i class="fa-solid fa-sliders"></i> Endpoint Module Settings</a>
+            <a class="settings-button" href="{settings_href}"><i class="fa-solid fa-sliders"></i> Manage Endpoint Modules</a>
             <span class="muted">Sort</span>
             {sort_links}
         </div>

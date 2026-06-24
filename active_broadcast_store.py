@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +14,29 @@ DB_PATH = RUNTIME_DIR / "active_broadcasts.sqlite3"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 LOCK_TIMEOUT_SECONDS = float(os.getenv("ACTIVE_BROADCAST_LOCK_TIMEOUT", "5"))
 REMOVAL_DELIVERY_STATES = {"expired", "cancelled"}
+MESSAGE_EXPIRATION_MESSAGE_ID_RE = re.compile(r"^\d+$")
+
+
+def _message_expiration_trigger_targets(value):
+    any_message = False
+    message_ids = []
+    seen = set()
+    for token in str(value or "").strip().split("|"):
+        token = token.strip()
+        if not token.lower().startswith("msg="):
+            continue
+        for part in token[4:].replace(",", ".").split("."):
+            part = part.strip()
+            if not part:
+                continue
+            if part == "*":
+                any_message = True
+                continue
+            if not MESSAGE_EXPIRATION_MESSAGE_ID_RE.fullmatch(part) or part in seen:
+                continue
+            seen.add(part)
+            message_ids.append(part)
+    return {"any_message": any_message, "message_ids": message_ids}
 
 
 def _ensure_runtime_dir():
@@ -102,14 +126,11 @@ def _normalize_record(record):
 
 
 def _matches_expires_rule(record, template_id):
-    raw = str(record.get("expires_rule") or "").strip()
-    if not raw.lower().startswith("msg="):
-        return False
     token = str(template_id).strip()
     if not token:
         return False
-    parts = [part.strip() for part in raw[4:].split(".") if part.strip()]
-    return token in parts
+    targets = _message_expiration_trigger_targets(record.get("expires_rule"))
+    return bool(targets["any_message"] or token in targets["message_ids"])
 
 
 def _row_to_record(row):
@@ -284,19 +305,39 @@ def expire_active_broadcasts_by_template_ids(template_ids, exclude_broadcast_ids
     return expired_ids
 
 
-def expire_active_broadcasts_triggered_by_template(template_id):
+def expire_active_broadcasts_triggered_by_template(template_id, exclude_broadcast_ids=None):
     token = str(template_id or "").strip()
     if not token:
         return []
+    excluded = {str(broadcast_id).strip() for broadcast_id in (exclude_broadcast_ids or []) if str(broadcast_id).strip()}
     with _connect() as conn:
         rows = conn.execute(
             "SELECT id, template_id, expires_rule, sender, groups_value, delivery, issued, expires, payload "
-            "FROM active_broadcasts WHERE expires_rule LIKE 'msg=%'",
+            "FROM active_broadcasts WHERE expires_rule LIKE '%msg=%'",
         ).fetchall()
         expired_ids = []
         for row in rows:
             record = _row_to_record(row)
-            if record and _matches_expires_rule(record, token):
+            if record and record["id"] not in excluded and _matches_expires_rule(record, token):
+                expired_ids.append(record["id"])
+        if expired_ids:
+            _delete_ids(conn, expired_ids)
+    return expired_ids
+
+
+def expire_active_broadcasts_any_message(exclude_broadcast_ids=None):
+    excluded = {str(broadcast_id).strip() for broadcast_id in (exclude_broadcast_ids or []) if str(broadcast_id).strip()}
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, template_id, expires_rule, sender, groups_value, delivery, issued, expires, payload "
+            "FROM active_broadcasts WHERE expires_rule LIKE '%msg=%'",
+        ).fetchall()
+        expired_ids = []
+        for row in rows:
+            record = _row_to_record(row)
+            if not record or record["id"] in excluded:
+                continue
+            if _message_expiration_trigger_targets(record.get("expires_rule")).get("any_message"):
                 expired_ids.append(record["id"])
         if expired_ids:
             _delete_ids(conn, expired_ids)

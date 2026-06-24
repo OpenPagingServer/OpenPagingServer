@@ -76,7 +76,7 @@ def handle_request():
             <h1>{h(info.get("name") or module)} Settings</h1>
             {description}
         </div>
-        <a class="back-link" href="/admin/endpoint-module-settings"><i class="fa-solid fa-arrow-left"></i> Modules</a>
+        <a class="back-link" href="/admin/endpoint-module-settings"><i class="fa-solid fa-arrow-left"></i> Manage Endpoint Modules</a>
     </div>
     <div class="settings-frame" style="padding:18px; overflow:auto;">{settings_body}</div>"""
     return legacy_page(f"{info.get('name') or module} Settings", legacy_user_context(user), "endpoints", MODULE_CONFIGURE_STYLE, content)

@@ -2,7 +2,7 @@ import os
 import re
 import threading
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import pymysql
@@ -13,6 +13,11 @@ from active_broadcast_store import (
     put_active_broadcast,
 )
 from audio_utils import generate_wav
+from broadcasts import (
+    expand_broadcast_record_variables,
+    message_expiration_trigger_targets,
+    parse_message_expiration,
+)
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
@@ -51,13 +56,7 @@ def runtime_type(value):
 
 
 def parse_expires(value, issued):
-    raw = str(value or "").strip()
-    if not raw or raw.lower() == "manual" or raw.lower().startswith("msg="):
-        return None, raw
-    match = re.fullmatch(r"(\d+)\s*m", raw, re.IGNORECASE)
-    if match:
-        return issued + timedelta(minutes=int(match.group(1))), raw
-    return None, raw
+    return parse_message_expiration(value, issued)
 
 
 def fetch_template(cursor, message_id):
@@ -220,11 +219,14 @@ def resolve_group_and_message(cursor, raw, sender=""):
     return "", message_id
 
 
-def expire_triggered_broadcasts(cursor, template_id):
+def expire_triggered_broadcasts(cursor, template_id, exclude_broadcast_ids=None):
     columns = table_columns(cursor, "broadcasts")
     if "delivery" not in columns:
         return
-    expired_ids = expire_active_broadcasts_triggered_by_template(template_id)
+    expired_ids = expire_active_broadcasts_triggered_by_template(
+        template_id,
+        exclude_broadcast_ids=exclude_broadcast_ids,
+    )
     if not expired_ids:
         return
     placeholders = ", ".join(["%s"] * len(expired_ids))
@@ -235,10 +237,7 @@ def expire_triggered_broadcasts(cursor, template_id):
 
 
 def expire_message_rule_broadcasts(cursor, expires_rule, exclude_broadcast_ids=None):
-    raw = str(expires_rule or "").strip()
-    if not raw.lower().startswith("msg="):
-        return
-    template_ids = [item.strip() for item in raw[4:].split(".") if item.strip()]
+    template_ids = message_expiration_trigger_targets(expires_rule)["message_ids"]
     if not template_ids:
         return
     excluded = exclude_broadcast_ids or []
@@ -281,6 +280,7 @@ def insert_broadcast(cursor, template, groups, sender):
         "priority": template.get("priority") or "Normal",
         "delivery": "pending",
     }
+    expand_broadcast_record_variables(cursor, values, source_values={"sender": sender or ""})
     columns = table_columns(cursor, "broadcasts")
     insert_columns = [column for column in values if column in columns]
     placeholders = ", ".join(["%s"] * len(insert_columns))
@@ -314,7 +314,7 @@ def _create_broadcast(arg, sender=""):
 
                 broadcast_id, expires_rule = insert_broadcast(cur, template, group_id, sender)
                 expire_message_rule_broadcasts(cur, expires_rule, exclude_broadcast_ids=[broadcast_id])
-                expire_triggered_broadcasts(cur, message_id)
+                expire_triggered_broadcasts(cur, message_id, exclude_broadcast_ids=[broadcast_id])
             conn.commit()
         finally:
             conn.close()

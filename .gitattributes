@@ -1,4 +1,5 @@
 README.md export-ignore
 CONTRIBUTING.md export-ignore
 .gitignore export-ignore
-.gitattributes export-ignore
+.gitattributes export-ignore text eol=lf
+*.py text eol=lf

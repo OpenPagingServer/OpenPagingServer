@@ -1,10 +1,21 @@
 from srv.web.app import *
-from broadcasts import expire_message_rule_broadcasts, parse_expires, put_active_broadcast, runtime_type
+from broadcasts import (
+    expand_broadcast_record_variables,
+    expire_any_message_rule_broadcasts,
+    expire_message_rule_broadcasts,
+    parse_expires,
+    put_active_broadcast,
+    runtime_type,
+)
 from srv.web.pages.messages.form_common import (
     MESSAGE_FORM_SCRIPT,
     MESSAGE_FORM_STYLE,
     audio_transfer_html,
+    message_variable_field_html,
+    message_variable_guide_html,
     message_multiline_text,
+    vendor_specific_editor_html,
+    vendor_specific_from_form,
 )
 
 CUSTOM_EXTRA_STYLE = r"""
@@ -60,7 +71,7 @@ def create_custom_broadcast(values, expires_rule):
         "longmessage": values.get("longmessage") or "",
         "icon": values.get("icon") or "",
         "color": values.get("color") or "",
-        "vendor_specific": "",
+        "vendor_specific": values.get("vendor_specific") or "",
         "expires_rule": normalized_rule,
         "type": runtime_type(values.get("type")),
         "expires": expires_at,
@@ -75,6 +86,7 @@ def create_custom_broadcast(values, expires_rule):
     conn = db()
     try:
         with conn.cursor() as cur:
+            expand_broadcast_record_variables(cur, record, source_values=values)
             columns = table_columns("broadcasts")
             insert_columns = [column for column in record if column in columns]
             cur.execute(
@@ -83,6 +95,7 @@ def create_custom_broadcast(values, expires_rule):
             )
             put_active_broadcast(record)
             expire_message_rule_broadcasts(cur, normalized_rule, [broadcast_id])
+            expire_any_message_rule_broadcasts(cur, [broadcast_id])
         conn.commit()
     finally:
         conn.close()
@@ -95,6 +108,7 @@ def handle_request():
     ctx = legacy_user_context(user)
     if demo_mode_enabled():
         return demo_mode_iframe_html("messages")
+    ensure_message_vendor_schema()
 
     if request.method == "POST":
         if request.form.get("send_all"):
@@ -118,6 +132,7 @@ def handle_request():
                 "sender": user.get("username") or session.get("username") or "User",
                 "priority": request.form.get("priority", "Normal"),
                 "type": request.form.get("type", "text"),
+                "vendor_specific": vendor_specific_from_form(request.form),
             },
             expires_rule,
         )
@@ -152,6 +167,21 @@ def handle_request():
     else:
         groups_html = '<p class="help-text">No groups are available.</p>'
     transfer = audio_transfer_html(audio_files())
+    vendor_specific_html = vendor_specific_editor_html(context={"mode": "message_custom"})
+    variable_fields = (
+        message_variable_field_html(
+            "shortmessage",
+            "Short Message",
+            '<input type="text" name="shortmessage" id="shortmessage" class="form-control">',
+            "You can use variables here and they will resolve when the custom message is sent.",
+        )
+        + message_variable_field_html(
+            "longmessage",
+            "Long Message",
+            '<textarea name="longmessage" id="longmessage" class="form-control textarea-long" rows="7" wrap="soft"></textarea>',
+            "Use variables for timestamps, sender details, live API text, or the product name.",
+        )
+    )
     content = f"""    <div class="header-actions">
         <h1>Send Custom Message</h1>
     </div>
@@ -178,14 +208,7 @@ def handle_request():
                 </div>
             </div>
             <div id="visual-fields" style="display:none;">
-                <div class="form-group">
-                    <label class="main-label" for="shortmessage">Short Message</label>
-                    <input type="text" name="shortmessage" id="shortmessage" class="form-control">
-                </div>
-                <div class="form-group">
-                    <label class="main-label" for="longmessage">Long Message</label>
-                    <textarea name="longmessage" id="longmessage" class="form-control textarea-long" rows="7" wrap="soft"></textarea>
-                </div>
+{variable_fields}
                 <div class="form-group">
                     <label class="main-label">Color</label>
                     <div class="color-picker-container">
@@ -212,8 +235,10 @@ def handle_request():
                     <option value="Emergency">Emergency</option>
                 </select>
             </div>
+            {vendor_specific_html}
             <button type="submit" class="btn-send"><i class="fa-solid fa-paper-plane" style="margin-right:8px;"></i> Send Custom Message</button>
             <a href="/messages/" class="btn-cancel">Cancel</a>
         </form>
-    </div>"""
+    </div>
+{message_variable_guide_html()}"""
     return legacy_page("Send Custom Message", ctx, "messages", MESSAGE_FORM_STYLE + CUSTOM_EXTRA_STYLE, content, CUSTOM_SCRIPT)

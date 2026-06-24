@@ -21,7 +21,33 @@ def frame_response(title, body, active="endpoints", user=None, status=200):
         f"""<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{h(title)}</title></head>
-<body>{body}</body>
+<body>{body}<script>
+(function() {{
+  function sendHeight() {{
+    const body = document.body;
+    const html = document.documentElement;
+    const height = Math.max(
+      body ? body.scrollHeight : 0,
+      body ? body.offsetHeight : 0,
+      html ? html.scrollHeight : 0,
+      html ? html.offsetHeight : 0
+    );
+    if (window.parent && window.parent !== window) {{
+      window.parent.postMessage({{ type: 'ops-frame-height', height: height }}, window.location.origin);
+    }}
+  }}
+  window.addEventListener('load', sendHeight);
+  window.addEventListener('resize', sendHeight);
+  if (window.ResizeObserver) {{
+    const observer = new ResizeObserver(sendHeight);
+    observer.observe(document.documentElement);
+    if (document.body) observer.observe(document.body);
+  }} else {{
+    setInterval(sendHeight, 300);
+  }}
+  setTimeout(sendHeight, 0);
+}})();
+</script></body>
 </html>""",
         status=status,
         mimetype="text/html",
@@ -38,7 +64,26 @@ def chooser_response(module, forms):
         for key, form in forms.items()
     ) + "</div>"
     return Response(
-        f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><style>{style}</style></head><body>{body}</body></html>""",
+        f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><style>{style}</style></head><body>{body}<script>
+(function() {{
+  function sendHeight() {{
+    const body = document.body;
+    const html = document.documentElement;
+    const height = Math.max(
+      body ? body.scrollHeight : 0,
+      body ? body.offsetHeight : 0,
+      html ? html.scrollHeight : 0,
+      html ? html.offsetHeight : 0
+    );
+    if (window.parent && window.parent !== window) {{
+      window.parent.postMessage({{ type: 'ops-frame-height', height: height }}, window.location.origin);
+    }}
+  }}
+  window.addEventListener('load', sendHeight);
+  window.addEventListener('resize', sendHeight);
+  setTimeout(sendHeight, 0);
+}})();
+</script></body></html>""",
         mimetype="text/html",
     )
 

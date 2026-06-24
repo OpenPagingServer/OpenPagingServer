@@ -339,6 +339,8 @@ def output_capable(endpoint):
 def endpoint_can_receive_page(endpoint):
     if not output_capable(endpoint):
         return False
+    if "available" in endpoint:
+        return bool(endpoint.get("available"))
     return str(endpoint.get("status") or "").strip().lower() in {"online", "configured", "ready", "ok", "up"}
 
 

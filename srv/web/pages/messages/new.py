@@ -3,7 +3,13 @@ from srv.web.pages.messages.form_common import (
     MESSAGE_FORM_SCRIPT,
     MESSAGE_FORM_STYLE,
     audio_transfer_html,
+    message_expiration_field_html,
+    message_expiration_from_form,
+    message_variable_field_html,
+    message_variable_guide_html,
     message_multiline_text,
+    vendor_specific_editor_html,
+    vendor_specific_from_form,
 )
 
 def handle_request():
@@ -16,6 +22,7 @@ def handle_request():
         abort(403)
     if demo_mode_enabled():
         return demo_mode_iframe_html("messages")
+    ensure_message_vendor_schema()
 
     message_types = {
         "text+audio": "Audio & visual message",
@@ -41,11 +48,13 @@ def handle_request():
             "longmessage": message_multiline_text(request.form.get("longmessage", "")) if has_text else "",
             "color": request.form.get("color", "").lstrip("#") if has_text else "",
             "audio": audio,
-            "expires": request.form.get("expires", "manual").strip() or "manual",
+            "expires": message_expiration_from_form(request.form),
+            "priority": request.form.get("priority", "Normal"),
+            "vendor_specific": vendor_specific_from_form(request.form),
         }
 
         columns = table_columns("messages")
-        wanted = ["messageid", "name", "type", "shortmessage", "longmessage", "color", "audio", "expires"]
+        wanted = ["messageid", "name", "type", "shortmessage", "longmessage", "color", "audio", "expires", "priority", "vendor_specific"]
         insert = {k: values.get(k, "") for k in wanted if k in columns}
 
         execute(
@@ -89,22 +98,24 @@ def handle_request():
 
     has_audio = selected_type in ("text+audio", "audio")
     has_text = selected_type in ("text+audio", "text")
+    expiration_messages = query_all("SELECT messageid, name FROM messages ORDER BY name ASC, messageid ASC")
 
     visual_fields = ""
     if has_text:
-        visual_fields = """            <div class="form-group">
-                <label class="main-label" for="shortmessage">Short Message</label>
-                <p class="help-text">Enter the short text message. Usually shown on previews and on wall-mounted devices. This should be brief. You can use variables.</p>
-                <input type="text" name="shortmessage" id="shortmessage" class="form-control">
-            </div>
-
-            <div class="form-group">
-                <label class="main-label" for="longmessage">Long Message</label>
-                <p class="help-text">Enter the long text message. Usually shown on apps, and in a "more details" section. This should contain as much information as a user would need to know about the situation or incident associated with the message.</p>
-                <textarea name="longmessage" id="longmessage" class="form-control textarea-long" rows="7" wrap="soft"></textarea>
-            </div>
-
-            <div class="form-group">
+        visual_fields = (
+            message_variable_field_html(
+                "shortmessage",
+                "Short Message",
+                '<input type="text" name="shortmessage" id="shortmessage" class="form-control">',
+                "Enter the short text message. Usually shown on previews and on wall-mounted devices. This should be brief. You can use variables.",
+            )
+            + message_variable_field_html(
+                "longmessage",
+                "Long Message",
+                '<textarea name="longmessage" id="longmessage" class="form-control textarea-long" rows="7" wrap="soft"></textarea>',
+                'Enter the long text message. Usually shown on apps, and in a "more details" section. This should contain as much information as a user would need to know about the situation or incident associated with the message.',
+            )
+            + """            <div class="form-group">
                 <label class="main-label">Color</label>
                 <p class="help-text">Certain endpoints can show a color-coded message.</p>
                 <div class="color-picker-container">
@@ -113,6 +124,7 @@ def handle_request():
                 </div>
             </div>
 """
+        )
 
     audio_fields = ""
     if has_audio:
@@ -124,6 +136,7 @@ def handle_request():
             </div>
 """
 
+    vendor_specific_html = vendor_specific_editor_html(context={"mode": "message_new", "message_type": selected_type})
     content = f"""    <div class="header-actions">
         <h1>New Message</h1>
     </div>
@@ -144,17 +157,23 @@ def handle_request():
                 <input type="text" name="name" id="name" class="form-control" required>
             </div>
 
-{visual_fields}{audio_fields}            <div class="form-group">
-                <label class="main-label" for="expires">Expiration</label>
-                <p class="help-text">Use 30m or 15m, msg=3 or msg=3.4, or manual for no automatic expiration.</p>
-                <input type="text" name="expires" id="expires" class="form-control" value="manual">
+{visual_fields}{audio_fields}{message_expiration_field_html(expiration_messages)}            <div class="form-group">
+                <label class="main-label" for="priority">Priority</label>
+                <select name="priority" id="priority" class="form-control">
+                    <option value="Low">Low</option>
+                    <option value="Normal" selected>Normal</option>
+                    <option value="High">High</option>
+                    <option value="Emergency">Emergency</option>
+                </select>
             </div>
 
+{vendor_specific_html}
             <div style="margin-top: 20px;">
                 <button type="submit" class="btn-primary">Create Message</button>
                 <a href="/messages/" style="margin-left:10px; color:#777; text-decoration:none;">Cancel</a>
             </div>
         </form>
-    </div>"""
+    </div>
+{message_variable_guide_html() if has_text else ""}"""
 
     return legacy_page("New Message", ctx, "messages", MESSAGE_FORM_STYLE, content, MESSAGE_FORM_SCRIPT)

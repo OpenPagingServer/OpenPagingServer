@@ -4,6 +4,7 @@ import struct
 import threading
 import time
 import select
+import os
 
 DTMF_MAP = {
     0: "0", 1: "1", 2: "2", 3: "3",
@@ -12,16 +13,28 @@ DTMF_MAP = {
     12: "A", 13: "B", 14: "C", 15: "D"
 }
 
+def rtp_debug(message):
+    if os.getenv("DEBUG", "").strip().lower() == "true":
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] DEBUG sip.rtp {message}", flush=True)
+
+def rtp_sockname(sock):
+    try:
+        host, port = sock.getsockname()[:2]
+        return f"{host}:{port}"
+    except Exception:
+        return "unknown"
+
 class RTPSession:
-    def __init__(self, target_ip, target_port, payload_generator=None, on_finish=None):
+    def __init__(self, target_ip, target_port, payload_generator=None, on_finish=None, rtp_socket=None):
         self.target_ip = target_ip
         self.target_port = target_port
         self.payload_generator = payload_generator
         self.on_finish = on_finish
         self.stop_event = threading.Event()
         self.thread = None
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.bind(("0.0.0.0", 0))
+        self.socket = rtp_socket if rtp_socket is not None else socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        if rtp_socket is None:
+            self.socket.bind(("0.0.0.0", 0))
         self.local_port = self.socket.getsockname()[1]
         self.digits = ""
         self.rtp_paused = False
@@ -33,7 +46,10 @@ class RTPSession:
         self.finished_dtmf_event_time = 0
         self.finished_dtmf_event_timestamp = None
         self._last_rtp_timestamp = None
+        self.initial_silence_frames = 0
         self.lock = threading.Lock()
+        self.sent_packets = 0
+        self.received_packets = 0
 
     def start(self):
         if self.thread is None or not self.thread.is_alive():
@@ -68,6 +84,33 @@ class RTPSession:
         self.last_dtmf_time = now
         with self.lock:
             self.digits += d
+
+    def _learn_packet_source(self, addr, data=b""):
+        if not getattr(self, "rtp_latching_enabled", False):
+            return
+        if not addr or len(addr) < 2:
+            return
+        source_ip = str(addr[0] or "").strip()
+        try:
+            source_port = int(addr[1] or 0)
+        except Exception:
+            source_port = 0
+        current_port = int(getattr(self, "target_port", 0) or 0)
+        packet_type = data[1] if len(data) > 1 else 0
+        if (
+            not source_ip
+            or source_port <= 0
+            or 192 <= packet_type <= 223
+            or ((data[:1] or b"\x00")[0] >> 6) != 2
+            or (current_port > 0 and current_port % 2 == 0 and source_port == current_port + 1 and source_port % 2 == 1)
+        ):
+            return
+        old_ip = str(getattr(self, "target_ip", "") or "")
+        old_port = int(getattr(self, "target_port", 0) or 0)
+        self.target_ip = source_ip
+        self.target_port = source_port
+        if (old_ip, old_port) != (source_ip, source_port):
+            rtp_debug(f"learned source local={rtp_sockname(self.socket)} old={old_ip}:{old_port} new={source_ip}:{source_port}")
 
     def _parse_rtp(self, data):
         if len(data) < 12:
@@ -136,17 +179,28 @@ class RTPSession:
 
         try:
             while not self.stop_event.is_set():
+                payload = None
                 r, _, _ = select.select([self.socket], [], [], 0.01)
                 if r:
                     try:
-                        data, _ = self.socket.recvfrom(4096)
-                        pt, payload = self._parse_rtp(data)
+                        data, addr = self.socket.recvfrom(4096)
+                        self._learn_packet_source(addr, data)
+                        pt, received_payload = self._parse_rtp(data)
                         if pt is not None:
-                            self._handle_dtmf(pt, payload)
+                            self.received_packets += 1
+                            if self.received_packets <= 3 or self.received_packets % 50 == 0:
+                                rtp_debug(f"recv packet={self.received_packets} local={rtp_sockname(self.socket)} remote={addr[0]}:{addr[1]} bytes={len(data)}")
+                            self._handle_dtmf(pt, received_payload)
                     except:
                         pass
 
-                if gen and getattr(self, "rtp_paused", False):
+                if getattr(self, "initial_silence_frames", 0) and not getattr(self, "rtp_paused", False):
+                    payload = b"\xff" * 160
+                    try:
+                        self.initial_silence_frames = max(0, int(self.initial_silence_frames) - 1)
+                    except Exception:
+                        self.initial_silence_frames = 0
+                elif gen and getattr(self, "rtp_paused", False):
                     payload = None
                 elif gen:
                     try:
@@ -157,14 +211,17 @@ class RTPSession:
                         if finish_when_generator_exhausted:
                             break
 
-                    if payload:
-                        packet = self.build_packet(sequence, timestamp, ssrc, payload)
-                        try:
-                            self.socket.sendto(packet, (self.target_ip, self.target_port))
-                        except:
-                            break
-                        sequence = (sequence + 1) & 0xFFFF
-                        timestamp = (timestamp + 160) & 0xFFFFFFFF
+                if payload:
+                    packet = self.build_packet(sequence, timestamp, ssrc, payload)
+                    try:
+                        self.socket.sendto(packet, (self.target_ip, self.target_port))
+                    except:
+                        break
+                    self.sent_packets += 1
+                    if self.sent_packets <= 3 or self.sent_packets % 50 == 0:
+                        rtp_debug(f"send packet={self.sent_packets} local={rtp_sockname(self.socket)} remote={self.target_ip}:{self.target_port} bytes={len(packet)}")
+                    sequence = (sequence + 1) & 0xFFFF
+                    timestamp = (timestamp + 160) & 0xFFFFFFFF
 
                 next_send += 0.02
                 sleep_for = next_send - time.monotonic()

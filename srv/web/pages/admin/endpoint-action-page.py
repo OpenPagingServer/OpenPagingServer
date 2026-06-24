@@ -40,9 +40,68 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 }
 """
 
+FRAME_SCRIPT = r"""
+(function() {
+  const frame = document.getElementById('endpointActionFrame');
+  function applyHeight(height) {
+    if (!frame) return;
+    const numeric = Number(height);
+    if (!Number.isFinite(numeric) || numeric <= 0) return;
+    frame.style.height = Math.max(320, Math.ceil(numeric) + 8) + 'px';
+  }
+  window.addEventListener('message', function(event) {
+    if (event.origin !== window.location.origin) return;
+    if (!event.data || event.data.type !== 'ops-frame-height') return;
+    applyHeight(event.data.height);
+  });
+  if (frame) {
+    frame.addEventListener('load', function() {
+      try {
+        applyHeight(frame.contentWindow.document.documentElement.scrollHeight);
+      } catch (_error) {
+      }
+    });
+  }
+})();
+"""
+
 
 def safe_name(value):
     return re.fullmatch(r"[A-Za-z0-9_-]+", str(value or "")) is not None
+
+
+def action_frame_response(title, body, active="endpoints", user=None, status=200):
+    return Response(
+        f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{h(title)}</title></head><body>{body}<script>
+(function() {{
+  function sendHeight() {{
+    const body = document.body;
+    const html = document.documentElement;
+    const height = Math.max(
+      body ? body.scrollHeight : 0,
+      body ? body.offsetHeight : 0,
+      html ? html.scrollHeight : 0,
+      html ? html.offsetHeight : 0
+    );
+    if (window.parent && window.parent !== window) {{
+      window.parent.postMessage({{ type: 'ops-frame-height', height: height }}, window.location.origin);
+    }}
+  }}
+  window.addEventListener('load', sendHeight);
+  window.addEventListener('resize', sendHeight);
+  if (window.ResizeObserver) {{
+    const observer = new ResizeObserver(sendHeight);
+    observer.observe(document.documentElement);
+    if (document.body) observer.observe(document.body);
+  }} else {{
+    setInterval(sendHeight, 300);
+  }}
+  setTimeout(sendHeight, 0);
+}})();
+</script></body></html>""",
+        status=status,
+        mimetype="text/html",
+    )
 
 
 def render_endpoint_action_frame(action):
@@ -56,7 +115,7 @@ def render_endpoint_action_frame(action):
     if action not in {"edit", "delete"} or not safe_name(module) or endpoint_id == "" or len(endpoint_id) > 255:
         abort(400)
     mod = load_endpoint_web(module)
-    return mod.render_action(action, endpoint_id, request, db, module_page, user)
+    return mod.render_action(action, endpoint_id, request, db, action_frame_response, user)
 
 
 def render_endpoint_action_page(action):
@@ -85,9 +144,9 @@ def render_endpoint_action_page(action):
         <a class="back-link" href="/admin/manage-endpoints"><i class="fa-solid fa-arrow-left"></i> Endpoints</a>
     </div>
     <div class="frame-shell">
-        <iframe class="form-frame" sandbox="allow-forms allow-same-origin allow-scripts allow-top-navigation" src="{h(frame_src)}" title="{h(action_title)}"></iframe>
+        <iframe id="endpointActionFrame" class="form-frame" sandbox="allow-forms allow-same-origin allow-scripts allow-top-navigation" src="{h(frame_src)}" title="{h(action_title)}"></iframe>
     </div>"""
-    return legacy_page(action_title, legacy_user_context(user), "endpoints", ACTION_STYLE, content)
+    return legacy_page(action_title, legacy_user_context(user), "endpoints", ACTION_STYLE, content, FRAME_SCRIPT)
 
 
 def handle_request():
