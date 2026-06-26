@@ -29,7 +29,7 @@ def render_bells_ui(scope_schedule_id, post_path, hidden_fields, demo=False):
     day_mapping = {"0": "Sun", "1": "Mon", "2": "Tue", "3": "Wed", "4": "Thu", "5": "Fri", "6": "Sat"}
     
     def render_day_checks(prefix=""):
-        return "".join(f'<label style="cursor: pointer;"><input type="checkbox" name="days_of_week" value="{day}" id="{prefix}day_{day}" checked> {label}</label>' for day, label in day_mapping.items())
+        return "".join(f'<label class="weekday-chip md-checkbox-container"><input type="checkbox" name="days_of_week" value="{day}" id="{prefix}day_{day}" checked><span class="md-checkmark"></span><span class="md-checkbox-text">{label}</span></label>' for day, label in day_mapping.items())
     
     hidden = "".join(f'<input type="hidden" name="{h(key)}" value="{h(value)}">' for key, value in hidden_fields.items())
     

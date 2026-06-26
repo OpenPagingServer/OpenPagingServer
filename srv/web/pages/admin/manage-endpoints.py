@@ -20,9 +20,10 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 @media(max-width:767px){ #content{ margin-left:0; width:100%; padding-top:70px; } }
 #content h1{ font-weight:400; }
 .header-actions { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; gap:16px; flex-wrap:wrap; }
-.sort-actions { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
-.sort-link { color:#1976D2; text-decoration:none; padding:8px 10px; border-radius:4px; border:1px solid #EEE; font-size:0.9em; }
-.sort-link.active { background:#1976D2; color:#FFF; border-color:#1976D2; }
+.toolbar-actions { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.filter-bar { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:16px; }
+.filter-link { color:#1976D2; text-decoration:none; padding:8px 10px; border-radius:4px; border:1px solid #EEE; font-size:0.9em; }
+.filter-link.active { background:#1976D2; color:#FFF; border-color:#1976D2; }
 .settings-button { color:#1976D2; text-decoration:none; padding:9px 12px; border-radius:4px; border:1px solid #1976D2; font-size:0.9em; display:inline-flex; align-items:center; gap:7px; }
 .settings-button:hover { background:rgba(25,118,210,0.08); }
 .add-button { width:40px; height:40px; border-radius:50%; background:#1976D2; color:#FFF; display:inline-flex; align-items:center; justify-content:center; text-decoration:none; box-shadow:0 2px 5px rgba(0,0,0,0.24); transition:background-color 0.2s, box-shadow 0.2s; }
@@ -66,8 +67,8 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 #content{ background-color:#121212; }
 .info-card,.summary-item{ border:1px solid #333; background-color:#1E1E1E; }
 .muted{ color:#BBB; }
-.sort-link { color:#BB86FC; border-color:#333; }
-.sort-link.active { background:#BB86FC; color:#000; border-color:#BB86FC; }
+.filter-link { color:#BB86FC; border-color:#333; }
+.filter-link.active { background:#BB86FC; color:#000; border-color:#BB86FC; }
 .settings-button { color:#BB86FC; border-color:#BB86FC; }
 .settings-button:hover { background:rgba(187,134,252,0.1); }
 .add-button { background:#BB86FC; color:#000; }
@@ -144,23 +145,43 @@ def endpoint_rows(payload):
     return rows, module_errors
 
 
+def endpoint_filter_options(rows):
+    options = [("all", "All"), ("siptrunks", "SIP Trunks"), (endpoints.MULTICAST_RTP_MODULE, endpoints.MULTICAST_RTP_NAME)]
+    seen = {key for key, _label in options}
+    for module_name, info in endpoint_module_catalog(include_system=True).items():
+        if module_name in seen:
+            continue
+        label = str(info.get("name") or module_name).strip() or module_name
+        options.append((module_name, label))
+        seen.add(module_name)
+    for row in rows:
+        module_name = str(row.get("module") or "").strip()
+        if not module_name or module_name in seen:
+            continue
+        label = str(row.get("module_display") or module_name).strip() or module_name
+        options.append((module_name, label))
+        seen.add(module_name)
+    fixed = options[:3]
+    dynamic = sorted(options[3:], key=lambda item: (cmp_key_text(item[1]), cmp_key_text(item[0])))
+    return fixed + dynamic
+
+
 def handle_request():
     user = require_admin()
     if not isinstance(user, dict):
         return user
     ctx = legacy_user_context(user)
     demo = demo_mode_enabled()
-    sort = request.args.get("sort", "alpha")
-    if sort not in {"alpha", "module", "devices"}:
-        sort = "alpha"
+    module_filter = request.args.get("sort", "all").strip()
     payload = endpoint_ipc("LIST_ENDPOINTS")
     rows, module_errors = endpoint_rows(payload)
-    if sort == "module":
-        rows.sort(key=lambda row: (cmp_key_text(row["module_display"]), cmp_key_text(row["name"] or row["id"] or row["address"]), cmp_key_text(row["address"])))
-    elif sort == "devices":
-        rows.sort(key=lambda row: (-int(row["module_count"] or 0), cmp_key_text(row["module_display"]), cmp_key_text(row["name"] or row["id"] or row["address"])))
-    else:
-        rows.sort(key=lambda row: (cmp_key_text(row["name"] or row["id"] or row["address"]), cmp_key_text(row["address"]), cmp_key_text(row["module_display"])))
+    filter_options = endpoint_filter_options(rows)
+    valid_filters = {key for key, _label in filter_options}
+    if module_filter not in valid_filters:
+        module_filter = "all"
+    if module_filter != "all":
+        rows = [row for row in rows if row.get("module") == module_filter]
+    rows.sort(key=lambda row: (cmp_key_text(row["name"] or row["id"] or row["address"]), cmp_key_text(row["address"]), cmp_key_text(row["module_display"])))
 
     notices = ""
     success = session.pop("endpoint_flash_success", "")
@@ -171,9 +192,9 @@ def handle_request():
     if payload.get("warning"):
         notices += f'<div class="error">{h(payload.get("warning"))}</div>'
     notices += "".join(f'<div class="error">{h(err)}</div>' for err in module_errors if err)
-    sort_links = "".join(
-        f'<a class="sort-link {"active" if sort == key else ""}" href="?sort={key}">{label}</a>'
-        for key, label in (("alpha", "Alphabetical"), ("module", "Module"), ("devices", "Most Devices"))
+    filter_links = "".join(
+        f'<a class="filter-link {"active" if module_filter == key else ""}" href="?{urlencode({"sort": key})}">{h(label)}</a>'
+        for key, label in filter_options
     )
     new_href = "javascript:openDemoModePopup('manage-endpoints')" if demo else "/admin/new-endpoint"
     settings_href = "javascript:openDemoModePopup('manage-endpoints')" if demo else "/admin/endpoint-module-settings"
@@ -213,16 +234,17 @@ def handle_request():
         endpoint_list = '<p class="muted" style="text-align:center; padding:20px;">No endpoints found</p>'
     content = f"""    <div class="header-actions">
         <h1>Manage Endpoints</h1>
-        <div class="sort-actions">
+        <div class="toolbar-actions">
             <a class="add-button" href="{new_href}" title="New Endpoint"><i class="fa-solid fa-plus"></i></a>
             <a class="settings-button" href="{settings_href}"><i class="fa-solid fa-sliders"></i> Manage Endpoint Modules</a>
-            <span class="muted">Sort</span>
-            {sort_links}
         </div>
     </div>
     {notices}
     <div class="summary-grid">
         <div class="summary-item"><strong>{h(len(rows))}</strong><span class="muted">Endpoints</span></div>
+    </div>
+    <div class="filter-bar">
+        {filter_links}
     </div>
     <div class="info-card">{endpoint_list}</div>"""
     return legacy_page("Manage Endpoints", ctx, "endpoints", ENDPOINTS_STYLE, content)

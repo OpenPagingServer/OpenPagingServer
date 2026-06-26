@@ -101,7 +101,7 @@ def handle_request():
     prev_url = urlencode({"schedule_id": sid, "month": prev_month})
     next_url = urlencode({"schedule_id": sid, "month": next_month})
     back_url = urlencode({"id": sid})
-    day_checks = "".join(f'<label class="weekday-chip"><input type="checkbox" name="days_of_week" value="{h(key)}" checked><span>{h(label)}</span></label>' for key, label in weekday_names().items())
+    day_checks = "".join(f'<label class="weekday-chip md-checkbox-container"><input type="checkbox" name="days_of_week" value="{h(key)}" checked><span class="md-checkmark"></span><span class="md-checkbox-text">{h(label)}</span></label>' for key, label in weekday_names().items())
     bulk = f"""<div class="card">
         <form method="POST" action="/bells/calendar" class="bulk-grid" style="margin-top:12px;"{demo_submit}>
         <input type="hidden" name="schedule_id" value="{h(sid)}"><input type="hidden" name="month" value="{h(month)}">

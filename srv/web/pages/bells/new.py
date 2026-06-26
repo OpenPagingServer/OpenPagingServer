@@ -23,7 +23,7 @@ def handle_request():
 <form class="card" method="POST" action="/bells/new">
     <div class="field"><label for="name">Schedule name</label><input id="name" name="name" required autofocus></div>
     <div class="field"><label for="timezone">Time zone</label><select id="timezone" name="timezone">{timezone_options("server")}</select></div>
-    <label class="checkbox-row"><input type="checkbox" name="enabled" checked><span>Enabled</span></label>
+    <label class="checkbox-row md-checkbox-container"><input type="checkbox" name="enabled" checked><span class="md-checkmark"></span><span class="md-checkbox-text">Enabled</span></label>
     <div class="actions" style="margin-top:12px;"><button class="btn" type="submit"><i class="fa-solid fa-floppy-disk"></i> Create Schedule</button><a class="btn secondary" href="/bells">Cancel</a></div>
 </form>"""
     return bells_page("New Schedule", "Create a bell schedule", actions, body, user)

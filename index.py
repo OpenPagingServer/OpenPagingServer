@@ -90,6 +90,23 @@ def analytics_enabled():
     return str(row[0]).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def multicast_gateway_enabled():
+    try:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM systemsettings WHERE parameter = 'allow_multicast_gateway' LIMIT 1")
+                row = cur.fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:
+        core.log(f"multicast gateway setting read error: {exc}")
+        return False
+    if not row:
+        return False
+    return str(row[0]).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def start_analytics():
     global analytics_proc
     analytics_path = BASE_DIR / "analyticsd.py"
@@ -1141,7 +1158,7 @@ def main():
         core.log(f"web worker started pid={webd_proc.pid}")
 
     multicastgateway_path = BASE_DIR / "multicastgatewayd.py"
-    if multicastgateway_path.exists():
+    if multicastgateway_path.exists() and multicast_gateway_enabled():
         multicastgateway_proc = subprocess.Popen([sys.executable, str(multicastgateway_path)], cwd=BASE_DIR)
         core.log(f"multicast gateway worker started pid={multicastgateway_proc.pid}")
 

@@ -292,7 +292,7 @@ def handle_request():
                 <div class="upload-box">
                     <i class="fa-solid fa-cloud-arrow-up" style="font-size:2em;"></i>
                     <div style="margin-top:10px;">Choose an endpoint module package</div>
-                    <div class="muted" style="margin-top:6px;">Allowed: .opsepm. Limit: {h(format_bytes(MAX_MODULE_UPLOAD_BYTES))}. Package must be signed by a trusted CA and contain a valid payload.</div>
+                    <div class="muted" style="margin-top:6px;">Allowed: .opsepm. Limit: {h(format_bytes(MAX_MODULE_UPLOAD_BYTES))}.</div>
                     <input class="control" type="file" name="module_file" accept=".opsepm" required>
                 </div>
             </div>

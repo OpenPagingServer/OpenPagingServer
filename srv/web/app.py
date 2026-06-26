@@ -471,14 +471,15 @@ def legacy_sidebar_html(ctx, active):
         )
     if ctx.get("is_admin"):
         admin_links = [
-            ("/admin/manage-users", "users-cog", "Manage Users"),
-            ("/admin/manage-endpoints", "shapes", "Manage Endpoints"),
-            ("/admin/manage-groups", "user-group", "Manage Groups"),
-            ("/admin/settings/general", "cogs", "Server Settings"),
+            ("/admin/manage-users", "users-cog", "Manage Users", "users"),
+            ("/admin/manage-endpoints", "shapes", "Manage Endpoints", "endpoints"),
+            ("/admin/manage-groups", "user-group", "Manage Groups", "groups"),
+            ("/admin/settings/general", "cogs", "Server Settings", "settings"),
         ]
-        for href, icon, label in admin_links:
+        for href, icon, label, key in admin_links:
+            cls = "admin-only active" if active == key else "admin-only"
             nav_links.append(
-                f'<a href="{h(href)}" class="admin-only"><span class="nav-icon"><i class="fa-solid fa-{icon}"></i></span><span class="nav-label">{h(label)}</span></a>'
+                f'<a href="{h(href)}" class="{cls}"><span class="nav-icon"><i class="fa-solid fa-{icon}"></i></span><span class="nav-label">{h(label)}</span></a>'
             )
     if ctx.get("show_online_docs") == "1":
         nav_links.append(
@@ -641,8 +642,9 @@ a{color:#1976d2;text-decoration:none}a:hover{text-decoration:underline}
 .sidebar a,.sidebar .brand{color:white;display:flex;align-items:center;gap:10px;padding:12px 20px;border-bottom:1px solid rgba(255,255,255,.14);box-sizing:border-box}.sidebar a.active,.sidebar a:hover{background:#1565c0;text-decoration:none}.sidebar .nav-icon{width:24px;display:inline-flex;justify-content:center;flex:0 0 24px}.sidebar .logout{margin-top:auto;background:#c62828}.sidebar-logo{display:block;max-width:170px;max-height:64px;object-fit:contain;margin:auto}
 .content{margin-left:220px;padding:24px;box-sizing:border-box;width:calc(100% - 220px)}h1,h2{font-weight:400;color:#1976d2}.card{border:1px solid #e5e5e5;border-radius:8px;padding:16px;margin:0 0 16px;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.08)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px}.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 input,select,textarea{box-sizing:border-box;width:100%;padding:10px;border:1px solid #bbb;border-radius:4px;font:inherit;background:#fff;color:#222}textarea{min-height:110px}.button,button{display:inline-flex;align-items:center;gap:8px;border:0;border-radius:4px;background:#1976d2;color:#fff;padding:10px 14px;font:inherit;cursor:pointer;text-decoration:none}.button:hover,button:hover{background:#1565c0;text-decoration:none}.danger{background:#c62828}.danger:hover{background:#b71c1c}.muted{color:#666}.table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid #eee;text-align:left;padding:10px;vertical-align:top}.flash{padding:12px;border-radius:4px;margin-bottom:16px}.success{background:#e8f5e9;color:#1b5e20}.error{background:#ffebee;color:#b71c1c}.tabs{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}.tabs a{padding:10px 14px;background:#f5f5f5;border-radius:5px 5px 0 0}.tabs a.active{background:#1976d2;color:#fff;text-decoration:none}.pill{display:inline-block;padding:4px 8px;border-radius:999px;background:#e3f2fd;color:#1565c0}
+.md-checkbox-container{display:flex;align-items:center;position:relative;cursor:pointer;font-size:14px;font-weight:500;color:#222;user-select:none;gap:12px}.md-checkbox-container input{position:absolute;opacity:0;cursor:pointer;height:0;width:0}.md-checkmark{position:relative;display:inline-block;flex:0 0 auto;height:20px;width:20px;background:#fff;border:2px solid #5f6368;border-radius:2px;transition:all .2s}.md-checkbox-container:hover input ~ .md-checkmark{border-color:#202124}.md-checkbox-container input:checked ~ .md-checkmark{background:#1976D2;border-color:#1976D2}.md-checkmark:after{content:"";position:absolute;display:none;left:6px;top:2px;width:4px;height:10px;border:solid #fff;border-width:0 2px 2px 0;transform:rotate(45deg)}.md-checkbox-container input:checked ~ .md-checkmark:after{display:block}
 @media(max-width:767px){.layout{display:block}.sidebar{position:static;width:100%;min-height:auto}.content{margin-left:0;width:100%;padding:16px}.table{display:block;overflow-x:auto}}
-@media(prefers-color-scheme:dark){body,html{background:#121212;color:#e0e0e0}.sidebar{background:#424242}.sidebar a.active,.sidebar a:hover{background:#505050}.card{background:#1e1e1e;border-color:#333;box-shadow:none}.table th,.table td{border-color:#333}input,select,textarea{background:#222;color:#e0e0e0;border-color:#555}h1,h2{color:#90caf9}.muted{color:#bbb}.tabs a{background:#222}.pill{background:#263238;color:#90caf9}}
+@media(prefers-color-scheme:dark){body,html{background:#121212;color:#e0e0e0}.sidebar{background:#424242}.sidebar a.active,.sidebar a:hover{background:#505050}.card{background:#1e1e1e;border-color:#333;box-shadow:none}.table th,.table td{border-color:#333}input,select,textarea{background:#222;color:#e0e0e0;border-color:#555}h1,h2{color:#90caf9}.muted{color:#bbb}.tabs a{background:#222}.pill{background:#263238;color:#90caf9}.md-checkbox-container{color:#E0E0E0}.md-checkmark{border-color:#9AA0A6;background:#1E1E1E}.md-checkbox-container:hover input ~ .md-checkmark{border-color:#E8EAED}.md-checkbox-container input:checked ~ .md-checkmark{background:#8AB4F8;border-color:#8AB4F8}.md-checkmark:after{border-color:#1E1E1E}}
 """
 
 LEGACY_GENERIC_STYLE = """
@@ -677,6 +679,7 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .muted{ color:#777; }
 input,select,textarea{ box-sizing:border-box; padding:10px; border:1px solid #DDD; border-radius:4px; background:#FFF; color:#000; font-family:inherit; }
 label{ display:block; margin-bottom:10px; }
+.md-checkbox-container{display:flex;align-items:center;position:relative;cursor:pointer;font-size:14px;font-weight:500;color:#202124;user-select:none;gap:12px}.md-checkbox-container input{position:absolute;opacity:0;cursor:pointer;height:0;width:0}.md-checkmark{position:relative;display:inline-block;flex:0 0 auto;height:20px;width:20px;background:#FFF;border:2px solid #5f6368;border-radius:2px;transition:all .2s}.md-checkbox-container:hover input ~ .md-checkmark{border-color:#202124}.md-checkbox-container input:checked ~ .md-checkmark{background:#1976D2;border-color:#1976D2}.md-checkmark:after{content:"";position:absolute;display:none;left:6px;top:2px;width:4px;height:10px;border:solid #FFF;border-width:0 2px 2px 0;transform:rotate(45deg)}.md-checkbox-container input:checked ~ .md-checkmark:after{display:block}
 .flash{ padding:12px 14px; border-radius:8px; margin-bottom:14px; }
 .success{ background:#E6F4EA; border:1px solid #CEEAD6; color:#137333; }
 .error{ background:#FCE8E6; border:1px solid #F6AEA9; color:#A50E0E; }
@@ -693,6 +696,11 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 .card{ border:1px solid #333; background-color:#1E1E1E; box-shadow:none; }
 .table th,.table td{ border-color:#333; }
 input,select,textarea{ background:#333; border-color:#444; color:#FFF; }
+.md-checkbox-container{color:#E0E0E0;}
+.md-checkmark{border-color:#9AA0A6;background:#1E1E1E;}
+.md-checkbox-container:hover input ~ .md-checkmark{border-color:#E8EAED;}
+.md-checkbox-container input:checked ~ .md-checkmark{background:#8AB4F8;border-color:#8AB4F8;}
+.md-checkmark:after{border-color:#1E1E1E;}
 .button,button{ background:#BB86FC; color:#000; }
 .button:hover,button:hover{ background:#A370F7; }
 .danger{ background:#CF6679; color:#000; }
@@ -741,7 +749,7 @@ def simple_form(title, fields, action, values=None, submit="Save", extra=""):
             )
             controls.append(f'<label>{h(label)}<select name="{h(name)}">{opts}</select></label>')
         elif kind == "checkbox":
-            controls.append(f'<label><input type="checkbox" name="{h(name)}" value="1"{" checked" if truthy(value) else ""}> {h(label)}</label>')
+            controls.append(f'<label class="md-checkbox-container"><input type="checkbox" name="{h(name)}" value="1"{" checked" if truthy(value) else ""}><span class="md-checkmark"></span><span>{h(label)}</span></label>')
         else:
             controls.append(f'<label>{h(label)}<input type="{h(kind)}" name="{h(name)}" value="{h(value)}"></label>')
     return f'<h1>{h(title)}</h1><form method="post" enctype="multipart/form-data" action="{h(action)}" class="card grid">{"".join(controls)}{extra}<div class="actions"><button type="submit"><i class="fa-solid fa-save"></i>{h(submit)}</button></div></form>'
@@ -948,7 +956,7 @@ def builtin_endpoint_modules():
         "siptrunks": {
             "module": "siptrunks",
             "name": "SIP Trunks",
-            "description": "Built-in SIP trunk, SIP dialplan, and SIP number endpoint management.",
+            "description": "Interconnect Open Paging Server with a VoIP-based PBX or ITSP",
             "developer": "Open Paging Server",
             "input_type": "Input+Output",
             "version": endpoints.OPS_VERSION,
@@ -1373,6 +1381,11 @@ SETTINGS_TABS = "<div class='tabs'><a href='/admin/settings/general'>General</a>
 @alias("/admin/settings/general", methods=["GET", "POST"])
 def settings_general():
     return dispatch_web_page("admin/settings/general")
+
+
+@alias("/admin/settings/multicast-gateway", methods=["GET", "POST"])
+def settings_multicast_gateway():
+    return dispatch_web_page("admin/settings/multicast-gateway")
 
 
 @alias("/admin/settings/login", methods=["GET", "POST"])

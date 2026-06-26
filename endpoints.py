@@ -45,6 +45,7 @@ from active_broadcast_store import (
     mark_active_broadcast_delivery,
     put_active_broadcast,
 )
+from multicastgatewayd import encode_local_source_packet
 
 try:
     from broadcasts import is_audio_type, message_expiration_is_immediate
@@ -909,22 +910,6 @@ def default_ipv4_multicast_interface():
     return None
 
 
-def gateway_recv_exact(sock, size):
-    data = bytearray()
-    while len(data) < size:
-        chunk = sock.recv(size - len(data))
-        if not chunk:
-            raise OSError("gateway connection closed")
-        data.extend(chunk)
-    return bytes(data)
-
-
-def gateway_frame_bytes(header, payload):
-    header_bytes = json.dumps(header, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    payload_bytes = bytes(payload or b"")
-    return struct.pack("!II", len(header_bytes), len(payload_bytes)) + header_bytes + payload_bytes
-
-
 def normalize_multicast_socket_destination(address):
     if not isinstance(address, tuple) or len(address) < 2:
         return None
@@ -965,16 +950,10 @@ def connect_multicast_gateway_source():
     if now < multicast_gateway_source_next_retry:
         return None
     multicast_gateway_source_next_retry = now + 5.0
-    sock = socket.create_connection((MULTICAST_GATEWAY_HOST, MULTICAST_GATEWAY_PORT), timeout=1.0)
-    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    sock.sendall(
-        json.dumps(
-            {"role": "source", "service": "endpoints", "pid": os.getpid()},
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        + b"\n"
-    )
+    infos = socket.getaddrinfo(MULTICAST_GATEWAY_HOST, MULTICAST_GATEWAY_PORT, socket.AF_UNSPEC, socket.SOCK_DGRAM)
+    family, _socktype, _proto, _canonname, sockaddr = infos[0]
+    sock = socket.socket(family, socket.SOCK_DGRAM)
+    sock.connect(sockaddr)
     multicast_gateway_source_sock = sock
     multicast_gateway_source_next_retry = 0.0
     return multicast_gateway_source_sock
@@ -1003,7 +982,15 @@ def forward_multicast_packet(payload, address, port, family=None, ttl=None):
             sock = connect_multicast_gateway_source()
             if sock is None:
                 return False
-            sock.sendall(gateway_frame_bytes(header, data))
+            sock.send(
+                encode_local_source_packet(
+                    address,
+                    port,
+                    data,
+                    family=socket.AF_INET6 if header.get("family") == 6 else socket.AF_INET,
+                    ttl=header.get("ttl"),
+                )
+            )
             return True
         except OSError:
             close_multicast_gateway_source()
@@ -1754,7 +1741,7 @@ def get_siptrunks_endpoint_status():
         "module": "siptrunks",
         "display_name": "SIP Trunks",
         "name": "SIP Trunks",
-        "description": "Built-in SIP trunk, SIP dialplan, and SIP number endpoint management.",
+        "description": "Interconnect Open Paging Server with a VoIP-based PBX or ITSP",
         "system_builtin": True,
         "enabled": True,
         "loaded": True,
@@ -1876,8 +1863,8 @@ def sip_form_frame(body):
         "button,.button{background:#1976D2;color:#fff;border:0;border-radius:6px;padding:10px 14px;font:inherit;cursor:pointer;justify-self:start;text-decoration:none}.danger{background:#C62828}"
         ".success{background:#E8F5E9;border:1px solid #A5D6A7;color:#1B5E20;padding:10px;border-radius:6px;margin-bottom:12px}.error{background:#FFEBEE;border:1px solid #EF9A9A;color:#B71C1C;padding:10px;border-radius:6px;margin-bottom:12px}.notice{background:#FFF8E1;border:1px solid #FFE082;color:#5D4037;padding:10px;border-radius:6px;margin-bottom:12px;line-height:1.4}.meta{color:#5f6368;margin:0 0 14px}.advanced{border:1px solid #e6e8eb;border-radius:6px;overflow:hidden}.advanced summary{cursor:pointer;padding:10px 11px;font-weight:500}.advanced-body{border-top:1px solid #e6e8eb;padding:12px;display:grid;gap:14px}"
         ".dropdown-checklist{position:relative}.dropdown-checklist summary{list-style:none;cursor:pointer;padding:10px 11px;border:1px solid #ccd1d5;border-radius:6px;background:#fff}.dropdown-checklist summary::-webkit-details-marker{display:none}.dropdown-panel{position:absolute;top:calc(100% + 6px);left:0;right:0;z-index:20;border:1px solid #d8dde2;border-radius:6px;padding:8px;display:grid;gap:6px;max-height:220px;overflow:auto;background:#fff;box-shadow:0 8px 18px rgba(0,0,0,.14)}"
-        ".check{display:flex;gap:8px;align-items:center;font-weight:400}.check.disabled{opacity:.55}.switch-row{display:flex;align-items:center;gap:10px}.switch{position:relative;width:44px;height:24px}.switch input{opacity:0;width:0;height:0}.slider{position:absolute;cursor:pointer;inset:0;background:#9aa0a6;border-radius:999px;transition:.2s}.slider:before{content:\"\";position:absolute;height:18px;width:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 2px rgba(0,0,0,.25)}.switch input:checked + .slider{background:#1976D2}.switch input:checked + .slider:before{transform:translateX(20px)}.hint{color:#5f6368;font-size:.9em}"
-        "@media(prefers-color-scheme:dark){body{background:#1e1e1e;color:#e0e0e0}.form-surface,.surface{background:#232323;border-color:#333;box-shadow:none}.control,input,select,.dropdown-checklist summary,.dropdown-panel{background:#171717;border-color:#3a3a3a;color:#eee}.notice{background:#332800;border-color:#5f4b00;color:#FFE8A3}.advanced{border-color:#333}.advanced-body{border-top-color:#333}button,.button{background:#BB86FC;color:#000}.danger{background:#EF9A9A}.meta,.hint{color:#aaa}.switch input:checked + .slider{background:#BB86FC}}</style>"
+        ".md-checkbox-container{display:flex;align-items:center;position:relative;cursor:pointer;font-size:14px;font-weight:400;color:#202124;user-select:none;width:100%;gap:12px}.md-checkbox-container input{position:absolute;opacity:0;cursor:pointer;height:0;width:0}.md-checkmark{position:relative;display:inline-block;flex:0 0 auto;height:20px;width:20px;background:#fff;border:2px solid #5f6368;border-radius:2px;transition:all .2s}.md-checkbox-container:hover input ~ .md-checkmark{border-color:#202124}.md-checkbox-container input:checked ~ .md-checkmark{background:#1976D2;border-color:#1976D2}.md-checkmark:after{content:\"\";position:absolute;display:none;left:6px;top:2px;width:4px;height:10px;border:solid #fff;border-width:0 2px 2px 0;transform:rotate(45deg)}.md-checkbox-container input:checked ~ .md-checkmark:after{display:block}.md-checkbox-text{flex:1 1 auto;min-width:0}.check.disabled{opacity:.55}.switch-row{display:flex;align-items:center;gap:10px}.switch{position:relative;width:44px;height:24px}.switch input{opacity:0;width:0;height:0}.slider{position:absolute;cursor:pointer;inset:0;background:#9aa0a6;border-radius:999px;transition:.2s}.slider:before{content:\"\";position:absolute;height:18px;width:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 2px rgba(0,0,0,.25)}.switch input:checked + .slider{background:#1976D2}.switch input:checked + .slider:before{transform:translateX(20px)}.hint{color:#5f6368;font-size:.9em}"
+        "@media(prefers-color-scheme:dark){body{background:#1e1e1e;color:#e0e0e0}.form-surface,.surface{background:#232323;border-color:#333;box-shadow:none}.control,input,select,.dropdown-checklist summary,.dropdown-panel{background:#171717;border-color:#3a3a3a;color:#eee}.notice{background:#332800;border-color:#5f4b00;color:#FFE8A3}.advanced{border-color:#333}.advanced-body{border-top-color:#333}button,.button{background:#BB86FC;color:#000}.danger{background:#EF9A9A}.meta,.hint,.md-checkbox-container{color:#aaa}.md-checkmark{border-color:#9AA0A6;background:#171717}.md-checkbox-container:hover input ~ .md-checkmark{border-color:#E8EAED}.md-checkbox-container input:checked ~ .md-checkmark{background:#8AB4F8;border-color:#8AB4F8}.md-checkmark:after{border-color:#171717}.switch input:checked + .slider{background:#BB86FC}}</style>"
         + body
     )
 
@@ -1885,7 +1872,7 @@ def sip_form_frame(body):
 def sip_dialplan_fields(values):
     selected_groups = set(str(values["group"] or "").split(".")) if values.get("group") else set()
     group_options = "".join(
-        f"""<label class="check"><input type="checkbox" class="group-check" value="{h(row.get("id"))}" data-label="{h("All Recipients" if str(row.get("id")) == "0" else row.get("name") or row.get("id"))}"{" checked" if str(row.get("id")) in selected_groups else ""}> {h("All Recipients" if str(row.get("id")) == "0" else str(row.get("id")) + (" - " + str(row.get("name")) if row.get("name") else ""))}</label>"""
+        f"""<label class="check md-checkbox-container"><input type="checkbox" class="group-check" value="{h(row.get("id"))}" data-label="{h("All Recipients" if str(row.get("id")) == "0" else row.get("name") or row.get("id"))}"{" checked" if str(row.get("id")) in selected_groups else ""}><span class="md-checkmark"></span><span class="md-checkbox-text">{h("All Recipients" if str(row.get("id")) == "0" else str(row.get("id")) + (" - " + str(row.get("name")) if row.get("name") else ""))}</span></label>"""
         for row in sip_fetch_groups()
     )
     if not group_options:
@@ -2155,8 +2142,8 @@ def sip_number_form_html(values, error, submit_label):
 <div class="row"><label>Number</label><input class="control" name="number" value="{h(values.get("number"))}" required></div>
 <div class="row"><label>CID Number</label><input class="control" name="cid_number" value="{h(values.get("cid_number"))}"><div class="hint">Ensure this is correct for your configuration or calls may fail.</div></div>
 <div class="row"><label>CNAM Caller ID Name</label><input class="control" name="cnam_name" value="{h(values.get("cnam_name"))}"><div class="hint">Some configurations may override the CNAM. CNAM is not sent over the PSTN, so it will only be shown internally.</div></div>
-<label class="check"><input type="checkbox" name="allow_cid_override" value="1"{" checked" if values.get("allow_cid_override") == "1" else ""}> Allow per-message CID Number override</label>
-<label class="check"><input type="checkbox" name="allow_cnam_override" value="1"{" checked" if values.get("allow_cnam_override") == "1" else ""}> Allow per-message CNAM Caller ID Name override</label>
+<label class="check md-checkbox-container"><input type="checkbox" name="allow_cid_override" value="1"{" checked" if values.get("allow_cid_override") == "1" else ""}><span class="md-checkmark"></span><span class="md-checkbox-text">Allow per-message CID Number override</span></label>
+<label class="check md-checkbox-container"><input type="checkbox" name="allow_cnam_override" value="1"{" checked" if values.get("allow_cnam_override") == "1" else ""}><span class="md-checkmark"></span><span class="md-checkbox-text">Allow per-message CNAM Caller ID Name override</span></label>
 <div class="row"><label>Mode</label><select class="control short-control" name="mode" id="sipNumberMode"><option value="page"{" selected" if values.get("mode") == "page" else ""}>Page</option><option value="telephone"{" selected" if values.get("mode") == "telephone" else ""}>Telephone</option></select></div>
 <div class="notice" id="sipModeNotice">Use page mode when the call is automatically picked up. Such as by a paging zone controller, PBX page group, etc. This endpoint will behave like a speaker where the broadcast will not start until all endpoints in a group including this one is ready to receive the page.<br><br>Use telephone mode if this is calling a person(s). Such as when calling a cellphone, telephone, ring group, etc. In this mode, broadcast audio is sent independently of all other endpoints so that, for example, a user picking up the phone a long time after a broadcast begins can hear the full broadcast while speakers inside of a building can freely play and finish the broadcast in the meantime.</div>
 <div class="row"><label>Alert-Info Header</label><select class="control" name="alert_info_mode" id="alertInfoMode">{alert_options}</select><div class="hint">Most VoIP systems are a Back-to-Back User Agent (B2BUA) by design and may require a dialplan or configuration change to allow Alert-Info headers to pass through.</div></div>
@@ -2165,7 +2152,7 @@ def sip_number_form_html(values, error, submit_label):
 <div class="row"><label>Answer Timeout (seconds)</label><input class="control short-control" type="number" min="0" max="3600" name="answer_timeout" id="answerTimeout" value="{h(values.get("answer_timeout"))}"><div class="hint">US: <span id="ringsUs"></span> rings | UK/AU: <span id="ringsUk"></span> rings | ETSI: <span id="ringsEtsi"></span> rings</div></div>
 <div class="row"><label>Answer Timeout Retries</label><input class="control short-control" type="number" min="0" max="8" name="answer_timeout_retry_limit" value="{h(values.get("answer_timeout_retry_limit"))}"></div>
 <div class="row"><label>Answer Timeout Retry Delay (seconds)</label><input class="control short-control" type="number" min="5" max="60" name="answer_timeout_retry_delay" value="{h(values.get("answer_timeout_retry_delay"))}"></div>
-<label class="check"><input type="checkbox" name="amd_enabled" value="1" id="amdEnabled"{" checked" if values.get("amd_enabled") == "1" else ""}> Enable Answering Machine Detection</label>
+<label class="check md-checkbox-container"><input type="checkbox" name="amd_enabled" value="1" id="amdEnabled"{" checked" if values.get("amd_enabled") == "1" else ""}><span class="md-checkmark"></span><span class="md-checkbox-text">Enable Answering Machine Detection</span></label>
 <div id="amdOptions">
 <div class="row"><label>If a machine answers</label><select class="control short-control" name="amd_action" id="amdAction">{amd_options}</select></div>
 <div class="row" id="amdRetryLimitRow"><label>Answering Machine Retries</label><input class="control short-control" type="number" min="0" max="8" name="amd_retry_limit" value="{h(values.get("amd_retry_limit"))}"></div>
@@ -2393,8 +2380,8 @@ class BuiltinSipTrunksWeb:
                 "label": "Outbound-Authenticated SIP Trunk",
                 "description": "Trunk Open Paging Server into a VoIP server or ITSP. Does not require SIP/RTP to be open to the internet on this server.",
             },
-            "dialplan": {"label": "SIP Dialplan Extension", "description": "Route a SIP extension to paging, messaging, test tone, or echo test."},
-            "number": {"label": "SIP Number Endpoint", "description": "Dial a number over a SIP trunk and use it like an output endpoint."},
+            "dialplan": {"label": "Dialplan Extension", "description": "Define where incoming calls from a SIP trunk go on a per DID basis. Paging, sending messages, test tone, and echo test."},
+            "number": {"label": "Outbound Dial", "description": "Send broadcasts to any phone number or extension over a SIP trunk. Such as cellphones, POTS telephones, zone controllers, page groups, and more. Use outbound dial endpoints in any group."},
         }
 
     def render_message_vendor_specific(self, value="", field_name="", context=None):
@@ -5682,3 +5669,4 @@ def handle_ipc_client(conn):
         log(f"IPC connection handler error: {exc}")
     finally:
         conn.close()
+

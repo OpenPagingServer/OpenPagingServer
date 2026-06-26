@@ -398,6 +398,7 @@ def seed_defaults(cursor):
             "Use a separate logo for dark mode. When disabled, uses only logo_light. (0/1)",
         ),
         ("show_online_docs", "1", "Show GUI links to docs.openpagingserver.org (0/1)"),
+        ("allow_multicast_gateway", "1", "Allow Multicast Gateway connections to this server (0/1)"),
         ("use_logo_in_sidebar", "1", "Use a logo in the sidebar, if disabled the product name will show"),
         ("sidebar_logo_light", "/assets/OPENPAGINGSERVER-768x576-LIGHTMODE.png", "Light mode logo for the sidebar"),
         ("sidebar_logo_dark", "/assets/OPENPAGINGSERVER-768x576-DARKMODE.png", "Dark mode logo for the sidebar"),

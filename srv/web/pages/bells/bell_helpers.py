@@ -47,8 +47,17 @@ h1{font-weight:400;margin:0;}
 input,select{border:1px solid #CCC;border-radius:4px;padding:10px;font:inherit;background:#FFF;color:#202124;box-sizing:border-box;width:100%;}
 .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;}
 .row>*{flex:1;}
-.checkbox-row{display:flex;align-items:center;gap:8px;padding:7px 0;}
-.checkbox-row input{width:auto;}
+.md-checkbox-container{display:flex;align-items:center;position:relative;cursor:pointer;font-size:14px;font-weight:500;color:#555;user-select:none;gap:12px;}
+.md-checkbox-container input{position:absolute;opacity:0;cursor:pointer;height:0;width:0;}
+.md-checkmark{position:relative;display:inline-block;flex:0 0 auto;height:20px;width:20px;background:#FFF;border:2px solid #5f6368;border-radius:2px;transition:all .2s;}
+.md-checkbox-container:hover input ~ .md-checkmark{border-color:#202124;}
+.md-checkbox-container input:checked ~ .md-checkmark{background:#1976D2;border-color:#1976D2;}
+.md-checkmark:after{content:"";position:absolute;display:none;left:6px;top:2px;width:4px;height:10px;border:solid #FFF;border-width:0 2px 2px 0;transform:rotate(45deg);}
+.md-checkbox-container input:checked ~ .md-checkmark:after{display:block;}
+.md-checkbox-text{flex:1 1 auto;min-width:0;}
+.checkbox-row{display:flex;align-items:center;padding:7px 0;}
+.checkbox-tile{justify-content:flex-start;min-height:42px;padding:10px 12px;box-sizing:border-box;text-align:left;border:1px solid #EEE;border-radius:10px;background:#FFF;}
+.checkbox-grid{display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;gap:8px;width:100%;max-width:320px;text-align:left;margin:0;}
 .muted{color:#777;font-size:.9em;}
 .error{background:#FFEBEE;border:1px solid #EF9A9A;color:#B71C1C;padding:12px;border-radius:8px;margin-bottom:16px;}
 .calendar-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px;}
@@ -77,7 +86,9 @@ input,select{border:1px solid #CCC;border-radius:4px;padding:10px;font:inherit;b
 .schedule-tabs a{color:#1976D2;text-decoration:none;padding:8px 10px;border-radius:4px;display:inline-flex;align-items:center;gap:7px;font-size:.94em;}
 .schedule-tabs a.active,.schedule-tabs a:hover{background:#E3F2FD;color:#1565C0;}
 .weekday-row{display:flex;flex-wrap:wrap;gap:6px;}
-.weekday-chip{display:inline-flex;align-items:center;gap:5px;border:1px solid #DDD;border-radius:4px;padding:6px 8px;background:#FAFAFA;font-size:.9em;}
+.weekday-chip{display:inline-flex;align-items:center;gap:8px;border:1px solid #DDD;border-radius:4px;padding:6px 8px;background:#FAFAFA;font-size:.9em;}
+.weekday-chip .md-checkmark{height:18px;width:18px;}
+.weekday-chip .md-checkmark:after{left:5px;top:1px;}
 @media(max-width:980px){.schedule-settings-grid{grid-template-columns:1fr 1fr;}.schedule-enabled{align-self:center;}}
 @media(max-width:620px){.schedule-settings-grid{grid-template-columns:1fr;}.server-clock{text-align:left;}}
 @media(prefers-color-scheme:dark){
@@ -93,12 +104,18 @@ body,html{background:#121212;color:#E0E0E0;}
 .list-item,.event{border-bottom-color:#333;}
 .list-meta{color:#CCC;}
 input,select{background:#121212;border-color:#444;color:#E0E0E0;}
+.md-checkbox-container{color:#BBB;}
+.md-checkmark{border-color:#9AA0A6;background:#1E1E1E;}
+.md-checkbox-container:hover input ~ .md-checkmark{border-color:#E8EAED;}
+.md-checkbox-container input:checked ~ .md-checkmark{background:#8AB4F8;border-color:#8AB4F8;}
+.md-checkmark:after{border-color:#1E1E1E;}
 .btn{background:#BB86FC;color:#000;}
 .btn.secondary{background:transparent;color:#BB86FC;}
 .btn.danger{background:#CF6679;color:#000;}
 .error{background:#3B1515;border-color:#6D2A2A;color:#FFCDD2;}
 .day-list{background:#242424;border-color:#333;}
 .bell-list-card>.list-editor-head{border-bottom-color:#333;}
+.checkbox-tile{border-color:#333;background:#1E1E1E;}
 .weekday-chip{background:#242424;border-color:#444;}
 .schedule-tabs{border-top-color:#333;}
 .schedule-tabs a{color:#BB86FC;}
@@ -205,7 +222,7 @@ def schedule_settings_card(schedule, active_tab="settings", return_to=""):
     <div class="schedule-settings-grid">
         <div class="field"><label for="schedule_name">Schedule name</label><input id="schedule_name" name="name" value="{schedule_name}" required></div>
         <div class="field"><label for="schedule_timezone">Time zone</label><select id="schedule_timezone" name="timezone">{schedule_timezone}</select></div>
-        <label class="checkbox-row schedule-enabled"><input type="checkbox" name="enabled"{enabled_checked}><span>Enabled</span></label>
+        <label class="checkbox-row md-checkbox-container schedule-enabled"><input type="checkbox" name="enabled"{enabled_checked}><span class="md-checkmark"></span><span class="md-checkbox-text">Enabled</span></label>
         <button class="btn" type="submit"><i class="fa-solid fa-floppy-disk"></i> Save Schedule</button>
     </div>
     <div class="schedule-tabs">{tab_links}</div>

@@ -40,9 +40,10 @@ def handle_request():
                 <div style="margin-bottom:16px;">
                     <h4>Sidebar Logo</h4>
                     <p>When enabled, the sidebar uses the configured logo paths instead of the product name.</p>
-                    <label style="display:flex; gap:8px; align-items:center; margin-bottom:12px;">
-                        <input type="checkbox" name="use_logo_in_sidebar" value="1"{checked} style="width:auto;">
-                        <span>Use logo in sidebar</span>
+                    <label class="md-checkbox-container" style="margin-bottom:12px;">
+                        <input type="checkbox" name="use_logo_in_sidebar" value="1"{checked}>
+                        <span class="md-checkmark"></span>
+                        <span class="md-checkbox-text">Use logo in sidebar</span>
                     </label>
                     <div style="display:grid; gap:12px;">
                         <div>

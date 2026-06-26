@@ -3,6 +3,9 @@ from srv.web.pages.messages.form_common import (
     MESSAGE_FORM_SCRIPT,
     MESSAGE_FORM_STYLE,
     audio_transfer_html,
+    message_icon_field_html,
+    material_radio_group_html,
+    resolve_message_icon_value,
     message_expiration_field_html,
     message_expiration_from_form,
     message_variable_field_html,
@@ -47,6 +50,7 @@ def handle_request():
             "shortmessage": request.form.get("shortmessage", "") if has_text else "",
             "longmessage": message_multiline_text(request.form.get("longmessage", "")) if has_text else "",
             "color": request.form.get("color", "").lstrip("#") if has_text else "",
+            "icon": resolve_message_icon_value(request.form.get("icon", "")) if has_text else "",
             "audio": audio,
             "expires": message_expiration_from_form(request.form),
             "priority": request.form.get("priority", "Normal"),
@@ -54,7 +58,7 @@ def handle_request():
         }
 
         columns = table_columns("messages")
-        wanted = ["messageid", "name", "type", "shortmessage", "longmessage", "color", "audio", "expires", "priority", "vendor_specific"]
+        wanted = ["messageid", "name", "type", "shortmessage", "longmessage", "color", "icon", "audio", "expires", "priority", "vendor_specific"]
         insert = {k: values.get(k, "") for k in wanted if k in columns}
 
         execute(
@@ -66,6 +70,15 @@ def handle_request():
 
     selected_type = request.args.get("type", "")
     if selected_type not in message_types:
+        type_group = material_radio_group_html(
+            "type",
+            [
+                ("text+audio", "Audio & visual message"),
+                ("audio", "Audio message"),
+                ("text", "Visual message"),
+            ],
+            required=True,
+        )
         content = f"""    <div class="header-actions">
         <h1>New Message</h1>
     </div>
@@ -75,17 +88,7 @@ def handle_request():
 
             <div class="form-group">
                 <label class="main-label">Message Type</label>
-                <div class="radio-group">
-                    <label>
-                        <input type="radio" name="type" value="text+audio" required> Audio & visual message
-                    </label>
-                    <label>
-                        <input type="radio" name="type" value="audio"> Audio message
-                    </label>
-                    <label>
-                        <input type="radio" name="type" value="text"> Visual message
-                    </label>
-                </div>
+                {type_group}
             </div>
 
             <div style="margin-top: 20px;">
@@ -124,6 +127,7 @@ def handle_request():
                 </div>
             </div>
 """
+            + message_icon_field_html()
         )
 
     audio_fields = ""

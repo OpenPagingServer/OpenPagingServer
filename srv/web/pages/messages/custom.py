@@ -11,22 +11,19 @@ from srv.web.pages.messages.form_common import (
     MESSAGE_FORM_SCRIPT,
     MESSAGE_FORM_STYLE,
     audio_transfer_html,
+    material_radio_group_html,
+    message_expiration_field_html,
+    message_expiration_from_form,
+    message_icon_field_html,
     message_variable_field_html,
     message_variable_guide_html,
     message_multiline_text,
+    resolve_message_icon_value,
     vendor_specific_editor_html,
     vendor_specific_from_form,
 )
 
 CUSTOM_EXTRA_STYLE = r"""
-.md-checkbox-container{display:flex;align-items:center;position:relative;cursor:pointer;font-size:14px;font-weight:500;color:#555;user-select:none;width:100%;padding:5px 0;}
-.md-checkbox-container input{position:absolute;opacity:0;cursor:pointer;height:0;width:0;}
-.md-checkmark{position:relative;display:inline-block;height:20px;width:20px;background:#fff;border:2px solid #5f6368;border-radius:2px;margin-right:12px;transition:all 0.2s;flex:0 0 auto;}
-.md-checkbox-container:hover input ~ .md-checkmark{border-color:#202124;}
-.md-checkbox-container input:checked ~ .md-checkmark{background:#1976D2;border-color:#1976D2;}
-.md-checkmark:after{content:"";position:absolute;display:none;left:6px;top:2px;width:4px;height:10px;border:solid white;border-width:0 2px 2px 0;transform:rotate(45deg);}
-.md-checkbox-container input:checked ~ .md-checkmark:after{display:block;}
-.md-checkbox-container input:disabled ~ .md-checkmark{border-color:#dadce0;background:#f1f3f4;cursor:not-allowed;}
 .md-checkbox-container input:disabled ~ .text{color:#9aa0a6;cursor:not-allowed;}
 .recipient-note{color:#777;font-size:0.9em;margin-left:auto;white-space:nowrap;}
 .recipient-row.unavailable{opacity:0.58;}
@@ -36,12 +33,6 @@ CUSTOM_EXTRA_STYLE = r"""
 .btn-send:hover{background:#1B5E20;}
 .btn-cancel{color:#777;text-decoration:none;margin-left:10px;}
 @media(prefers-color-scheme:dark){
-    .md-checkbox-container{color:#BBB;}
-    .md-checkmark{border-color:#9AA0A6;background:#1E1E1E;}
-    .md-checkbox-container:hover input ~ .md-checkmark{border-color:#E8EAED;}
-    .md-checkbox-container input:checked ~ .md-checkmark{background:#8AB4F8;border-color:#8AB4F8;}
-    .md-checkmark:after{border-color:#1E1E1E;}
-    .md-checkbox-container input:disabled ~ .md-checkmark{border-color:#5F6368;background:#3C4043;}
     .recipient-note{color:#9E9E9E;}
     .recipient-row.unavailable .md-checkmark{border-color:#555;background:#2A2A2A;}
     .btn-send{background:#81C784;color:#000;}
@@ -111,6 +102,8 @@ def handle_request():
     ensure_message_vendor_schema()
 
     if request.method == "POST":
+        msg_type = request.form.get("type", "text")
+        has_text = msg_type in {"text", "text+audio"}
         if request.form.get("send_all"):
             groups_value = "0"
         else:
@@ -118,20 +111,20 @@ def handle_request():
             groups_value = ".".join(selected)
         if groups_value == "":
             return redirect("/messages/custom")
-        expires_rule = request.form.get("expires", "manual").strip() or "manual"
+        expires_rule = message_expiration_from_form(request.form)
         create_custom_broadcast(
             {
                 "name": "Custom message",
                 "shortmessage": request.form.get("shortmessage", ""),
                 "longmessage": message_multiline_text(request.form.get("longmessage", "")),
-                "icon": request.form.get("icon", ""),
+                "icon": resolve_message_icon_value(request.form.get("icon", "")) if has_text else "",
                 "color": request.form.get("color", "").lstrip("#"),
                 "groups": groups_value,
                 "image": request.form.get("image", ""),
                 "audio": ":".join(request.form.getlist("audio_files[]")),
                 "sender": user.get("username") or session.get("username") or "User",
                 "priority": request.form.get("priority", "Normal"),
-                "type": request.form.get("type", "text"),
+                "type": msg_type,
                 "vendor_specific": vendor_specific_from_form(request.form),
             },
             expires_rule,
@@ -139,6 +132,7 @@ def handle_request():
         return redirect("/messages/")
 
     groups = query_all("SELECT id, name, members FROM `groups` ORDER BY name ASC")
+    expiration_messages = query_all("SELECT messageid, name FROM messages ORDER BY name ASC, messageid ASC")
     endpoint_data = endpoint_ipc("LIST_ENDPOINTS")
     endpoint_error = None if endpoint_data.get("ok", True) else endpoint_data.get("error") or "Endpoint manager returned an error."
     endpoint_availability = endpoint_availability_map(endpoint_data)
@@ -168,6 +162,16 @@ def handle_request():
         groups_html = '<p class="help-text">No groups are available.</p>'
     transfer = audio_transfer_html(audio_files())
     vendor_specific_html = vendor_specific_editor_html(context={"mode": "message_custom"})
+    type_group = material_radio_group_html(
+        "type",
+        [
+            ("text+audio", "Audio & visual message"),
+            ("audio", "Audio message"),
+            ("text", "Visual message"),
+        ],
+        onchange="toggleFields()",
+        required=True,
+    )
     variable_fields = (
         message_variable_field_html(
             "shortmessage",
@@ -201,31 +205,24 @@ def handle_request():
             </div>
             <div class="form-group">
                 <label class="main-label">Message Type</label>
-                <div class="radio-group">
-                    <label><input type="radio" name="type" value="text+audio" onchange="toggleFields()" required> Audio & visual message</label>
-                    <label><input type="radio" name="type" value="audio" onchange="toggleFields()"> Audio message</label>
-                    <label><input type="radio" name="type" value="text" onchange="toggleFields()"> Visual message</label>
-                </div>
+                {type_group}
             </div>
             <div id="visual-fields" style="display:none;">
 {variable_fields}
                 <div class="form-group">
                     <label class="main-label">Color</label>
-                    <div class="color-picker-container">
-                        <input type="color" id="colorPicker" value="#000000" class="color-picker-input">
-                        <input type="text" name="color" id="colorHex" class="form-control" style="width:150px;" placeholder="000000" maxlength="6">
-                    </div>
+                <div class="color-picker-container">
+                    <input type="color" id="colorPicker" value="#000000" class="color-picker-input">
+                    <input type="text" name="color" id="colorHex" class="form-control" style="width:150px;" placeholder="000000" maxlength="6">
                 </div>
+            </div>
+{message_icon_field_html()}
             </div>
             <div id="audio-fields" style="display:none;" class="form-group">
                 <label class="main-label">Audio</label>
                 {transfer}
             </div>
-            <div class="form-group">
-                <label class="main-label" for="expires">Expiration</label>
-                <p class="help-text">Use 30m or 15m, msg=3 or msg=3.4, or manual for no automatic expiration.</p>
-                <input type="text" name="expires" id="expires" class="form-control" value="manual">
-            </div>
+            {message_expiration_field_html(expiration_messages)}
             <div class="form-group">
                 <label class="main-label" for="priority">Priority</label>
                 <select name="priority" id="priority" class="form-control">

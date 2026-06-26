@@ -1,5 +1,6 @@
-
 import inspect
+from pathlib import Path
+from urllib.parse import urlencode
 
 from broadcasts import (
     message_expiration_state,
@@ -8,7 +9,10 @@ from broadcasts import (
     serialize_message_expiration,
     serialize_vendor_specific,
 )
-from srv.web.app import h
+from srv.web.app import ASSET_DIR, asset_filename, asset_path, h
+
+
+MESSAGE_ICON_MAX_DIMENSION = 1080
 
 
 MESSAGE_FORM_STYLE = r"""
@@ -43,6 +47,15 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .help-text { font-size: 0.9em; color: #666; margin-top: 0; margin-bottom: 12px; line-height: 1.4; }
 .radio-group label { display: block; margin-bottom: 8px; font-weight: normal; cursor: pointer; }
 .radio-group input[type="radio"] { margin-right: 8px; }
+.md-radio-group{display:flex;flex-direction:column;gap:10px;}
+.md-radio-option{display:flex;align-items:center;gap:12px;cursor:pointer;font-weight:400;color:#202124;user-select:none;}
+.md-radio-option input{position:absolute;opacity:0;pointer-events:none;}
+.md-radio-indicator{width:20px;height:20px;border:2px solid #5f6368;border-radius:50%;position:relative;box-sizing:border-box;flex:0 0 auto;transition:border-color 0.2s, box-shadow 0.2s;}
+.md-radio-indicator:after{content:"";position:absolute;top:50%;left:50%;width:10px;height:10px;border-radius:50%;background:#1976D2;transform:translate(-50%,-50%) scale(0);transition:transform 0.2s;}
+.md-radio-option input:checked + .md-radio-indicator{border-color:#1976D2;}
+.md-radio-option input:checked + .md-radio-indicator:after{transform:translate(-50%,-50%) scale(1);}
+.md-radio-option:hover .md-radio-indicator{border-color:#202124;}
+.md-radio-text{display:flex;align-items:center;min-width:0;}
 .color-picker-container { display: flex; align-items: center; gap: 12px; }
 .color-picker-input { height: 42px; width: 42px; padding: 0; border: 1px solid #DDD; border-radius: 4px; cursor: pointer; background: none; }
 .transfer-list-container { display: flex; gap: 15px; align-items: stretch; height: 300px; margin-top: 10px; }
@@ -137,6 +150,48 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .message-expiration-any-locked .md-checkmark{background:#d7dde3;border-color:#b0bec5;}
 .message-expiration-any-locked .md-checkmark:after{display:block;border-color:#5f6368;}
 .message-expiration-any-locked .message-expiration-text{color:#9aa0a6;}
+.message-icon-selection{display:flex;flex-direction:column;align-items:flex-start;gap:16px;}
+.message-icon-summary{display:flex;align-items:center;gap:14px;min-width:0;width:100%;flex:0 0 auto;}
+.message-icon-preview{width:72px;height:72px;border-radius:14px;border:1px solid #E0E0E0;background:#F8FAFD;display:flex;align-items:center;justify-content:center;overflow:hidden;color:#5F6368;font-size:1.4em;flex:0 0 auto;}
+.message-icon-preview img{width:100%;height:100%;object-fit:cover;}
+.message-icon-text{min-width:0;}
+.message-icon-name{font-weight:500;font-size:1em;word-break:break-word;}
+.message-icon-meta{font-size:0.9em;color:#666;margin-top:4px;}
+.message-icon-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
+.message-icon-clear{border:1px solid #DADCE0;background:#FFF;color:#374151;border-radius:8px;padding:9px 12px;cursor:pointer;font:inherit;}
+.message-icon-clear:hover{background:#F9FAFB;}
+.message-icon-clear:disabled{opacity:0.6;cursor:not-allowed;}
+.message-icon-note{display:none;margin-top:12px;padding:12px 14px;border:1px solid #FFE08A;border-radius:10px;background:#FFF8E1;color:#8A5A00;}
+.message-icon-note.open{display:block;}
+.message-icon-picker-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:1450;}
+.message-icon-picker-backdrop.open{display:block;}
+.message-icon-picker-modal{display:none;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:min(980px,calc(100vw - 32px));max-height:calc(100vh - 40px);overflow:hidden;background:#FFF;border-radius:18px;box-shadow:0 18px 50px rgba(0,0,0,0.28);z-index:1500;}
+.message-icon-picker-modal.open{display:flex;flex-direction:column;}
+.message-icon-picker-header{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 20px;border-bottom:1px solid #EEE;}
+.message-icon-picker-header h2{margin:0;font-size:1.2em;font-weight:500;}
+.message-icon-picker-close{border:none;background:transparent;color:#666;font-size:1.4em;cursor:pointer;line-height:1;padding:4px 6px;}
+.message-icon-picker-close:hover{color:#111;}
+.message-icon-picker-body{padding:18px 20px 20px;overflow-y:auto;}
+.message-icon-picker-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:14px;}
+.message-icon-asset-card{border:1px solid #DADCE0;border-radius:16px;background:#FFF;padding:0;cursor:pointer;text-align:left;color:inherit;overflow:hidden;box-shadow:0 1px 2px rgba(60,64,67,.08);}
+.message-icon-asset-card:hover{border-color:#B6C8E1;box-shadow:0 4px 10px rgba(60,64,67,.12);}
+.message-icon-asset-card.selected{border-color:#1976D2;box-shadow:0 0 0 2px rgba(25,118,210,0.18);}
+.message-icon-asset-card.unsupported{opacity:0.48;}
+.message-icon-asset-card.unsupported:hover{border-color:#DADCE0;box-shadow:0 1px 2px rgba(60,64,67,.08);}
+.message-icon-asset-preview{height:132px;background:#F1F3F4;display:flex;align-items:center;justify-content:center;overflow:hidden;color:#5F6368;font-size:2em;}
+.message-icon-asset-preview img{width:100%;height:100%;object-fit:cover;}
+.message-icon-asset-info{padding:12px 14px 14px;}
+.message-icon-asset-name{font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.message-icon-asset-meta{font-size:0.84em;color:#666;margin-top:4px;}
+.message-icon-asset-status{font-size:0.83em;margin-top:8px;color:#1976D2;}
+.message-icon-asset-card.unsupported .message-icon-asset-status{color:#A50E0E;}
+.message-icon-picker-empty{padding:28px;border:1px dashed #DADCE0;border-radius:16px;text-align:center;color:#5F6368;background:#F8FAFD;}
+@media(max-width:767px){
+    .message-icon-selection{align-items:flex-start;}
+    .message-icon-summary{flex-basis:100%;}
+    .message-icon-picker-modal{width:calc(100vw - 20px);max-height:calc(100vh - 20px);}
+    .message-icon-picker-grid{grid-template-columns:repeat(2,minmax(0,1fr));}
+}
 @media(prefers-color-scheme:dark){
     body,html{ background-color:#121212; color:#E0E0E0; }
     #sidebar{ background-color:#424242; }
@@ -147,6 +202,11 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
     #content{ background-color:#121212; }
     .info-card{ border:1px solid #333; background-color:#1E1E1E; }
     .form-control { background: #333; border: 1px solid #444; color: #FFF; }
+    .md-radio-option{color:#E0E0E0;}
+    .md-radio-indicator{border-color:#9AA0A6;}
+    .md-radio-option:hover .md-radio-indicator{border-color:#E8EAED;}
+    .md-radio-option input:checked + .md-radio-indicator{border-color:#8AB4F8;}
+    .md-radio-indicator:after{background:#8AB4F8;}
     .btn-primary { background:#BB86FC; color:#000; }
     .btn-primary:hover { background:#A370F7; }
     .form-group { border-bottom: 1px solid #333; }
@@ -194,6 +254,22 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
     .message-expiration-any-locked .md-checkmark{background:#4B5563;border-color:#6B7280;}
     .message-expiration-any-locked .md-checkmark:after{border-color:#E5E7EB;}
     .message-expiration-any-locked .message-expiration-text{color:#9E9E9E;}
+    .message-icon-preview{background:#252525;border-color:#333;color:#BBB;}
+    .message-icon-meta{color:#AAA;}
+    .message-icon-clear{background:#252525;border-color:#444;color:#E5E7EB;}
+    .message-icon-clear:hover{background:#303030;}
+    .message-icon-note{background:#3A2B10;border-color:#6B4F12;color:#FFD54F;}
+    .message-icon-picker-modal{background:#1E1E1E;}
+    .message-icon-picker-header{border-bottom-color:#333;}
+    .message-icon-picker-close{color:#AAA;}
+    .message-icon-asset-card{background:#252525;border-color:#3A3A3A;box-shadow:none;}
+    .message-icon-asset-card:hover{border-color:#4A4A4A;box-shadow:none;}
+    .message-icon-asset-card.selected{border-color:#8AB4F8;box-shadow:0 0 0 2px rgba(138,180,248,0.18);}
+    .message-icon-asset-preview{background:#2A2A2A;color:#BBB;}
+    .message-icon-asset-meta{color:#AAA;}
+    .message-icon-asset-status{color:#8AB4F8;}
+    .message-icon-asset-card.unsupported .message-icon-asset-status{color:#EF9A9A;}
+    .message-icon-picker-empty{background:#202020;border-color:#333;color:#BBB;}
 }
 """
 
@@ -578,8 +654,97 @@ async function testVariableApi() {
         statusLine.classList.add('open');
     }
 }
+function messageIconElements() {
+    return {
+        input: document.getElementById('messageIconValue'),
+        preview: document.getElementById('messageIconPreview'),
+        name: document.getElementById('messageIconName'),
+        meta: document.getElementById('messageIconMeta'),
+        note: document.getElementById('messageIconTransparencyNote'),
+        clear: document.getElementById('messageIconClear'),
+        modal: document.getElementById('messageIconPickerModal'),
+        backdrop: document.getElementById('messageIconPickerBackdrop')
+    };
+}
+function messageIconPreviewHtml(kind, url, name) {
+    if (kind === 'image' && url) {
+        return '<img src="' + url + '" alt="' + (name || 'Selected icon') + '">';
+    }
+    if (kind === 'audio') return '<i class="fa-solid fa-music"></i>';
+    if (kind === 'text') return '<i class="fa-solid fa-file-lines"></i>';
+    if (kind === 'missing') return '<i class="fa-solid fa-triangle-exclamation"></i>';
+    return '<i class="fa-solid fa-image"></i>';
+}
+function setMessageIconSelectedCard(name) {
+    document.querySelectorAll('.message-icon-asset-card.selected').forEach(function(card) {
+        card.classList.remove('selected');
+    });
+    if (!name) return;
+    document.querySelectorAll('.message-icon-asset-card').forEach(function(card) {
+        if (card.getAttribute('data-name') === name) {
+            card.classList.add('selected');
+        }
+    });
+}
+function updateMessageIconWarning(name, transparent, previewKind) {
+    const note = messageIconElements().note;
+    if (!note) return;
+    const show = !!name && previewKind === 'image' && !transparent;
+    note.classList.toggle('open', show);
+}
+function clearMessageIconPickerMessage() {
+    return;
+}
+function setMessageIconSelection(name, url, transparent, previewKind, metaText) {
+    const elements = messageIconElements();
+    if (!elements.input || !elements.preview || !elements.name || !elements.meta) return;
+    const hasValue = !!name;
+    elements.input.value = hasValue ? name : '';
+    elements.input.dataset.url = hasValue ? (url || '') : '';
+    elements.input.dataset.transparent = transparent ? '1' : '0';
+    elements.input.dataset.previewKind = hasValue ? (previewKind || 'image') : 'empty';
+    elements.input.dataset.meta = hasValue ? (metaText || '') : '';
+    elements.preview.innerHTML = hasValue ? messageIconPreviewHtml(previewKind || 'image', url || '', name) : '<i class="fa-solid fa-image"></i>';
+    elements.name.textContent = hasValue ? name : 'No icon selected';
+    elements.meta.textContent = hasValue ? (metaText || '') : '';
+    if (elements.clear) elements.clear.disabled = !hasValue;
+    setMessageIconSelectedCard(hasValue ? name : '');
+    updateMessageIconWarning(hasValue ? name : '', !!transparent, hasValue ? (previewKind || 'image') : 'empty');
+}
+function openMessageIconPicker() {
+    const elements = messageIconElements();
+    if (!elements.modal || !elements.backdrop) return;
+    clearMessageIconPickerMessage();
+    elements.modal.classList.add('open');
+    elements.backdrop.classList.add('open');
+}
+function closeMessageIconPicker() {
+    const elements = messageIconElements();
+    if (!elements.modal || !elements.backdrop) return;
+    elements.modal.classList.remove('open');
+    elements.backdrop.classList.remove('open');
+}
+function clearMessageIconSelection() {
+    setMessageIconSelection('', '', false, 'empty', '');
+}
+function chooseMessageIconAsset(button) {
+    if (!button) return;
+    const supported = button.getAttribute('data-supported') === '1';
+    if (!supported) return;
+    setMessageIconSelection(
+        button.getAttribute('data-name') || '',
+        button.getAttribute('data-url') || '',
+        button.getAttribute('data-transparent') === '1',
+        button.getAttribute('data-preview-kind') || 'image',
+        button.getAttribute('data-meta') || ''
+    );
+    closeMessageIconPicker();
+}
 document.addEventListener('keydown', function(event) {
-    if (event.key === 'Escape') closeVariableGuide();
+    if (event.key === 'Escape') {
+        closeVariableGuide();
+        closeMessageIconPicker();
+    }
 });
 document.addEventListener('DOMContentLoaded', function() {
     syncMessageExpiration();
@@ -612,6 +777,22 @@ def message_variable_field_html(field_id, label, control_html, help_text=""):
                 </div>
             </div>
 """
+
+
+def material_radio_group_html(name, options, selected="", onchange="", required=False):
+    rows = []
+    for index, (value, label) in enumerate(options):
+        checked = ' checked' if str(selected) == str(value) else ""
+        onchange_attr = f' onchange="{h(onchange)}"' if onchange else ""
+        required_attr = " required" if required and index == 0 else ""
+        rows.append(
+            f"""                    <label class="md-radio-option">
+                        <input type="radio" name="{h(name)}" value="{h(value)}"{checked}{required_attr}{onchange_attr}>
+                        <span class="md-radio-indicator"></span>
+                        <span class="md-radio-text">{h(label)}</span>
+                    </label>"""
+        )
+    return '<div class="md-radio-group">\n' + "\n".join(rows) + "\n                </div>"
 
 
 def message_variable_guide_html():
@@ -878,6 +1059,267 @@ def message_expiration_from_form(form):
         any_message=bool(form.get("expiration_any_message")),
         message_ids=form.getlist("expiration_message_ids[]"),
     )
+
+
+def _png_image_metadata(path):
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if len(data) < 33 or not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return None
+    width = int.from_bytes(data[16:20], "big")
+    height = int.from_bytes(data[20:24], "big")
+    color_type = data[25]
+    transparent = color_type in {4, 6}
+    offset = 8
+    while offset + 8 <= len(data):
+        chunk_length = int.from_bytes(data[offset:offset + 4], "big")
+        chunk_type = data[offset + 4:offset + 8]
+        chunk_end = offset + 8 + chunk_length
+        if chunk_end + 4 > len(data):
+            break
+        if chunk_type == b"tRNS":
+            transparent = True
+        if chunk_type == b"IDAT":
+            break
+        offset = chunk_end + 4
+    return {"width": width, "height": height, "transparent": transparent, "format": "PNG"}
+
+
+def _jpeg_image_metadata(path):
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if len(data) < 4 or not data.startswith(b"\xff\xd8"):
+        return None
+    offset = 2
+    sof_markers = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+    while offset + 3 < len(data):
+        while offset < len(data) and data[offset] != 0xFF:
+            offset += 1
+        while offset < len(data) and data[offset] == 0xFF:
+            offset += 1
+        if offset >= len(data):
+            break
+        marker = data[offset]
+        offset += 1
+        if marker in {0xD8, 0xD9}:
+            continue
+        if offset + 2 > len(data):
+            break
+        segment_length = int.from_bytes(data[offset:offset + 2], "big")
+        if segment_length < 2 or offset + segment_length > len(data):
+            break
+        if marker in sof_markers and segment_length >= 7:
+            height = int.from_bytes(data[offset + 3:offset + 5], "big")
+            width = int.from_bytes(data[offset + 5:offset + 7], "big")
+            return {"width": width, "height": height, "transparent": False, "format": "JPG"}
+        offset += segment_length
+    return None
+
+
+def _bmp_image_metadata(path):
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if len(data) < 26 or not data.startswith(b"BM"):
+        return None
+    dib_header_size = int.from_bytes(data[14:18], "little")
+    if dib_header_size == 12 and len(data) >= 26:
+        width = int.from_bytes(data[18:20], "little")
+        height = int.from_bytes(data[20:22], "little")
+    elif dib_header_size >= 40 and len(data) >= 26:
+        width = abs(int.from_bytes(data[18:22], "little", signed=True))
+        height = abs(int.from_bytes(data[22:26], "little", signed=True))
+    else:
+        return None
+    return {"width": width, "height": height, "transparent": False, "format": "BMP"}
+
+
+def message_icon_asset_metadata(path):
+    name = path.name
+    ext = path.suffix.lower().lstrip(".")
+    preview_kind = "file"
+    metadata = None
+    if ext == "png":
+        metadata = _png_image_metadata(path)
+        preview_kind = "image"
+    elif ext == "jpg":
+        metadata = _jpeg_image_metadata(path)
+        preview_kind = "image"
+    elif ext == "bmp":
+        metadata = _bmp_image_metadata(path)
+        preview_kind = "image"
+    elif ext in {"wav", "mp3"}:
+        preview_kind = "audio"
+    elif ext == "txt":
+        preview_kind = "text"
+    supported = False
+    reason = "Unsupported format"
+    transparent = False
+    meta_text = ""
+    if metadata is not None:
+        width = int(metadata.get("width") or 0)
+        height = int(metadata.get("height") or 0)
+        transparent = bool(metadata.get("transparent"))
+        format_name = metadata.get("format") or ext.upper()
+        meta_text = f"{width}x{height} - {format_name}"
+        if width <= MESSAGE_ICON_MAX_DIMENSION and height <= MESSAGE_ICON_MAX_DIMENSION:
+            supported = True
+            reason = ""
+        else:
+            reason = "Image is more than 1080x1080 pixels"
+    elif preview_kind == "audio":
+        meta_text = "Audio asset"
+    elif preview_kind == "text":
+        meta_text = "Text asset"
+    else:
+        meta_text = "Unsupported asset"
+    return {
+        "name": name,
+        "preview_kind": preview_kind,
+        "preview_url": "/assets/?raw=" + urlencode({"": name})[1:],
+        "supported": supported,
+        "reason": reason,
+        "transparent": transparent,
+        "meta_text": meta_text,
+        "status_text": "Selectable" if supported else reason,
+    }
+
+
+def resolve_message_icon_value(raw_value, current_value=""):
+    selected = asset_filename(raw_value)
+    if not selected:
+        return ""
+    current = asset_filename(current_value)
+    try:
+        path = asset_path(selected)
+    except Exception:
+        if current and selected.lower() == current.lower():
+            return current_value or selected
+        raise RuntimeError("Unsupported format")
+    if not path.is_file():
+        if current and path.name.lower() == current.lower():
+            return current_value or path.name
+        raise RuntimeError("Unsupported format")
+    metadata = message_icon_asset_metadata(Path(path))
+    if metadata.get("supported"):
+        return path.name
+    if current and path.name.lower() == current.lower():
+        return path.name
+    raise RuntimeError(metadata.get("reason") or "Unsupported format")
+
+
+def _message_icon_summary(current_value):
+    selected_name = asset_filename(current_value)
+    selected_meta = None
+    options = []
+    ASSET_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        selected_path = asset_path(selected_name) if selected_name else None
+    except Exception:
+        selected_path = None
+    canonical_selected = selected_path.name if selected_path and selected_path.is_file() else selected_name
+    try:
+        files = sorted([item for item in ASSET_DIR.iterdir() if item.is_file()], key=lambda item: item.name.lower())
+    except OSError:
+        files = []
+    for path in files:
+        item = message_icon_asset_metadata(path)
+        item["selected"] = bool(canonical_selected) and path.name.lower() == canonical_selected.lower()
+        if item["selected"]:
+            selected_meta = item
+        options.append(item)
+    if selected_meta is None and selected_name:
+        selected_meta = {
+            "name": selected_name,
+            "preview_kind": "missing",
+            "preview_url": "",
+            "supported": False,
+            "reason": "Unsupported format",
+            "transparent": False,
+            "meta_text": "Asset not found",
+            "status_text": "Unsupported format",
+            "selected": True,
+        }
+    return canonical_selected, selected_meta, options
+
+
+def _message_icon_preview_html(meta):
+    if meta and meta.get("preview_kind") == "image" and meta.get("preview_url"):
+        return f'<img src="{h(meta["preview_url"])}" alt="{h(meta.get("name") or "Selected icon")}">'
+    if meta and meta.get("preview_kind") == "audio":
+        return '<i class="fa-solid fa-music"></i>'
+    if meta and meta.get("preview_kind") == "text":
+        return '<i class="fa-solid fa-file-lines"></i>'
+    if meta and meta.get("preview_kind") == "missing":
+        return '<i class="fa-solid fa-triangle-exclamation"></i>'
+    return '<i class="fa-solid fa-image"></i>'
+
+
+def message_icon_field_html(current_value=""):
+    selected_name, selected_meta, options = _message_icon_summary(current_value)
+    note_open = bool(selected_meta and selected_name and selected_meta.get("preview_kind") == "image" and not selected_meta.get("transparent"))
+    preview_kind = selected_meta.get("preview_kind") if selected_meta else "empty"
+    preview_url = selected_meta.get("preview_url") if selected_meta else ""
+    meta_text = selected_meta.get("meta_text") if selected_meta else ""
+    asset_cards = []
+    for item in options:
+        classes = ["message-icon-asset-card"]
+        if item.get("selected"):
+            classes.append("selected")
+        if not item.get("supported"):
+            classes.append("unsupported")
+        asset_cards.append(
+            f"""                    <button type="button" class="{' '.join(classes)}" data-name="{h(item['name'])}" data-url="{h(item.get('preview_url') or '')}" data-supported="{'1' if item.get('supported') else '0'}" data-reason="{h(item.get('reason') or '')}" data-transparent="{'1' if item.get('transparent') else '0'}" data-preview-kind="{h(item.get('preview_kind') or 'file')}" data-meta="{h(item.get('meta_text') or '')}" onclick="chooseMessageIconAsset(this)">
+                        <div class="message-icon-asset-preview">{_message_icon_preview_html(item)}</div>
+                        <div class="message-icon-asset-info">
+                            <div class="message-icon-asset-name" title="{h(item['name'])}">{h(item['name'])}</div>
+                            <div class="message-icon-asset-meta">{h(item.get('meta_text') or '')}</div>
+                            <div class="message-icon-asset-status">{h(item.get('status_text') or '')}</div>
+                        </div>
+                    </button>"""
+        )
+    picker_body = (
+        "\n".join(asset_cards)
+        if asset_cards
+        else '<div class="message-icon-picker-empty">No assets are stored on the server yet.</div>'
+    )
+    return f"""            <div class="form-group">
+                <label class="main-label" for="messageIconValue">Icon</label>
+                <p class="help-text">Max: 1080x1080px</p>
+                <input type="hidden" name="icon" id="messageIconValue" value="{h(selected_name or '')}" data-url="{h(preview_url or '')}" data-transparent="{'1' if selected_meta and selected_meta.get('transparent') else '0'}" data-preview-kind="{h(preview_kind)}" data-meta="{h(meta_text)}">
+                <div class="message-icon-selection">
+                    <div class="message-icon-summary">
+                        <div id="messageIconPreview" class="message-icon-preview">{_message_icon_preview_html(selected_meta)}</div>
+                        <div class="message-icon-text">
+                            <div id="messageIconName" class="message-icon-name">{h(selected_meta.get("name") if selected_meta else "No icon selected")}</div>
+                            <div id="messageIconMeta" class="message-icon-meta">{h(meta_text)}</div>
+                        </div>
+                    </div>
+                    <div class="message-icon-actions">
+                        <button type="button" class="btn-primary" onclick="openMessageIconPicker()">Select Icon</button>
+                        <button type="button" class="message-icon-clear" id="messageIconClear" onclick="clearMessageIconSelection()"{" disabled" if not selected_name else ""}>Clear</button>
+                    </div>
+                </div>
+                <div id="messageIconTransparencyNote" class="message-icon-note{' open' if note_open else ''}">This icon is not tranpsernt. It's recommended to sue transpernt icons.</div>
+                <div id="messageIconPickerBackdrop" class="message-icon-picker-backdrop" onclick="closeMessageIconPicker()"></div>
+                <div id="messageIconPickerModal" class="message-icon-picker-modal" role="dialog" aria-modal="true" aria-labelledby="messageIconPickerTitle">
+                    <div class="message-icon-picker-header">
+                        <h2 id="messageIconPickerTitle">Select Icon</h2>
+                        <button type="button" class="message-icon-picker-close" onclick="closeMessageIconPicker()" aria-label="Close">&times;</button>
+                    </div>
+                    <div class="message-icon-picker-body">
+                        <div class="message-icon-picker-grid">
+{picker_body}
+                        </div>
+                    </div>
+                </div>
+            </div>
+"""
 
 
 def audio_item(file_name, selected=False):

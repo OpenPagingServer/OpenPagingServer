@@ -3,6 +3,8 @@ from srv.web.pages.messages.form_common import (
     MESSAGE_FORM_SCRIPT,
     MESSAGE_FORM_STYLE,
     audio_transfer_html,
+    message_icon_field_html,
+    resolve_message_icon_value,
     message_expiration_field_html,
     message_expiration_from_form,
     message_variable_field_html,
@@ -31,7 +33,7 @@ def handle_request():
         abort(404)
     columns = table_columns("messages")
     message_type = str(row.get("type") or "")
-    show_visual = message_type in {"text", "text+audio"}
+    show_visual = message_type in {"text", "text+audio", "liveaudio+text"}
     show_audio = message_type in {"audio", "text+audio"}
     error = ""
 
@@ -53,6 +55,8 @@ def handle_request():
                     if color and not re.fullmatch(r"[A-F0-9]{6}", color):
                         raise RuntimeError("Color must be a 6 character hex value.")
                     updates["color"] = color
+                if "icon" in columns:
+                    updates["icon"] = resolve_message_icon_value(request.form.get("icon", ""), row.get("icon", ""))
             if show_audio and "audio" in columns:
                 updates["audio"] = ":".join([v.strip() for v in request.form.getlist("audio_files[]") if v.strip()])
             if "expires" in columns:
@@ -103,6 +107,7 @@ def handle_request():
                         <input type="text" name="color" id="colorHex" class="form-control" style="width: 150px;" placeholder="000000" maxlength="6" value="{h(color_value)}">
                     </div>
                 </div>
+{message_icon_field_html(row.get("icon") or "")}
             </div>"""
     audio_html = ""
     if show_audio:

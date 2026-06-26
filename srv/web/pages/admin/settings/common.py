@@ -48,6 +48,14 @@ input:checked + .slider:before { transform: translateX(20px); background-color: 
 .login-settings input[type="text"], .login-settings input[type="password"], .login-settings input[type="number"], .login-settings select, .login-settings textarea { width:100%; padding:10px; border-radius:6px; border:1px solid #CCC; font-family:inherit; font-size:14px; box-sizing:border-box; }
 .login-settings textarea { resize:vertical; min-height:80px; }
 .login-settings input:disabled, .login-settings select:disabled, .login-settings textarea:disabled { background:rgba(0,0,0,0.05); color:#999; cursor:not-allowed; }
+.md-checkbox-container { display:flex; align-items:center; position:relative; cursor:pointer; font-size:14px; font-weight:500; color:#555; user-select:none; gap:12px; }
+.md-checkbox-container input { position:absolute; opacity:0; cursor:pointer; height:0; width:0; }
+.md-checkmark { position:relative; display:inline-block; flex:0 0 auto; height:20px; width:20px; background:#FFF; border:2px solid #5f6368; border-radius:2px; transition:all 0.2s; }
+.md-checkbox-container:hover input ~ .md-checkmark { border-color:#202124; }
+.md-checkbox-container input:checked ~ .md-checkmark { background:#1976D2; border-color:#1976D2; }
+.md-checkmark:after { content:""; position:absolute; display:none; left:6px; top:2px; width:4px; height:10px; border:solid #FFF; border-width:0 2px 2px 0; transform:rotate(45deg); }
+.md-checkbox-container input:checked ~ .md-checkmark:after { display:block; }
+.md-checkbox-text { flex:1 1 auto; min-width:0; }
 .login-settings button { background:#1976D2; color:#FFF; border:none; padding:10px 16px; border-radius:6px; font-size:14px; cursor:pointer; }
 .login-settings button:hover { background:#1565C0; }
 .login-settings h4 { margin: 0 0 4px 0; font-weight: 500; font-size: 1.1em; }
@@ -81,6 +89,11 @@ input:checked + .slider { background-color: #3d2b52; }
 input:checked + .slider:before { background-color: #BB86FC; }
 .login-settings input[type="text"], .login-settings input[type="password"], .login-settings input[type="number"], .login-settings select, .login-settings textarea { background:#1E1E1E; border:1px solid #444; color:#E0E0E0; }
 .login-settings input:disabled, .login-settings select:disabled, .login-settings textarea:disabled { background:#2A2A2A; color:#777; }
+.md-checkbox-container { color:#BBB; }
+.md-checkmark { border-color:#9AA0A6; background:#1E1E1E; }
+.md-checkbox-container:hover input ~ .md-checkmark { border-color:#E8EAED; }
+.md-checkbox-container input:checked ~ .md-checkmark { background:#8AB4F8; border-color:#8AB4F8; }
+.md-checkmark:after { border-color:#1E1E1E; }
 .login-settings button { background:#BB86FC; color:#000; }
 .login-settings button:hover { background:#A370F7; }
 .login-settings p { color: #AAA; }

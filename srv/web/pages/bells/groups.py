@@ -28,9 +28,10 @@ def handle_request():
 
     checks = "".join(
         f'''
-        <label style="display:flex;align-items:center;justify-content:flex-start;gap:10px;width:100%;min-height:42px;padding:10px 12px;box-sizing:border-box;text-align:left;border:1px solid var(--border);border-radius:10px;background:var(--card-bg);cursor:pointer;">
-            <input type="checkbox" name="groups" value="{h(group["id"])}" style="margin:0;flex:0 0 auto;width:16px;height:16px;"{" checked" if str(group["id"]) in selected else ""}>
-            <span style="display:block;flex:1;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{h(group["name"])}</span>
+        <label class="md-checkbox-container checkbox-tile">
+            <input type="checkbox" name="groups" value="{h(group["id"])}"{" checked" if str(group["id"]) in selected else ""}>
+            <span class="md-checkmark"></span>
+            <span class="md-checkbox-text" style="display:block;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{h(group["name"])}</span>
         </label>
         '''
         for group in groups
@@ -41,7 +42,7 @@ def handle_request():
 <form class="card" method="POST" action="/bells/groups"{demo_submit} style="max-width:420px;width:100%;margin-left:0;margin-right:auto;text-align:left;">
     <input type="hidden" name="schedule_id" value="{h(sid)}">
     <div class="field" style="display:block;width:100%;text-align:left;margin:0 0 16px 0;">
-        <div style="display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;gap:8px;width:100%;max-width:320px;text-align:left;margin:0;">
+        <div class="checkbox-grid">
             {checks or '<span class="muted">No groups configured.</span>'}
         </div>
     </div>

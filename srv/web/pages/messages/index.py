@@ -22,6 +22,10 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .info-card{ background:#FFF; padding:16px; border:1px solid #EEE; border-radius:8px; box-shadow:0 2px 4px rgba(0,0,0,0.1); margin-bottom:16px; }
 .info-row { display:flex; justify-content:space-between; padding:10px 0; border-bottom:1px solid #f0f0f0; align-items: center; }
 .info-row:last-child { border-bottom:none; }
+.message-summary{ display:flex; align-items:center; gap:10px; min-width:0; }
+.message-text{ min-width:0; }
+.message-icon{ width:32px; height:32px; flex:0 0 32px; display:flex; align-items:center; justify-content:center; overflow:hidden; }
+.message-icon img{ width:100%; height:100%; object-fit:contain; display:block; }
 .info-label { font-weight:500; color:#555; }
 @media(min-width:768px){ #mobile-header{ display:none; } }
 @media(prefers-color-scheme:dark){
@@ -88,12 +92,22 @@ def handle_request():
             return demo_mode_iframe_html("messages")
         execute("DELETE FROM messages WHERE messageid=%s", (request.args["delete_msgid"],))
         return redirect("/messages/")
-    rows = query_all("SELECT messageid, name, type FROM messages ORDER BY name ASC")
+    rows = query_all("SELECT messageid, name, type, icon FROM messages ORDER BY name ASC")
     admin_new = ('<a href="javascript:openDemoModePopup(\'messages\')" class="btn-primary"><i class="fa-solid fa-plus" style="margin-right:8px;"></i> New Message</a>' if demo else '<a href="/messages/new" class="btn-primary"><i class="fa-solid fa-plus" style="margin-right:8px;"></i> New Message</a>') if ctx["is_admin"] else ""
     if rows:
         rendered = []
         for row in rows:
             mid = h(row.get("messageid"))
+            icon_name = asset_filename(row.get("icon"))
+            icon_html = ""
+            if icon_name:
+                try:
+                    icon_path = asset_path(icon_name)
+                except Exception:
+                    icon_path = None
+                if icon_path and icon_path.is_file() and icon_path.suffix.lower() in {".png", ".jpg", ".bmp"}:
+                    icon_url = "/assets/?raw=" + urlencode({"": icon_path.name})[1:]
+                    icon_html = f'<div class="message-icon"><img src="{h(icon_url)}" alt=""></div>'
             admin_menu = ""
             if ctx["is_admin"]:
                 edit_href = "javascript:openDemoModePopup('messages')" if demo else f"/messages/edit?msgid={mid}"
@@ -109,9 +123,12 @@ def handle_request():
                         </div>"""
             rendered.append(
                 f"""                <div class="info-row">
-                    <div>
-                        <span class="info-label">{h(row.get("name"))}</span>
-                        <span class="msg-type">{h(row.get("type"))}</span>
+                    <div class="message-summary">
+                        {icon_html}
+                        <div class="message-text">
+                            <span class="info-label">{h(row.get("name"))}</span>
+                            <span class="msg-type">{h(row.get("type"))}</span>
+                        </div>
                     </div>
                     <div style="display:flex; align-items:center; gap:10px;">
                         <a href="/messages/send?msgid={mid}" class="btn-send"><i class="fa-solid fa-paper-plane"></i> Send</a>

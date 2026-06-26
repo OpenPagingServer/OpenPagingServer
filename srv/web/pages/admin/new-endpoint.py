@@ -66,9 +66,13 @@ def handle_request():
         cards = []
         for module in modules:
             meta_parts = []
-            if module.get("version"):
-                meta_parts.append(f"Version {h(module['version'])}")
-            meta = f'<div class="module-meta">{" - ".join(meta_parts)}</div>' if meta_parts else ""
+            if not module.get("system_builtin"):
+                developer = module.get("developer") or module.get("author") or module.get("maintainer")
+                if developer:
+                    meta_parts.append(h(developer))
+                if module.get("version"):
+                    meta_parts.append(h(module["version"]))
+            meta = f'<div class="module-meta">{" &bull; ".join(meta_parts)}</div>' if meta_parts else ""
             desc = f'<div class="module-description">{h(module.get("description") or "")}</div>'
             state_badge = '<span class="module-badge disabled">Disabled</span>' if not module.get("enabled") else ""
             cards.append(

@@ -1474,6 +1474,15 @@ class SipServer:
             raw = raw.split(",", 1)[0].strip()
         return raw.split(";", 1)[0].strip() if raw.lower().startswith("sip:") else raw
 
+    def request_user_from_uri(self, uri):
+        raw_uri = self.sip_uri_from_header(uri)
+        if not raw_uri:
+            return ""
+        target = re.sub(r'^sips?:', '', raw_uri, flags=re.IGNORECASE)
+        user_part = target.rsplit("@", 1)[0] if "@" in target else target
+        user_part = user_part.split(";", 1)[0].strip()
+        return urllib.parse.unquote(user_part)
+
     def parse_sip_target(self, value, fallback_ip=None, fallback_port=5060, fallback_transport="udp"):
         uri = self.sip_uri_from_header(value)
         if not uri:
@@ -3545,13 +3554,7 @@ class SipServer:
         if not trusted:
             self.mark_authorized_trunk_seen(method, source_ip, headers)
         nat_mode = self.sip_nat_mode()
-        user = uri
-        if ":" in user:
-            user = user.split(":", 1)[1]
-        if "@" in user:
-            user = user.split("@", 1)[0]
-
-        user = urllib.parse.unquote(user)
+        user = self.request_user_from_uri(uri)
         
         db_status, trigger, passcode = self.get_endpoint_trigger(user)
 
