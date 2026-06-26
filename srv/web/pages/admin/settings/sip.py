@@ -1,4 +1,6 @@
+import hmac
 import ipaddress
+import os
 import urllib.request
 
 from srv.web.app import *
@@ -6,6 +8,21 @@ from srv.web.pages.admin.settings.common import settings_page
 
 SIP_RTP_DEFAULT_PORT_START = "40000"
 SIP_RTP_DEFAULT_PORT_END = "50000"
+SIP_BLOCK_SCANNERS_SETTING = "sip_block_scanners"
+SIP_INTRUSION_PREVENTION_SETTING = "sip_intrusion_prevention"
+SIP_SECURITY_FALSE_VALUES = {"0", "false", "off", "disable", "disabled", "no"}
+SIP_SECURITY_UNLOCK_SESSION_KEY = "sip_security_unlock_until"
+SIP_SECURITY_UNLOCK_IP_SESSION_KEY = "sip_security_unlock_ip"
+SIP_SECURITY_UNLOCK_PAGE_TOKEN_SESSION_KEY = "sip_security_unlock_page_token"
+SIP_SECURITY_UNLOCK_PAGE_TOKEN_FORM_KEY = "sip_security_unlock_page_token"
+SIP_SECURITY_UNLOCK_TTL_SECONDS = 300
+SIP_SENSITIVE_VERIFY_SESSION_KEY = "sip_sensitive_verify_until"
+SIP_SENSITIVE_VERIFY_CHALLENGE_KEY = "sip_sensitive_verify_challenge"
+SIP_SENSITIVE_VERIFY_TTL_SECONDS = 180
+
+
+def sip_abuse_override_enabled():
+    return str(os.getenv("ALLOW_SIP_ABUSE", "") or "").strip().lower() == "true"
 
 
 def is_port_in_use(port):
@@ -42,6 +59,36 @@ def detect_external_ipv4():
     return payload if is_public_routable_ipv4(payload) else ""
 
 
+def setting_enabled_with_default(data, key, default=True):
+    token = str(data.get(key, "") or "").strip().lower()
+    if not token:
+        return bool(default)
+    return token not in SIP_SECURITY_FALSE_VALUES
+
+
+def normalize_toggle_value(value, default="1"):
+    token = str(value if value is not None else default).strip().lower()
+    return "0" if token in SIP_SECURITY_FALSE_VALUES else "1"
+
+
+def sip_security_unlock_hash():
+    return "2a6ad5390bc20f6102ea8c207b9f6c4dd7e636b6a2dbec1b7b45f65ac3792c271384042a1ccd9f92096363fc701ba3c3a531736309e0d2f95f110aa0931f8763"
+
+
+def sip_securitydowngrade_warning():
+    return (
+        "Disabling this setting WILL compromise the security of this server, especially if the SIP port is exposed to WAN. "
+        "There's usually no reason to disable this in production. The Open Paging Server project is NOT responsible for any "
+        "financial loss caused by abuse of telephone service by malicious bots. CONTINUE AT YOUR OWN RISK!!!"
+    )
+
+
+def effective_sip_security_enabled(data, key, default=True):
+    if not sip_abuse_override_enabled():
+        return True
+    return setting_enabled_with_default(data, key, default=default)
+
+
 def ensure_sip_rtp_port_settings(data):
     if not str(data.get("sip_rtp_port_start", "") or "").strip():
         save_setting("sip_rtp_port_start", SIP_RTP_DEFAULT_PORT_START, "SIP RTP port range start")
@@ -51,7 +98,129 @@ def ensure_sip_rtp_port_settings(data):
         data["sip_rtp_port_end"] = SIP_RTP_DEFAULT_PORT_END
 
 
-def sip_settings_body(ctx, data, detected_external_ipv4):
+def ensure_sip_security_settings(data):
+    defaults = [
+        (SIP_BLOCK_SCANNERS_SETTING, "1", "Block SIP scanner user agents"),
+        (SIP_INTRUSION_PREVENTION_SETTING, "1", "Block IPs after repeated unauthorized SIP REGISTER/INVITE attempts"),
+    ]
+    for key, value, description in defaults:
+        if not str(data.get(key, "") or "").strip():
+            save_setting(key, value, description)
+            data[key] = value
+
+
+def sip_security_client_ip():
+    return str(request.remote_addr or "").strip()
+
+
+def sip_security_unlock_active():
+    try:
+        expires_at = float(session.get(SIP_SECURITY_UNLOCK_SESSION_KEY, "0") or 0)
+    except (TypeError, ValueError):
+        expires_at = 0
+    if expires_at > time.time():
+        return True
+    clear_sip_security_unlock()
+    return False
+
+
+def sip_unauthorized_response():
+    if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+        return jsonify(status="error", message="Unauthorized"), 401
+    abort(401)
+
+
+def clear_sip_security_unlock():
+    session.pop(SIP_SECURITY_UNLOCK_SESSION_KEY, None)
+    session.pop(SIP_SECURITY_UNLOCK_IP_SESSION_KEY, None)
+
+
+def clear_sip_security_page_token():
+    session.pop(SIP_SECURITY_UNLOCK_PAGE_TOKEN_SESSION_KEY, None)
+
+
+def issue_sip_security_page_token():
+    token = secrets.token_urlsafe(32)
+    session[SIP_SECURITY_UNLOCK_PAGE_TOKEN_SESSION_KEY] = token
+    clear_sip_security_unlock()
+    return token
+
+
+def sip_security_page_token_active():
+    supplied = str(request.form.get(SIP_SECURITY_UNLOCK_PAGE_TOKEN_FORM_KEY) or "").strip()
+    stored = str(session.get(SIP_SECURITY_UNLOCK_PAGE_TOKEN_SESSION_KEY, "") or "").strip()
+    return bool(supplied and stored and hmac.compare_digest(supplied, stored))
+
+
+def sip_sensitive_verify_active():
+    try:
+        expires_at = float(session.get(SIP_SENSITIVE_VERIFY_SESSION_KEY, "0") or 0)
+    except (TypeError, ValueError):
+        expires_at = 0
+    if expires_at > time.time():
+        return True
+    session.pop(SIP_SENSITIVE_VERIFY_SESSION_KEY, None)
+    return False
+
+
+def clear_sip_sensitive_verify():
+    session.pop(SIP_SENSITIVE_VERIFY_SESSION_KEY, None)
+    session.pop(SIP_SENSITIVE_VERIFY_CHALLENGE_KEY, None)
+
+
+def current_user_auth_record(user):
+    return query_one(
+        "SELECT id, username, password, salt FROM users WHERE id=%s LIMIT 1",
+        (user.get("id"),),
+    ) or {}
+
+
+def sip_unlock_candidate_matches(value):
+    candidate = str(value or "")
+    digest = hashlib.sha512(candidate.encode("utf-8")).hexdigest()
+    return hmac.compare_digest(digest, sip_security_unlock_hash())
+
+
+def handle_sip_unlock_request(user, data, detected_external_ipv4):
+    if not sip_abuse_override_enabled():
+        abort(404)
+    supplied = str(request.form.get("unlock_probe") or "")
+    matched = bool(supplied) and sip_unlock_candidate_matches(supplied)
+    if matched:
+        session[SIP_SECURITY_UNLOCK_SESSION_KEY] = str(time.time() + SIP_SECURITY_UNLOCK_TTL_SECONDS)
+        session[SIP_SECURITY_UNLOCK_IP_SESSION_KEY] = sip_security_client_ip()
+        return jsonify(status="success")
+    return jsonify(status="ignored")
+
+
+def issue_sensitive_change_challenge(user):
+    record = current_user_auth_record(user)
+    if not record:
+        return jsonify(status="error", message="Invalid username or password."), 401
+    challenge = secrets.token_hex(32)
+    session[SIP_SENSITIVE_VERIFY_CHALLENGE_KEY] = challenge
+    session.pop(SIP_SENSITIVE_VERIFY_SESSION_KEY, None)
+    return jsonify(
+        status="success",
+        username=str(record.get("username") or user.get("username") or ""),
+        salt=str(record.get("salt") or ""),
+        challenge=challenge,
+    )
+
+
+def verify_sensitive_change_response(user):
+    record = current_user_auth_record(user)
+    challenge = str(session.get(SIP_SENSITIVE_VERIFY_CHALLENGE_KEY, "") or "")
+    response = str(request.form.get("response") or "").strip()
+    expected = hashlib.sha256((str(record.get("password") or "") + challenge).encode()).hexdigest() if record and challenge else ""
+    clear_sip_sensitive_verify()
+    if not response or not expected or not hmac.compare_digest(response, expected):
+        return jsonify(status="error", message="Invalid username or password."), 401
+    session[SIP_SENSITIVE_VERIFY_SESSION_KEY] = str(time.time() + SIP_SENSITIVE_VERIFY_TTL_SECONDS)
+    return jsonify(status="success")
+
+
+def sip_settings_body(ctx, data, detected_external_ipv4, user, unlock_page_token=""):
     udp_checked = " checked" if data.get("enable_insecure_sip", "0") == "1" else ""
     udp_disabled = "" if udp_checked else " disabled"
     nat_enabled = clean_sip_nat_support_mode(data.get("sip_nat_support", "1")) != "no"
@@ -62,7 +231,223 @@ def sip_settings_body(ctx, data, detected_external_ipv4):
     manual_external_ipv4 = str(data.get("sip_external_ipv4", "") or "").strip()
     displayed_external_ipv4 = detected_external_ipv4 if external_mode == "auto" else manual_external_ipv4
     external_field_style = "background:rgba(0,0,0,0.05); color:#777;" if external_mode == "auto" else ""
+    allow_sip_abuse = sip_abuse_override_enabled()
+    scanners_enabled = effective_sip_security_enabled(data, SIP_BLOCK_SCANNERS_SETTING, default=True)
+    intrusion_enabled = effective_sip_security_enabled(data, SIP_INTRUSION_PREVENTION_SETTING, default=True)
+    security_unlocked = bool(unlock_page_token)
+    scanners_locked = scanners_enabled and (not allow_sip_abuse or not security_unlocked)
+    intrusion_locked = intrusion_enabled and (not allow_sip_abuse or not security_unlocked)
+    scanner_checkbox_attrs = (" checked" if scanners_enabled else "") + (" disabled" if scanners_locked else "")
+    intrusion_checkbox_attrs = (" checked" if intrusion_enabled else "") + (" disabled" if intrusion_locked else "")
+    scanner_switch_class = "switch locked" if scanners_locked else "switch"
+    intrusion_switch_class = "switch locked" if intrusion_locked else "switch"
+    scanner_aria_attr = ' aria-disabled="true"' if scanners_locked else ""
+    intrusion_aria_attr = ' aria-disabled="true"' if intrusion_locked else ""
+    unlock_listener_required = allow_sip_abuse and (scanners_enabled or intrusion_enabled) and not security_unlocked
+    username = str(user.get("username") or "")
+    if scanners_locked:
+        scanner_switch_html = '<span class="switch locked static checked" aria-disabled="true"><span class="slider"></span></span>'
+    else:
+        scanner_switch_html = f'<label class="{h(scanner_switch_class)}"{scanner_aria_attr}><input type="checkbox" id="blockScannersToggle"{scanner_checkbox_attrs}><span class="slider"></span></label>'
+    if intrusion_locked:
+        intrusion_switch_html = '<span class="switch locked static checked" aria-disabled="true"><span class="slider"></span></span>'
+    else:
+        intrusion_switch_html = f'<label class="{h(intrusion_switch_class)}"{intrusion_aria_attr}><input type="checkbox" id="intrusionPreventionToggle"{intrusion_checkbox_attrs}><span class="slider"></span></label>'
     return f"""
+    <style>
+    .switch.locked {{
+        opacity:0.45;
+        cursor:not-allowed;
+    }}
+    .switch.static {{
+        display:inline-block;
+        pointer-events:none;
+    }}
+    .switch.locked .slider {{
+        background-color:#C7CDD3;
+    }}
+    .switch.locked .slider:before {{
+        background-color:#F3F4F6;
+    }}
+    .switch.static.checked .slider {{
+        background-color:#90caf9;
+    }}
+    .switch.static.checked .slider:before {{
+        transform: translateX(20px);
+        background-color:#1976D2;
+    }}
+    .sip-security-divider {{
+        border-top:1px solid #E5E5E5;
+        margin:8px 0 12px 0;
+    }}
+    .sip-sensitive-modal-backdrop {{
+        display:none;
+        position:fixed;
+        inset:0;
+        background:rgba(0,0,0,0.45);
+        z-index:1600;
+        align-items:center;
+        justify-content:center;
+        padding:18px;
+        box-sizing:border-box;
+    }}
+    .sip-sensitive-modal-backdrop.active {{
+        display:flex;
+    }}
+    .sip-sensitive-modal {{
+        max-width:390px;
+        width:min(92vw, 390px);
+    }}
+    .sip-sensitive-login-box {{
+        background:#fff;
+        padding:30px;
+        border-radius:6px;
+        box-shadow:0 4px 6px rgba(0,0,0,0.1),0 1px 3px rgba(0,0,0,0.08);
+        max-width:390px;
+        width:min(92vw, 390px);
+        text-align:center;
+        animation:fadeInPage 1.5s ease-in-out;
+    }}
+    .sip-sensitive-login-box h2 {{
+        margin:0 0 20px 0;
+        color:#1976D2;
+        font-weight:500;
+        font-size:1.5em;
+    }}
+    .sip-sensitive-input-field {{
+        position:relative;
+        margin-bottom:20px;
+    }}
+    .sip-sensitive-input-field input {{
+        width:100%;
+        padding:8px 0;
+        border:none;
+        border-bottom:2px solid #ccc;
+        font-size:16px;
+        background:transparent;
+        outline:none;
+        color:#333;
+        font-family:"Roboto", sans-serif;
+        box-sizing:border-box;
+    }}
+    .sip-sensitive-input-field input:focus {{
+        border-bottom:2px solid #1976d2;
+    }}
+    .sip-sensitive-input-field input[disabled] {{
+        color:#999;
+        border-bottom:2px solid #ddd;
+    }}
+    .sip-sensitive-input-field label {{
+        position:absolute;
+        top:8px;
+        left:0;
+        color:#888;
+        font-size:14px;
+        pointer-events:none;
+        transition:0.2s ease all;
+    }}
+    .sip-sensitive-input-field input:focus ~ label,
+    .sip-sensitive-input-field input:not(:placeholder-shown) ~ label {{
+        top:-16px;
+        left:0;
+        font-size:12px;
+        color:#1976d2;
+    }}
+    .sip-sensitive-actions {{
+        display:flex;
+        flex-direction:column;
+        align-items:center;
+        gap:10px;
+        margin-top:10px;
+    }}
+    .sip-sensitive-actions button {{
+        width:100%;
+        padding:12px;
+        background-color:#1976d2;
+        border:none;
+        color:#fff;
+        font-size:16px;
+        border-radius:4px;
+        cursor:pointer;
+        font-family:"Roboto", sans-serif;
+        text-transform:uppercase;
+        height:45px;
+        display:inline-flex;
+        align-items:center;
+        justify-content:center;
+    }}
+    .sip-sensitive-actions button:disabled {{
+        opacity:0.7;
+        cursor:default;
+    }}
+    .sip-sensitive-cancel {{
+        color:#1976d2;
+        text-decoration:none;
+        font-size:14px;
+        line-height:1.4;
+    }}
+    .sip-sensitive-cancel:hover {{
+        text-decoration:underline;
+    }}
+    .sip-sensitive-error {{
+        min-height:1.2em;
+        color:#d32f2f;
+        font-size:0.9em;
+        margin-top:10px;
+    }}
+    @media (max-width:768px) {{
+        .sip-sensitive-login-box {{
+            max-width:360px;
+            width:100%;
+            padding:22px;
+        }}
+    }}
+    @media(prefers-color-scheme:dark) {{
+        .switch.locked .slider {{
+            background-color:#3A3A3A;
+        }}
+        .switch.locked .slider:before {{
+            background-color:#666;
+        }}
+        .switch.static.checked .slider {{
+            background-color:#3d2b52;
+        }}
+        .switch.static.checked .slider:before {{
+            background-color:#BB86FC;
+        }}
+        .sip-security-divider {{
+            border-top-color:#333;
+        }}
+        .sip-sensitive-login-box {{
+            background:#1E1E1E;
+            box-shadow:0 4px 6px rgba(0,0,0,0.6);
+        }}
+        .sip-sensitive-login-box h2 {{
+            color:#fff;
+        }}
+        .sip-sensitive-input-field input {{
+            color:#fff;
+            border-bottom:2px solid #555;
+        }}
+        .sip-sensitive-input-field input[disabled] {{
+            color:#777;
+            border-bottom:2px solid #444;
+        }}
+        .sip-sensitive-input-field label {{
+            color:#BBB;
+        }}
+        .sip-sensitive-actions button {{
+            background-color:#90caf9;
+            color:#121212;
+        }}
+        .sip-sensitive-cancel {{
+            color:#90caf9;
+        }}
+        .sip-sensitive-error {{
+            color:#ffcdd2;
+        }}
+    }}
+    </style>
     <div id="sip" class="tab-content active">
         <div class="info-card login-settings">
             <p>{h(ctx["product_name"])} uses Session Initiation Protocol (SIP) to integrate with PBXes and phone systems, connect to consoles, and to ATAs.</p>
@@ -109,17 +494,64 @@ def sip_settings_body(ctx, data, detected_external_ipv4):
                         <span id="externalIpv4Error" class="port-error-text">Please enter a valid publicly routable IPv4 address.</span>
                     </div>
                 </div>
+                <div class="sip-security-divider"></div>
+                <div class="info-row" style="border-bottom:none; padding-bottom:0;">
+                    <span>
+                        <span class="info-label">Block Scanners</span>
+                        <span class="info-description">Drop requests with user agents associated with SIP scanners. There's usually no reason to disable this in production.</span>
+                    </span>
+                    <span>
+                        <input type="hidden" name="{h(SIP_BLOCK_SCANNERS_SETTING)}" id="blockScannersValue" value="{"1" if scanners_enabled else "0"}">
+                        {scanner_switch_html}
+                    </span>
+                </div>
+                <div class="info-row" style="border-bottom:none; padding-bottom:0;">
+                    <span>
+                        <span class="info-label">Intrusion Detection/Prevention</span>
+                        <span class="info-description">Block IP addresses for 48 hours if they send 5 unauthorized REGISTER and/or INVITE attempts within a span 5 minutes. There's usually no reason to disable this in production.</span>
+                    </span>
+                    <span>
+                        <input type="hidden" name="{h(SIP_INTRUSION_PREVENTION_SETTING)}" id="intrusionPreventionValue" value="{"1" if intrusion_enabled else "0"}">
+                        {intrusion_switch_html}
+                    </span>
+                </div>
                 <input type="hidden" name="save_sip_settings" value="1">
+                <input type="hidden" name="{h(SIP_SECURITY_UNLOCK_PAGE_TOKEN_FORM_KEY)}" id="sipSecurityUnlockPageToken" value="{h(unlock_page_token)}">
                 <div style="margin-top:20px; display:flex; align-items:center;">
                     <button type="button" id="saveSipBtn">Save Settings</button>
                     <span id="sip-save-status" class="save-status"></span>
                 </div>
             </form>
         </div>
-    </div>"""
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/js-sha256@0.9.0/src/sha256.min.js"></script>
+    <div id="sipSensitiveModal" class="sip-sensitive-modal-backdrop" aria-hidden="true">
+        <div class="sip-sensitive-modal">
+            <div class="sip-sensitive-login-box">
+            <h2>Please verify your identity to make sensitive changes</h2>
+            <form id="sipSensitiveVerifyForm">
+                <div class="sip-sensitive-input-field">
+                    <input id="sipSensitiveUsername" type="text" value="{h(username)}" placeholder=" " disabled>
+                    <label for="sipSensitiveUsername">Username</label>
+                </div>
+                <div class="sip-sensitive-input-field">
+                    <input id="sipSensitivePassword" type="password" autocomplete="current-password" placeholder=" " required>
+                    <label for="sipSensitivePassword">Password</label>
+                </div>
+                <div id="sipSensitiveError" class="sip-sensitive-error"></div>
+                <div class="sip-sensitive-actions">
+                    <button type="submit" id="confirmSipSensitiveModal">LOGIN</button>
+                    <a href="#" class="sip-sensitive-cancel" id="closeSipSensitiveModal">Cancel</a>
+                </div>
+            </form>
+            </div>
+        </div>
+    </div>
+    <input type="hidden" id="sipUnlockRequired" value="{"1" if unlock_listener_required else "0"}">
+    """
 
 
-SCRIPT = r"""
+SCRIPT_TEMPLATE = r"""
 document.addEventListener('DOMContentLoaded', function() {
     const form = document.getElementById('sipSettingsForm');
     const saveBtn = document.getElementById('saveSipBtn');
@@ -136,12 +568,41 @@ document.addEventListener('DOMContentLoaded', function() {
     const rtpPortStart = document.getElementById('rtpPortStart');
     const rtpPortEnd = document.getElementById('rtpPortEnd');
     const rtpPortError = document.getElementById('rtpPortError');
+    const blockScannersToggle = document.getElementById('blockScannersToggle');
+    const blockScannersValue = document.getElementById('blockScannersValue');
+    const intrusionPreventionToggle = document.getElementById('intrusionPreventionToggle');
+    const intrusionPreventionValue = document.getElementById('intrusionPreventionValue');
+    const sensitiveModal = document.getElementById('sipSensitiveModal');
+    const sensitiveForm = document.getElementById('sipSensitiveVerifyForm');
+    const sensitivePassword = document.getElementById('sipSensitivePassword');
+    const sensitiveError = document.getElementById('sipSensitiveError');
+    const closeSensitiveBtn = document.getElementById('closeSipSensitiveModal');
+    const sipSecurityUnlockPageToken = document.getElementById('sipSecurityUnlockPageToken');
     const autoExternalIpv4Value = externalIpv4Field.dataset.autoValue || '';
     let manualExternalIpv4Value = externalIpv4Field.dataset.manualValue || '';
+    let sensitiveVerified = false;
+    const sipDisableWarning = __SIP_DISABLE_WARNING__;
+    const scannerInitiallyEnabled = __SCANNER_INITIALLY_ENABLED__;
+    const intrusionInitiallyEnabled = __INTRUSION_INITIALLY_ENABLED__;
+    const scannerCanDisable = __SCANNER_CAN_DISABLE__;
+    const intrusionCanDisable = __INTRUSION_CAN_DISABLE__;
+__UNLOCK_RUNTIME_DECLARATIONS__
 
     function setStatus(message, color) {
         status.innerText = message || '';
         status.style.color = color || 'inherit';
+    }
+
+    async function readJsonResponse(response, fallbackMessage) {
+        const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+        if (!contentType.includes('application/json')) {
+            throw new Error(fallbackMessage);
+        }
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error((data && data.message) ? data.message : fallbackMessage);
+        }
+        return data;
     }
 
     function clampPortInput(input, minValue) {
@@ -276,6 +737,138 @@ document.addEventListener('DOMContentLoaded', function() {
         return udpValid && natValid && rtpValid;
     }
 
+    function syncSecurityHiddenValues() {
+        if (blockScannersToggle && blockScannersValue) {
+            blockScannersValue.value = blockScannersToggle.checked ? '1' : '0';
+        }
+        if (intrusionPreventionToggle && intrusionPreventionValue) {
+            intrusionPreventionValue.value = intrusionPreventionToggle.checked ? '1' : '0';
+        }
+    }
+
+    function disablingSensitiveSetting() {
+        const scannerDisabling = scannerInitiallyEnabled && blockScannersValue && blockScannersValue.value === '0';
+        const intrusionDisabling = intrusionInitiallyEnabled && intrusionPreventionValue && intrusionPreventionValue.value === '0';
+        return scannerDisabling || intrusionDisabling;
+    }
+
+    function openSensitiveModal() {
+        if (!sensitiveModal) return;
+        sensitiveError.innerText = '';
+        sensitivePassword.value = '';
+        sensitiveModal.classList.add('active');
+        sensitiveModal.setAttribute('aria-hidden', 'false');
+        setTimeout(function() {
+            if (sensitivePassword) sensitivePassword.focus();
+        }, 0);
+    }
+
+    function closeSensitiveModal() {
+        if (!sensitiveModal) return;
+        sensitiveModal.classList.remove('active');
+        sensitiveModal.setAttribute('aria-hidden', 'true');
+    }
+
+    function localSha256(value) {
+        if (typeof window.sha256 !== 'function') {
+            throw new Error('Unable to verify password right now.');
+        }
+        return window.sha256(String(value || ''));
+    }
+
+    async function submitSettings() {
+        const formData = new FormData(form);
+        saveBtn.disabled = true;
+        setStatus('Saving...', 'inherit');
+        try {
+            const response = await fetch(window.location.href, {
+                method: 'POST',
+                body: formData,
+                headers: { 'X-Requested-With': 'XMLHttpRequest' }
+            });
+            const data = await readJsonResponse(response, 'Error saving settings.');
+            if (data.status === 'success') {
+                sensitiveVerified = false;
+                setStatus('SIP Settings saved.', '#4CAF50');
+            } else if (data.status === 'verify_required') {
+                setStatus('', 'inherit');
+                openSensitiveModal();
+            } else {
+                setStatus(data.message || 'Error saving settings.', '#F44336');
+            }
+        } catch (_error) {
+            setStatus('Connection error.', '#F44336');
+        } finally {
+            saveBtn.disabled = false;
+            setTimeout(function() { setStatus('', 'inherit'); }, 3000);
+        }
+    }
+
+    async function verifySensitiveChange() {
+        if (!sensitivePassword.value) {
+            sensitiveError.innerText = 'Enter your password.';
+            return;
+        }
+        sensitiveError.innerText = '';
+        const verifyButton = document.getElementById('confirmSipSensitiveModal');
+        verifyButton.disabled = true;
+        try {
+            const challengeResponse = await fetch(window.location.href, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                body: new URLSearchParams({ get_sensitive_verify_challenge: '1', sip_security_unlock_page_token: sipSecurityUnlockPageToken ? sipSecurityUnlockPageToken.value : '' })
+            });
+            const challengeData = await readJsonResponse(challengeResponse, 'Unauthorized');
+            if (challengeData.status !== 'success') {
+                throw new Error(challengeData.message || 'Invalid username or password.');
+            }
+            const verifier = localSha256(sensitivePassword.value + (challengeData.salt || ''));
+            const proof = localSha256(verifier + (challengeData.challenge || ''));
+            const verifyResponse = await fetch(window.location.href, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                body: new URLSearchParams({ verify_sensitive_change: '1', response: proof, sip_security_unlock_page_token: sipSecurityUnlockPageToken ? sipSecurityUnlockPageToken.value : '' })
+            });
+            const verifyData = await readJsonResponse(verifyResponse, 'Unauthorized');
+            if (verifyData.status !== 'success') {
+                throw new Error(verifyData.message || 'Invalid username or password.');
+            }
+            sensitiveVerified = true;
+            closeSensitiveModal();
+            await submitSettings();
+        } catch (error) {
+            sensitiveError.innerText = (error && error.message) ? error.message : 'Invalid username or password.';
+        } finally {
+            verifyButton.disabled = false;
+        }
+    }
+
+    function bindSensitiveToggle(toggle, canDisable, initiallyEnabled, hiddenInput) {
+        if (!toggle || !hiddenInput) return;
+        if (initiallyEnabled && !canDisable) {
+            hiddenInput.value = '1';
+            return;
+        }
+        toggle.addEventListener('change', function() {
+            if (initiallyEnabled && !this.checked) {
+                if (!window.confirm(sipDisableWarning)) {
+                    this.checked = true;
+                }
+            }
+            hiddenInput.value = this.checked ? '1' : '0';
+            if (this.checked) {
+                sensitiveVerified = false;
+            }
+        });
+        hiddenInput.value = toggle.checked ? '1' : '0';
+    }
+
     [udpPort, rtpPortStart, rtpPortEnd].forEach(input => {
         input.addEventListener('input', function() {
             clampPortInput(this, this === udpPort ? 1 : 1024);
@@ -292,46 +885,140 @@ document.addEventListener('DOMContentLoaded', function() {
     externalIpv4ModeAuto.addEventListener('change', syncExternalIpv4Field);
     externalIpv4ModeManual.addEventListener('change', syncExternalIpv4Field);
 
-    saveBtn.addEventListener('click', function() {
+    bindSensitiveToggle(blockScannersToggle, scannerCanDisable, scannerInitiallyEnabled, blockScannersValue);
+    bindSensitiveToggle(intrusionPreventionToggle, intrusionCanDisable, intrusionInitiallyEnabled, intrusionPreventionValue);
+
+    saveBtn.addEventListener('click', async function() {
         if (window.openDemoModePopup && document.querySelector('[data-demo-mode="1"]')) {
             openDemoModePopup('settings');
             return;
         }
+        syncSecurityHiddenValues();
         if (!validateForm()) {
             setStatus('Fix the highlighted SIP settings first.', '#F44336');
             setTimeout(function() { setStatus('', 'inherit'); }, 3000);
             return;
         }
-        const formData = new FormData(form);
-        saveBtn.disabled = true;
-        setStatus('Saving...', 'inherit');
-        fetch(window.location.href, {
-            method: 'POST',
-            body: formData,
-            headers: { 'X-Requested-With': 'XMLHttpRequest' }
-        })
-        .then(response => response.json())
-        .then(data => {
-            if (data.status === 'success') {
-                setStatus('SIP Settings saved.', '#4CAF50');
-            } else {
-                setStatus(data.message || 'Error saving settings.', '#F44336');
-            }
-        })
-        .catch(function() {
-            setStatus('Connection error.', '#F44336');
-        })
-        .finally(function() {
-            saveBtn.disabled = false;
-            setTimeout(function() { setStatus('', 'inherit'); }, 3000);
-        });
+        if (disablingSensitiveSetting() && !sensitiveVerified) {
+            openSensitiveModal();
+            return;
+        }
+        await submitSettings();
     });
+
+    if (sensitiveForm) {
+        sensitiveForm.addEventListener('submit', async function(event) {
+            event.preventDefault();
+            await verifySensitiveChange();
+        });
+    }
+    if (closeSensitiveBtn) {
+        closeSensitiveBtn.addEventListener('click', function(event) {
+            event.preventDefault();
+            closeSensitiveModal();
+        });
+    }
+    document.addEventListener('click', function(event) {
+        if (event.target === sensitiveModal) {
+            closeSensitiveModal();
+        }
+    });
+
+__UNLOCK_LISTENER_BLOCK__
 
     syncUdp();
     syncNatOptions();
+    syncSecurityHiddenValues();
     validateRtpRange();
 });
 """
+
+
+def sip_settings_script(data, unlock_page_token=""):
+    allow_sip_abuse = sip_abuse_override_enabled()
+    scanners_enabled = effective_sip_security_enabled(data, SIP_BLOCK_SCANNERS_SETTING, default=True)
+    intrusion_enabled = effective_sip_security_enabled(data, SIP_INTRUSION_PREVENTION_SETTING, default=True)
+    security_unlocked = bool(unlock_page_token)
+    unlock_runtime_declarations = ""
+    unlock_listener_block = ""
+    if allow_sip_abuse and (scanners_enabled or intrusion_enabled) and not security_unlocked:
+        unlock_runtime_declarations = """
+    let unlockBuffer = '';
+    let unlockTimer = null;
+"""
+        unlock_listener_block = r"""
+    document.addEventListener('keydown', function(event) {
+        const target = event.target;
+        if (
+            event.ctrlKey ||
+            event.metaKey ||
+            event.altKey ||
+            (target && (
+                target.tagName === 'INPUT' ||
+                target.tagName === 'TEXTAREA' ||
+                target.tagName === 'SELECT' ||
+                target.isContentEditable
+            ))
+        ) {
+            return;
+        }
+        if (event.key === 'Backspace') {
+            unlockBuffer = unlockBuffer.slice(0, -1);
+        } else if (event.key.length === 1) {
+            unlockBuffer += event.key;
+        } else {
+            return;
+        }
+        if (unlockTimer) clearTimeout(unlockTimer);
+        unlockTimer = window.setTimeout(async function() {
+            const candidate = unlockBuffer;
+            unlockBuffer = '';
+            if (!candidate) return;
+            try {
+                const response = await fetch(window.location.href, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body: new URLSearchParams({ unlock_probe: candidate })
+                });
+                const data = await readJsonResponse(response, '');
+                if (data && data.status === 'success') {
+                    window.location.reload();
+                }
+            } catch (_error) {
+            }
+        }, 2000);
+    });
+"""
+    replacements = {
+        "__SIP_DISABLE_WARNING__": json.dumps(sip_securitydowngrade_warning()),
+        "__SCANNER_INITIALLY_ENABLED__": json.dumps(scanners_enabled),
+        "__INTRUSION_INITIALLY_ENABLED__": json.dumps(intrusion_enabled),
+        "__SCANNER_CAN_DISABLE__": json.dumps(allow_sip_abuse and (security_unlocked or not scanners_enabled)),
+        "__INTRUSION_CAN_DISABLE__": json.dumps(allow_sip_abuse and (security_unlocked or not intrusion_enabled)),
+        "__UNLOCK_RUNTIME_DECLARATIONS__": unlock_runtime_declarations,
+        "__UNLOCK_LISTENER_BLOCK__": unlock_listener_block,
+    }
+    script = SCRIPT_TEMPLATE
+    for token, value in replacements.items():
+        script = script.replace(token, value)
+    return script
+
+
+def render_sip_settings_page(user, data, detected_external_ipv4):
+    ctx = legacy_user_context(user)
+    unlock_page_token = issue_sip_security_page_token() if sip_security_unlock_active() else ""
+    if not unlock_page_token:
+        clear_sip_security_page_token()
+    return settings_page(
+        "SIP Settings",
+        ctx,
+        "sip",
+        sip_settings_body(ctx, data, detected_external_ipv4, user, unlock_page_token),
+        sip_settings_script(data, unlock_page_token),
+    )
 
 
 def handle_request():
@@ -340,12 +1027,33 @@ def handle_request():
         return user
     data = settings()
     ensure_sip_rtp_port_settings(data)
+    ensure_sip_security_settings(data)
+    allow_sip_abuse = sip_abuse_override_enabled()
     detected_external_ipv4 = detect_external_ipv4()
     if request.method == "POST":
+        if request.form.get("unlock_probe") is not None:
+            if not allow_sip_abuse:
+                abort(404)
+            if demo_mode_enabled():
+                return jsonify(status="ignored")
+            return handle_sip_unlock_request(user, data, detected_external_ipv4)
+        if request.form.get("get_sensitive_verify_challenge"):
+            if not allow_sip_abuse or not sip_security_page_token_active():
+                return sip_unauthorized_response()
+            if demo_mode_enabled():
+                return jsonify(status="error", message="Demo Mode is enabled.")
+            return issue_sensitive_change_challenge(user)
+        if request.form.get("verify_sensitive_change"):
+            if not allow_sip_abuse or not sip_security_page_token_active():
+                return sip_unauthorized_response()
+            if demo_mode_enabled():
+                return jsonify(status="error", message="Demo Mode is enabled.")
+            return verify_sensitive_change_response(user)
         if demo_mode_enabled():
             if request.headers.get("X-Requested-With") == "XMLHttpRequest":
                 return jsonify(status="error", message="Demo Mode is enabled.")
             return demo_mode_page("SIP Settings", legacy_user_context(user), "settings", "settings")
+
         udp_enabled = "1" if request.form.get("enable_insecure_sip") else "0"
         udp_port = request.form.get("insecure_sip_port", "5060").strip()
         nat_support = "1" if request.form.get("sip_nat_support") else "0"
@@ -354,7 +1062,18 @@ def handle_request():
         manual_external_ipv4 = request.form.get("sip_external_ipv4", stored_manual_external_ipv4).strip() if external_mode == "manual" else stored_manual_external_ipv4
         rtp_port_start = request.form.get("sip_rtp_port_start", SIP_RTP_DEFAULT_PORT_START).strip()
         rtp_port_end = request.form.get("sip_rtp_port_end", SIP_RTP_DEFAULT_PORT_END).strip()
+        block_scanners = normalize_toggle_value(request.form.get(SIP_BLOCK_SCANNERS_SETTING, data.get(SIP_BLOCK_SCANNERS_SETTING, "1")), default="1")
+        intrusion_prevention = normalize_toggle_value(request.form.get(SIP_INTRUSION_PREVENTION_SETTING, data.get(SIP_INTRUSION_PREVENTION_SETTING, "1")), default="1")
         tls_enabled = data.get("enable_secure_sip", "0")
+        scanners_were_enabled = effective_sip_security_enabled(data, SIP_BLOCK_SCANNERS_SETTING, default=True)
+        intrusion_were_enabled = effective_sip_security_enabled(data, SIP_INTRUSION_PREVENTION_SETTING, default=True)
+        if not allow_sip_abuse:
+            block_scanners = "1"
+            intrusion_prevention = "1"
+        disabling_scanners = scanners_were_enabled and block_scanners == "0"
+        disabling_intrusion = intrusion_were_enabled and intrusion_prevention == "0"
+        disabling_sensitive = disabling_scanners or disabling_intrusion
+        sensitive_verify_required = False
         errors = []
 
         if external_mode not in {"auto", "manual"}:
@@ -382,6 +1101,11 @@ def handle_request():
         if nat_support != "0" and external_mode == "manual" and not is_public_routable_ipv4(manual_external_ipv4):
             errors.append("Enter a valid publicly routable External IPv4 address.")
 
+        if disabling_sensitive and (not allow_sip_abuse or not sip_security_page_token_active()):
+            return sip_unauthorized_response()
+        elif disabling_sensitive and not sip_sensitive_verify_active():
+            sensitive_verify_required = True
+
         if errors:
             message = " ".join(errors)
             if request.headers.get("X-Requested-With") == "XMLHttpRequest":
@@ -397,14 +1121,28 @@ def handle_request():
                     "sip_external_ipv4": manual_external_ipv4,
                     "sip_rtp_port_start": rtp_port_start,
                     "sip_rtp_port_end": rtp_port_end,
+                    SIP_BLOCK_SCANNERS_SETTING: block_scanners,
+                    SIP_INTRUSION_PREVENTION_SETTING: intrusion_prevention,
                 }
             )
             return settings_page(
                 "SIP Settings",
                 ctx,
                 "sip",
-                f'<div class="info-card login-settings"><p>{h(message)}</p></div>' + sip_settings_body(ctx, error_data, detected_external_ipv4),
-                SCRIPT,
+                f'<div class="info-card login-settings"><p>{h(message)}</p></div>' + sip_settings_body(ctx, error_data, detected_external_ipv4, user),
+                sip_settings_script(error_data),
+            )
+
+        if sensitive_verify_required:
+            if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+                return jsonify(status="verify_required", message="Please verify your identity to make sensitive changes")
+            return settings_page(
+                "SIP Settings",
+                legacy_user_context(user),
+                "sip",
+                f'<div class="info-card login-settings"><p>{h("Please verify your identity to make sensitive changes.")}</p></div>'
+                + sip_settings_body(legacy_user_context(user), data, detected_external_ipv4, user),
+                sip_settings_script(data),
             )
 
         save_setting("sip", "1" if (udp_enabled == "1" or tls_enabled == "1") else "0", "Enable SIP")
@@ -415,9 +1153,16 @@ def handle_request():
         save_setting("sip_external_ipv4", manual_external_ipv4, "Manual SIP external IPv4 address")
         save_setting("sip_rtp_port_start", rtp_port_start, "SIP RTP port range start")
         save_setting("sip_rtp_port_end", rtp_port_end, "SIP RTP port range end")
+        save_setting(SIP_BLOCK_SCANNERS_SETTING, block_scanners, "WARNING!!! Disabling this setting WILL compromise the security of this server, especially if the SIP port is exposed to WAN. There's usually no reason to disable this in production. The Open Paging Server project is NOT responsible for any financial loss caused by abuse of telephone service by malicious bots. CONTINUE AT YOUR OWN RISK!!!")
+        save_setting(
+            SIP_INTRUSION_PREVENTION_SETTING,
+            intrusion_prevention,
+            "WARNING!!! Disabling this setting WILL compromise the security of this server, especially if the SIP port is exposed to WAN. There's usually no reason to disable this in production. The Open Paging Server project is NOT responsible for any financial loss caused by abuse of telephone service by malicious bots. CONTINUE AT YOUR OWN RISK!!!",
+        )
+        clear_sip_sensitive_verify()
+        clear_sip_security_page_token()
         if request.headers.get("X-Requested-With") == "XMLHttpRequest":
             return jsonify(status="success")
         return redirect("/admin/settings/sip")
 
-    ctx = legacy_user_context(user)
-    return settings_page("SIP Settings", ctx, "sip", sip_settings_body(ctx, data, detected_external_ipv4), SCRIPT)
+    return render_sip_settings_page(user, data, detected_external_ipv4)

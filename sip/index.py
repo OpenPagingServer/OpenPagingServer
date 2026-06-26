@@ -50,6 +50,26 @@ DB_PASS = os.getenv("DB_PASS")
 DB_NAME = os.getenv("DB_NAME")
 DEBUG = os.getenv("DEBUG", "").strip().lower() == "true"
 OPENPAGINGSERVER_IPADDR_URL = "https://analytics.openpagingserver.org/ipaddr"
+SIP_SECURITY_FALSE_VALUES = {"0", "false", "off", "disable", "disabled", "no"}
+SIP_SCANNER_SIGNATURES = tuple(
+    token.strip().lower()
+    for token in (
+        "friendly-scanner,sipvicious,sipv,sipcli,sip-scan,sipsak,sundayddr,iWar,CSipSimple,SIVuS,Gulp,"
+        "smap,svmap,siparmyknife,friendly-request,Test Agent,VaxIPUserAgent,VaxSIPUserAgent,Mr.SIP,"
+        "SIPVicious,Sippts,Nmap NSE,SIP Scanner,SIP Scanner v1.0,SIP Scanner v2.0,SIPVicious v1.0,"
+        "SIPVicious v1.1,SIPVicious v1.2,Python SIP Scanner,SIP Auditor,SIP Enumerator,SIP Cracker,"
+        "SVWAR,SVMAP,SVCRACK"
+    ).split(",")
+    if token.strip()
+)
+SIP_INTRUSION_ATTEMPT_LIMIT = 5
+SIP_INTRUSION_WINDOW_SECONDS = 5 * 60
+SIP_INTRUSION_BLOCK_SECONDS = 48 * 60 * 60
+SIP_INTRUSION_STORAGE_PATH = "/var/spool/openpagingserver/.sipbannedips"
+
+
+def sip_abuse_override_enabled():
+    return str(os.getenv("ALLOW_SIP_ABUSE", "") or "").strip().lower() == "true"
 
 def sip_debug(message):
     if DEBUG:
@@ -564,6 +584,11 @@ class SipServer:
         self.tcp_buffers = {}
         self.rtp_port_cursor = None
         self.public_ip_cache = {"value": "", "loaded_at": 0.0}
+        self.sip_intrusion_attempts = {}
+        self.sip_intrusion_blocks = {}
+        self.sip_intrusion_storage_path = SIP_INTRUSION_STORAGE_PATH
+        self.sip_intrusion_storage_mtime = 0.0
+        self.load_sip_intrusion_storage(force=True)
 
     def connect_db(self):
         return pymysql.connect(
@@ -654,6 +679,210 @@ class SipServer:
         if port < 1 or port > 65535:
             port = 5060
         return enabled, port
+
+    def sip_security_setting_enabled(self, key, default=True):
+        if not sip_abuse_override_enabled():
+            return True
+        raw = self.read_setting(key)
+        token = str(raw if raw is not None else "").strip().lower()
+        if not token:
+            return bool(default)
+        return token not in SIP_SECURITY_FALSE_VALUES
+
+    def scanner_blocking_enabled(self):
+        return self.sip_security_setting_enabled("sip_block_scanners", default=True)
+
+    def intrusion_prevention_enabled(self):
+        return self.sip_security_setting_enabled("sip_intrusion_prevention", default=True)
+
+    def drop_transport_connection(self, conn):
+        if conn is None:
+            return
+        try:
+            conn.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    def scanner_header_matches(self, headers):
+        candidates = []
+        for header_name in ("User-Agent", "Server"):
+            value = self.get_first(headers, header_name)
+            if value:
+                candidates.append(str(value).strip().lower())
+        for value in candidates:
+            for signature in SIP_SCANNER_SIGNATURES:
+                if signature in value:
+                    return True
+        return False
+
+    def valid_sip_intrusion_ip(self, value):
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        try:
+            return str(ipaddress.ip_address(text))
+        except Exception:
+            return ""
+
+    def load_sip_intrusion_storage(self, force=False):
+        path = Path(self.sip_intrusion_storage_path)
+        try:
+            mtime = path.stat().st_mtime
+        except FileNotFoundError:
+            mtime = 0.0
+        except Exception:
+            return False
+        if not force and mtime == self.sip_intrusion_storage_mtime:
+            return False
+        now = time.time()
+        blocks = {}
+        attempts = {}
+        if mtime > 0:
+            try:
+                for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    parts = raw_line.strip().split()
+                    if not parts:
+                        continue
+                    kind = parts[0].lower()
+                    if kind == "block" and len(parts) >= 3:
+                        ip_text = self.valid_sip_intrusion_ip(parts[1])
+                        if not ip_text:
+                            continue
+                        blocked_until = safe_float(parts[2], 0.0)
+                        if blocked_until > now:
+                            blocks[ip_text] = blocked_until
+                    elif kind == "attempt" and len(parts) >= 3:
+                        ip_text = self.valid_sip_intrusion_ip(parts[1])
+                        if not ip_text:
+                            continue
+                        stamps = [safe_float(item, 0.0) for item in parts[2:]]
+                        stamps = [stamp for stamp in stamps if stamp >= now - SIP_INTRUSION_WINDOW_SECONDS and stamp <= now + 60]
+                        if stamps:
+                            attempts[ip_text] = stamps
+                    elif len(parts) >= 1:
+                        ip_text = self.valid_sip_intrusion_ip(parts[0])
+                        if ip_text:
+                            blocks[ip_text] = now + SIP_INTRUSION_BLOCK_SECONDS
+            except Exception:
+                return False
+        with self.lock:
+            self.sip_intrusion_blocks = blocks
+            self.sip_intrusion_attempts = attempts
+            self.sip_intrusion_storage_mtime = mtime
+        return True
+
+    def save_sip_intrusion_storage(self):
+        path = Path(self.sip_intrusion_storage_path)
+        now = time.time()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            lines = []
+            with self.lock:
+                blocks = dict(self.sip_intrusion_blocks)
+                attempts = {key: list(value) for key, value in self.sip_intrusion_attempts.items()}
+            for ip_text in sorted(blocks):
+                blocked_until = safe_float(blocks.get(ip_text), 0.0)
+                if blocked_until > now:
+                    lines.append(f"block {ip_text} {blocked_until:.3f}")
+            cutoff = now - SIP_INTRUSION_WINDOW_SECONDS
+            for ip_text in sorted(attempts):
+                stamps = [safe_float(item, 0.0) for item in attempts.get(ip_text, []) if safe_float(item, 0.0) >= cutoff]
+                if stamps:
+                    lines.append("attempt " + ip_text + " " + " ".join(f"{stamp:.3f}" for stamp in stamps))
+            temporary = path.with_name(path.name + ".tmp")
+            temporary.write_text(("\n".join(lines) + "\n") if lines else "", encoding="utf-8")
+            os.replace(temporary, path)
+            try:
+                self.sip_intrusion_storage_mtime = path.stat().st_mtime
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+
+    def sip_intrusion_cleanup(self, now=None):
+        current = float(time.time() if now is None else now)
+        cutoff = current - SIP_INTRUSION_WINDOW_SECONDS
+        changed = False
+        with self.lock:
+            for ip_text, blocked_until in list(self.sip_intrusion_blocks.items()):
+                if safe_float(blocked_until, 0.0) <= current:
+                    self.sip_intrusion_blocks.pop(ip_text, None)
+                    changed = True
+            for ip_text, stamps in list(self.sip_intrusion_attempts.items()):
+                kept = [stamp for stamp in stamps if safe_float(stamp, 0.0) >= cutoff]
+                if kept:
+                    if kept != stamps:
+                        self.sip_intrusion_attempts[ip_text] = kept
+                        changed = True
+                else:
+                    self.sip_intrusion_attempts.pop(ip_text, None)
+                    changed = True
+        if changed:
+            self.save_sip_intrusion_storage()
+        return changed
+
+    def intrusion_ip_blocked(self, ipaddr, now=None):
+        if not self.intrusion_prevention_enabled():
+            return False
+        self.load_sip_intrusion_storage()
+        current = float(time.time() if now is None else now)
+        ip_text = self.valid_sip_intrusion_ip(ipaddr) or str(ipaddr or "").strip()
+        expired = False
+        with self.lock:
+            blocked_until = float(self.sip_intrusion_blocks.get(ip_text, 0) or 0)
+            if blocked_until > current:
+                return True
+            if ip_text in self.sip_intrusion_blocks:
+                self.sip_intrusion_blocks.pop(ip_text, None)
+                expired = True
+        if expired:
+            self.save_sip_intrusion_storage()
+        return False
+
+    def note_unauthorized_attempt(self, ipaddr, method, conn=None):
+        if str(method or "").strip().upper() not in {"REGISTER", "INVITE"}:
+            return False
+        if not self.intrusion_prevention_enabled():
+            return False
+        self.load_sip_intrusion_storage()
+        ip_text = self.valid_sip_intrusion_ip(ipaddr) or str(ipaddr or "").strip()
+        now = time.time()
+        save_needed = False
+        with self.lock:
+            blocked_until = float(self.sip_intrusion_blocks.get(ip_text, 0) or 0)
+            if blocked_until > now:
+                blocked = True
+            else:
+                cutoff = now - SIP_INTRUSION_WINDOW_SECONDS
+                attempts = [stamp for stamp in self.sip_intrusion_attempts.get(ip_text, []) if stamp >= cutoff]
+                attempts.append(now)
+                if len(attempts) >= SIP_INTRUSION_ATTEMPT_LIMIT:
+                    self.sip_intrusion_blocks[ip_text] = now + SIP_INTRUSION_BLOCK_SECONDS
+                    self.sip_intrusion_attempts.pop(ip_text, None)
+                    blocked = True
+                else:
+                    self.sip_intrusion_attempts[ip_text] = attempts
+                    blocked = False
+                save_needed = True
+        if save_needed:
+            self.save_sip_intrusion_storage()
+        if blocked:
+            self.drop_transport_connection(conn)
+        return blocked
+
+    def should_drop_silently(self, headers, ipaddr, conn=None):
+        if self.scanner_blocking_enabled() and self.scanner_header_matches(headers):
+            self.drop_transport_connection(conn)
+            return True
+        if self.intrusion_ip_blocked(ipaddr):
+            self.drop_transport_connection(conn)
+            return True
+        return False
 
     def sip_nat_enabled(self):
         return self.sip_nat_mode() != "no"
@@ -3454,6 +3683,8 @@ class SipServer:
         if not call_id:
             return self.build_response(headers, "400 Bad Request")
         if not trusted and not self.ip_allowed(method, source_ip, headers=headers):
+            if self.note_unauthorized_attempt(source_ip, method, conn=conn):
+                return None
             nonce = uuid.uuid4().hex
             return self.build_response(headers, "401 Unauthorized", extra_headers=[f'WWW-Authenticate: Digest realm="OpenPagingServer", nonce="{nonce}", algorithm=MD5, qop="auth"'])
 
@@ -3546,9 +3777,10 @@ class SipServer:
             existing_call = call_id in self.calls
         if existing_call:
             response = self.handle_reinvite(method, headers, body, source_ip, source_port, transport=transport, conn=conn, trusted=trusted)
-            if response is not None:
-                return response
+            return response
         if not trusted and not self.ip_allowed(method, source_ip, headers=headers):
+            if self.note_unauthorized_attempt(source_ip, method, conn=conn):
+                return None
             nonce = uuid.uuid4().hex
             return self.build_response(headers, "401 Unauthorized", extra_headers=[f'WWW-Authenticate: Digest realm="OpenPagingServer", nonce="{nonce}", algorithm=MD5, qop="auth"'])
         if not trusted:
@@ -3760,6 +3992,9 @@ class SipServer:
         if not method:
             return None
 
+        if method != "SIP/2.0" and self.should_drop_silently(headers, addr[0], conn=conn):
+            return None
+
         if method != "SIP/2.0":
             headers = self.nat_annotate_request_headers(headers, addr[0], addr[1], transport)
             
@@ -3844,8 +4079,11 @@ class SipServer:
                             self.registrations.pop(username, None)
                         auth.update_trunk_status_by_user(username, "Offline")
             else:
-                nonce = uuid.uuid4().hex
-                response = self.build_response(headers, "401 Unauthorized", extra_headers=[f'WWW-Authenticate: Digest realm="OpenPagingServer", nonce="{nonce}", algorithm=MD5, qop="auth"'])
+                if self.note_unauthorized_attempt(addr[0], "REGISTER", conn=conn):
+                    response = None
+                else:
+                    nonce = uuid.uuid4().hex
+                    response = self.build_response(headers, "401 Unauthorized", extra_headers=[f'WWW-Authenticate: Digest realm="OpenPagingServer", nonce="{nonce}", algorithm=MD5, qop="auth"'])
         elif method == "INVITE":
             call_id = self.get_first(headers, "Call-ID")
             with self.outbound_lock:
@@ -3964,6 +4202,8 @@ class SipServer:
                 break
             except:
                 continue
+            if self.intrusion_ip_blocked(addr[0]):
+                continue
             try:
                 self.handle_packet(data, addr, sock, False)
             except Exception as e:
@@ -4007,6 +4247,9 @@ class SipServer:
         return None
 
     def tcp_client(self, conn, addr):
+        if self.intrusion_ip_blocked(addr[0]):
+            self.drop_transport_connection(conn)
+            return
         try:
             while not self.stop_event.is_set():
                 raw = self.tcp_message(conn)
@@ -4037,6 +4280,9 @@ class SipServer:
             except OSError:
                 break
             except:
+                continue
+            if self.intrusion_ip_blocked(addr[0]):
+                self.drop_transport_connection(conn)
                 continue
             threading.Thread(target=self.tcp_client, args=(conn, addr), daemon=True).start()
 
@@ -4106,6 +4352,7 @@ class SipServer:
                     if self.active_port != port or self.udp_sock is None or self.tcp_sock is None:
                         self.close_sockets()
                         self.bind_listeners(port)
+                self.sip_intrusion_cleanup()
                 self.maintain_outbound_trunks()
             except Exception:
                 traceback.print_exc()

@@ -12,6 +12,15 @@ def h(value):
     return html.escape("" if value is None else str(value), quote=True)
 
 
+BR_TAG_RE = re.compile(r"&lt;br\s*/?&gt;", re.IGNORECASE)
+
+
+def render_description_html(value):
+    escaped = h(value).replace("\r\n", "\n").replace("\r", "\n")
+    escaped = BR_TAG_RE.sub("<br>", escaped)
+    return escaped.replace("\n", "<br>")
+
+
 def frame_safe_name(value):
     return re.fullmatch(r"[A-Za-z0-9_-]+", str(value or "")) is not None
 
@@ -59,7 +68,7 @@ def chooser_response(module, forms):
     body = '<h2 class="title">Endpoint type</h2><div class="grid">' + "".join(
         f"""<a class="card" href="/admin/endpoint-form-frame?{h(urlencode({"module": module, "type": key}))}">
             <span class="name">{h(form.get("label") or key)}</span>
-            {f'<span class="desc">{h(form.get("description") or "")}</span>' if form.get("description") else ""}
+            {f'<span class="desc">{render_description_html(form.get("description") or "")}</span>' if form.get("description") else ""}
         </a>"""
         for key, form in forms.items()
     ) + "</div>"

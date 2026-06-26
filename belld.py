@@ -2,17 +2,20 @@
 
 import os
 import socket
+import struct
 import time
 import uuid
+import wave
+from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pymysql
 from dotenv import load_dotenv
-from endpoints import connect_endpoint_ipc
+from endpoints import ULAW_TO_LINEAR_TABLE, audio_frames, connect_endpoint_ipc, mix_ulaw_frames
 
-from active_broadcast_store import put_active_broadcast, mark_active_broadcast_delivery
+from active_broadcast_store import RUNTIME_DIR, mark_active_broadcast_delivery, put_active_broadcast
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -24,8 +27,14 @@ DB_NAME = os.getenv("DB_NAME")
 DEBUG = os.getenv("DEBUG", "").strip().lower() == "true"
 
 POLL_INTERVAL = max(0.2, float(os.getenv("BELL_POLL_INTERVAL", "0.5")))
+BELL_OVERLAP_BRIDGE_SECONDS = max(0.0, float(os.getenv("BELL_OVERLAP_BRIDGE_SECONDS", "15")))
+BELL_FRAME_RATE = 8000
+BELL_FRAME_BYTES = 160
+BELL_FRAME_SECONDS = BELL_FRAME_BYTES / BELL_FRAME_RATE
+BELL_CLUSTER_DIR = RUNTIME_DIR / "belld-clusters"
 LOG_FILE = BASE_DIR / "belld_debug.log"
 last_seen_by_schedule = {}
+audio_duration_cache = {}
 
 
 def log(message):
@@ -268,6 +277,154 @@ def fetch_due_events(schedule, last_seen, now):
         conn.close()
 
 
+def fetch_schedule_events_after(schedule, day_value, after_time, weekday):
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    s.id AS schedule_id,
+                    s.name AS schedule_name,
+                    l.id AS list_id,
+                    l.name AS list_name,
+                    e.id AS event_id,
+                    e.fire_time,
+                    e.audio,
+                    e.days_of_week,
+                    GROUP_CONCAT(g.group_id ORDER BY g.group_id SEPARATOR '.') AS group_ids
+                FROM bell_schedules s
+                JOIN bell_calendar_lists c ON c.schedule_id = s.id
+                JOIN bell_lists l ON l.id = c.list_id AND (l.schedule_id = 0 OR l.schedule_id = s.id)
+                JOIN bell_events e ON e.list_id = l.id
+                JOIN bell_schedule_groups g ON g.schedule_id = s.id
+                WHERE s.enabled = 1
+                  AND s.id = %s
+                  AND c.bell_date = %s
+                  AND e.fire_time > %s
+                  AND FIND_IN_SET(%s, e.days_of_week)
+                GROUP BY s.id, s.name, l.id, l.name, e.id, e.fire_time, e.audio, e.days_of_week
+                ORDER BY e.fire_time ASC, e.id ASC
+                """,
+                (
+                    schedule["id"],
+                    day_value.strftime("%Y-%m-%d"),
+                    after_time.strftime("%H:%M:%S"),
+                    weekday,
+                ),
+            )
+            return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def bell_time_seconds(value):
+    if hasattr(value, "hour") and hasattr(value, "minute") and hasattr(value, "second"):
+        return (int(value.hour) * 3600) + (int(value.minute) * 60) + int(value.second)
+    if isinstance(value, timedelta):
+        return int(value.total_seconds())
+    text = str(value or "").strip()
+    if not text:
+        return 0
+    parts = text.split(":")
+    if len(parts) == 3:
+        try:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds = int(float(parts[2]))
+            return (hours * 3600) + (minutes * 60) + seconds
+        except ValueError:
+            return 0
+    return 0
+
+
+def bell_event_start(day_value, event):
+    return datetime.combine(day_value, datetime.min.time()) + timedelta(seconds=bell_time_seconds(event.get("fire_time")))
+
+
+def bell_audio_duration_seconds(audio_value):
+    audio_key = str(audio_value or "").strip()
+    if not audio_key:
+        return 0.0
+    cached = audio_duration_cache.get(audio_key)
+    if cached is not None:
+        return cached
+    frame_count = 0
+    for _frame in audio_frames(audio_key):
+        frame_count += 1
+    duration = frame_count * BELL_FRAME_SECONDS
+    audio_duration_cache[audio_key] = duration
+    return duration
+
+
+def bell_offset_frames(offset_seconds):
+    return max(0, int(round(float(offset_seconds) / BELL_FRAME_SECONDS)))
+
+
+def build_bell_cluster(schedule, events, start_index, day_value):
+    first_event = events[start_index]
+    cluster_start = bell_event_start(day_value, first_event)
+    cluster_end = cluster_start + timedelta(seconds=bell_audio_duration_seconds(first_event.get("audio")))
+    included = []
+    index = start_index
+    bridge = timedelta(seconds=BELL_OVERLAP_BRIDGE_SECONDS)
+    while index < len(events):
+        event = events[index]
+        event_start = bell_event_start(day_value, event)
+        if included and event_start > cluster_end + bridge:
+            break
+        duration = bell_audio_duration_seconds(event.get("audio"))
+        event_end = event_start + timedelta(seconds=duration)
+        cluster_end = max(cluster_end, event_end)
+        item = dict(event)
+        item["start_at"] = event_start
+        item["duration_seconds"] = duration
+        included.append(item)
+        index += 1
+    return {
+        "schedule_id": int(schedule["id"]),
+        "schedule_name": str(schedule.get("name") or "Bell Schedule"),
+        "start_at": cluster_start,
+        "end_at": cluster_end,
+        "events": included,
+    }, index - start_index
+
+
+def write_cluster_audio_file(cluster):
+    BELL_CLUSTER_DIR.mkdir(parents=True, exist_ok=True)
+    path = BELL_CLUSTER_DIR / (
+        f"bell-cluster-{cluster['schedule_id']}-"
+        f"{cluster['start_at'].strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex}.wav"
+    )
+    frames_by_index = defaultdict(list)
+    max_frame_index = 0
+    for event in cluster["events"]:
+        start_frame = bell_offset_frames((event["start_at"] - cluster["start_at"]).total_seconds())
+        frame_index = start_frame
+        yielded = False
+        for frame in audio_frames(event.get("audio") or ""):
+            frames_by_index[frame_index].append(frame)
+            frame_index += 1
+            yielded = True
+        if yielded:
+            max_frame_index = max(max_frame_index, frame_index)
+        else:
+            log(f"cluster event={event.get('event_id')} produced no audio")
+    total_frames = max(
+        1,
+        max_frame_index,
+        bell_offset_frames((cluster["end_at"] - cluster["start_at"]).total_seconds()),
+    )
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(BELL_FRAME_RATE)
+        for frame_index in range(total_frames):
+            mixed = mix_ulaw_frames(frames_by_index.get(frame_index, []))
+            handle.writeframesraw(struct.pack("<160h", *[ULAW_TO_LINEAR_TABLE[byte] for byte in mixed[:BELL_FRAME_BYTES]]))
+    return str(path)
+
+
 def insert_broadcast(record):
     conn = db()
     try:
@@ -307,6 +464,18 @@ def send_broadcast_ipc(broadcast_id):
                 pass
 
 
+def dispatch_bell_record(record):
+    broadcast_id = str(record.get("id") or "").strip()
+    insert_broadcast(record)
+    put_active_broadcast(record)
+    log(
+        f"dispatch bell broadcast={broadcast_id} groups={record.get('groups')} "
+        f"audio={record.get('audio')} template={record.get('template_id')}"
+    )
+    if not send_broadcast_ipc(broadcast_id):
+        mark_active_broadcast_delivery(broadcast_id, "failed")
+
+
 def fire_event(event):
     broadcast_id = uuid.uuid4().hex
     issued = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -338,16 +507,65 @@ def fire_event(event):
         "priority": "Normal",
         "delivery": "pending",
     }
-    insert_broadcast(record)
-    put_active_broadcast(record)
     log(f"fire event={event.get('event_id')} broadcast={broadcast_id} groups={group_ids} audio={audio}")
-    if not send_broadcast_ipc(broadcast_id):
-        mark_active_broadcast_delivery(broadcast_id, "failed")
+    dispatch_bell_record(record)
+
+
+def fire_event_cluster(cluster):
+    events = cluster["events"]
+    if len(events) == 1:
+        fire_event(events[0])
+        return
+    first_event = events[0]
+    group_ids = str(first_event.get("group_ids") or "").strip()
+    if not group_ids:
+        log(f"skip cluster schedule={cluster['schedule_id']} missing groups")
+        return
+    audio_path = write_cluster_audio_file(cluster)
+    broadcast_id = uuid.uuid4().hex
+    issued = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    list_names = [str(event.get("list_name") or "Bell List") for event in events]
+    unique_names = []
+    for name in list_names:
+        if name not in unique_names:
+            unique_names.append(name)
+    list_label = unique_names[0] if unique_names else "Bell List"
+    if len(unique_names) > 1:
+        list_label = f"{list_label} +{len(unique_names) - 1} more"
+    template_id = f"bell-cluster-{cluster['schedule_id']}-{first_event.get('event_id')}-{events[-1].get('event_id')}"
+    record = {
+        "id": broadcast_id,
+        "name": f"{cluster['schedule_name']} Bell",
+        "shortmessage": "Bell",
+        "longmessage": f"Bell sequence from {list_label}",
+        "icon": "fa-solid fa-bell",
+        "color": "#1976D2",
+        "vendor_specific": "",
+        "template_id": template_id,
+        "expires_rule": "manual",
+        "type": "AudioMessage",
+        "expires": None,
+        "issued": issued,
+        "groups": group_ids,
+        "image": "",
+        "audio": audio_path,
+        "sender": "belld",
+        "priority": "Normal",
+        "delivery": "pending",
+    }
+    log(
+        f"fire cluster schedule={cluster['schedule_id']} events="
+        f"{[event.get('event_id') for event in events]} groups={group_ids} audio={audio_path}"
+    )
+    dispatch_bell_record(record)
 
 
 def main():
     ensure_schema()
-    log(f"belld started poll_interval={POLL_INTERVAL}")
+    log(
+        f"belld started poll_interval={POLL_INTERVAL} "
+        f"overlap_bridge_seconds={BELL_OVERLAP_BRIDGE_SECONDS}"
+    )
     while True:
         try:
             for schedule in fetch_enabled_schedules():
@@ -359,9 +577,23 @@ def main():
                     last_seen = now - timedelta(seconds=1)
                 if now.date() != last_seen.date():
                     last_seen = datetime.combine(now.date(), datetime.min.time()) - timedelta(seconds=1)
-                for event in fetch_due_events(schedule, last_seen, now):
-                    fire_event(event)
-                last_seen_by_schedule[schedule_id] = now
+                if last_seen > now:
+                    last_seen_by_schedule[schedule_id] = last_seen
+                    continue
+                due_events = fetch_due_events(schedule, last_seen, now)
+                advance_to = now
+                if due_events:
+                    schedule_events = fetch_schedule_events_after(schedule, now.date(), last_seen, now.strftime("%w"))
+                    index = 0
+                    while index < len(schedule_events):
+                        event = schedule_events[index]
+                        if bell_event_start(now.date(), event) > now:
+                            break
+                        cluster, consumed = build_bell_cluster(schedule, schedule_events, index, now.date())
+                        fire_event_cluster(cluster)
+                        advance_to = max(advance_to, cluster["end_at"])
+                        index += consumed
+                last_seen_by_schedule[schedule_id] = max(last_seen, advance_to)
         except Exception as exc:
             log(f"loop_error={exc}")
         time.sleep(POLL_INTERVAL)
