@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -48,41 +49,49 @@ def _ensure_runtime_dir():
         raise OSError(f"Active broadcast runtime directory is not writable: {RUNTIME_DIR}")
 
 
+@contextmanager
 def _connect():
     _ensure_runtime_dir()
     conn = sqlite3.connect(str(DB_PATH), timeout=max(0.1, LOCK_TIMEOUT_SECONDS))
-    conn.row_factory = sqlite3.Row
-    conn.execute(f"PRAGMA busy_timeout = {int(max(0.1, LOCK_TIMEOUT_SECONDS) * 1000)}")
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA synchronous = NORMAL")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS active_broadcasts (
-            id TEXT PRIMARY KEY,
-            template_id TEXT,
-            expires_rule TEXT,
-            sender TEXT NOT NULL DEFAULT '',
-            groups_value TEXT NOT NULL DEFAULT '',
-            delivery TEXT NOT NULL DEFAULT 'pending',
-            issued TEXT NOT NULL,
-            expires TEXT,
-            payload TEXT NOT NULL
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout = {int(max(0.1, LOCK_TIMEOUT_SECONDS) * 1000)}")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS active_broadcasts (
+                id TEXT PRIMARY KEY,
+                template_id TEXT,
+                expires_rule TEXT,
+                sender TEXT NOT NULL DEFAULT '',
+                groups_value TEXT NOT NULL DEFAULT '',
+                delivery TEXT NOT NULL DEFAULT 'pending',
+                issued TEXT NOT NULL,
+                expires TEXT,
+                payload TEXT NOT NULL
+            )
+            """
         )
-        """
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_active_broadcasts_pending "
-        "ON active_broadcasts (delivery, issued)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_active_broadcasts_expires "
-        "ON active_broadcasts (expires)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_active_broadcasts_template_id "
-        "ON active_broadcasts (template_id)"
-    )
-    return conn
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_active_broadcasts_pending "
+            "ON active_broadcasts (delivery, issued)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_active_broadcasts_expires "
+            "ON active_broadcasts (expires)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_active_broadcasts_template_id "
+            "ON active_broadcasts (template_id)"
+        )
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _parse_datetime(value):

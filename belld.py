@@ -235,6 +235,9 @@ def fetch_enabled_schedules():
 
 
 def fetch_due_events(schedule, last_seen, now):
+    day_value = now.date()
+    start_seconds = bell_window_start_seconds(day_value, last_seen)
+    end_seconds = bell_time_seconds(now)
     conn = db()
     try:
         with conn.cursor() as cur:
@@ -258,17 +261,17 @@ def fetch_due_events(schedule, last_seen, now):
                 WHERE s.enabled = 1
                   AND s.id = %s
                   AND c.bell_date = %s
-                  AND e.fire_time > %s
-                  AND e.fire_time <= %s
+                  AND TIME_TO_SEC(e.fire_time) > %s
+                  AND TIME_TO_SEC(e.fire_time) <= %s
                   AND FIND_IN_SET(%s, e.days_of_week)
                 GROUP BY s.id, s.name, l.id, l.name, e.id, e.fire_time, e.audio, e.days_of_week
                 ORDER BY e.fire_time ASC, e.id ASC
                 """,
                 (
                     schedule["id"],
-                    now.strftime("%Y-%m-%d"),
-                    last_seen.strftime("%H:%M:%S"),
-                    now.strftime("%H:%M:%S"),
+                    day_value.strftime("%Y-%m-%d"),
+                    start_seconds,
+                    end_seconds,
                     now.strftime("%w"),
                 ),
             )
@@ -277,7 +280,8 @@ def fetch_due_events(schedule, last_seen, now):
         conn.close()
 
 
-def fetch_schedule_events_after(schedule, day_value, after_time, weekday):
+def fetch_schedule_events_after(schedule, day_value, after_reference, weekday):
+    start_seconds = bell_window_start_seconds(day_value, after_reference)
     conn = db()
     try:
         with conn.cursor() as cur:
@@ -301,7 +305,7 @@ def fetch_schedule_events_after(schedule, day_value, after_time, weekday):
                 WHERE s.enabled = 1
                   AND s.id = %s
                   AND c.bell_date = %s
-                  AND e.fire_time > %s
+                  AND TIME_TO_SEC(e.fire_time) > %s
                   AND FIND_IN_SET(%s, e.days_of_week)
                 GROUP BY s.id, s.name, l.id, l.name, e.id, e.fire_time, e.audio, e.days_of_week
                 ORDER BY e.fire_time ASC, e.id ASC
@@ -309,7 +313,7 @@ def fetch_schedule_events_after(schedule, day_value, after_time, weekday):
                 (
                     schedule["id"],
                     day_value.strftime("%Y-%m-%d"),
-                    after_time.strftime("%H:%M:%S"),
+                    start_seconds,
                     weekday,
                 ),
             )
@@ -340,6 +344,12 @@ def bell_time_seconds(value):
 
 def bell_event_start(day_value, event):
     return datetime.combine(day_value, datetime.min.time()) + timedelta(seconds=bell_time_seconds(event.get("fire_time")))
+
+
+def bell_window_start_seconds(day_value, reference):
+    if reference is None or reference.date() != day_value:
+        return -1
+    return bell_time_seconds(reference)
 
 
 def bell_audio_duration_seconds(audio_value):

@@ -94,10 +94,22 @@ MODULE_LOG_DIR = Path(os.getenv("OPS_ENDPOINT_MODULE_LOG_DIR", "/var/log/openpag
 ENDPOINT_IPC_SOCKET_PATH = Path("/run/openpagingserver/endpointmodules.sock")
 LOG_FILE = MODULE_LOG_DIR / "endpoint_dispatch.log"
 VALID_MESSAGE_PRIORITIES = {"Low", "Normal", "High", "Emergency"}
+LIST_ENDPOINTS_STATUS_TIMEOUT = max(0.25, float(os.getenv("OPS_LIST_ENDPOINTS_STATUS_TIMEOUT", "1.5")))
+MODULE_STATUS_CACHE_TTL = max(0.0, float(os.getenv("OPS_MODULE_STATUS_CACHE_TTL", "5")))
+MODULE_STATUS_TASK_STALE_SECONDS = max(
+    LIST_ENDPOINTS_STATUS_TIMEOUT,
+    float(os.getenv("OPS_MODULE_STATUS_TASK_STALE_SECONDS", "30")),
+)
 
 loaded_modules = {}
 module_load_errors = {}
 loaded_modules_lock = threading.Lock()
+module_status_lock = threading.Lock()
+module_status_cache = {}
+module_status_tasks = {}
+endpoint_package_cache_lock = threading.Lock()
+endpoint_package_info_cache = {}
+endpoint_package_list_cache = {}
 stream_states = {}
 stream_states_lock = threading.Lock()
 message_vendor_schema_ready = False
@@ -386,7 +398,10 @@ def read_manifest(bundle_path):
         raw = read_tar_file(tar, "manifest.json")
     if raw is None:
         raise ValueError("manifest.json is missing")
-    manifest = json.loads(raw.decode("utf-8"))
+    text = raw.decode("utf-8", errors="replace").strip()
+    if not text:
+        raise ValueError("manifest.json is empty")
+    manifest = json.loads(text)
     if not isinstance(manifest, dict):
         raise ValueError("manifest.json must contain an object")
     module = package_module_name(manifest.get("module") or Path(bundle_path).stem)
@@ -670,8 +685,36 @@ def module_tables_from_install_sql(sql_text):
     return tables
 
 
+def endpoint_package_stat_key(bundle_path):
+    stat = Path(bundle_path).stat()
+    return (str(Path(bundle_path).resolve()), stat.st_size, getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)))
+
+
+def endpoint_package_directory_signature():
+    if not MODULE_STORE_DIR.is_dir():
+        return ()
+    signature = []
+    for path in sorted(MODULE_STORE_DIR.iterdir()):
+        if not path.is_file() or path.suffix.lower() != ".opsepm":
+            continue
+        stat = path.stat()
+        signature.append(
+            (
+                path.name,
+                stat.st_size,
+                getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)),
+            )
+        )
+    return tuple(signature)
+
+
 def endpoint_package_info(bundle_path, extract_if_trusted=False):
     bundle_path = Path(bundle_path)
+    cache_key = endpoint_package_stat_key(bundle_path)
+    with endpoint_package_cache_lock:
+        cached = endpoint_package_info_cache.get(cache_key)
+        if cached is not None and (not extract_if_trusted or cached.get("extract_ready")):
+            return dict(cached["info"])
     manifest = read_manifest(bundle_path)
     verification = verify_bundle_signature(bundle_path)
     info = {
@@ -686,10 +729,22 @@ def endpoint_package_info(bundle_path, extract_if_trusted=False):
         info["load_error"] = module_load_error_text(info)
     if extract_if_trusted and info["trusted"]:
         info.update(ensure_bundle_extracted(bundle_path, manifest))
-    return info
+    cache_entry = {
+        "info": dict(info),
+        "extract_ready": bool(info.get("trusted")) and "payload_path" in info and "web_path" in info,
+    }
+    with endpoint_package_cache_lock:
+        endpoint_package_info_cache[cache_key] = cache_entry
+    return dict(info)
 
 
 def discover_endpoint_packages(extract_if_trusted=False):
+    directory_signature = endpoint_package_directory_signature()
+    cache_key = (extract_if_trusted, directory_signature)
+    with endpoint_package_cache_lock:
+        cached = endpoint_package_list_cache.get(cache_key)
+        if cached is not None:
+            return {name: dict(info) for name, info in cached.items()}
     modules = {}
     if not MODULE_STORE_DIR.is_dir():
         return modules
@@ -718,6 +773,9 @@ def discover_endpoint_packages(extract_if_trusted=False):
                 "load_error": f"This module is unsigned and cannot be verified ({exc})",
             }
         modules[info["module"]] = info
+    cached_modules = {name: dict(info) for name, info in modules.items()}
+    with endpoint_package_cache_lock:
+        endpoint_package_list_cache[cache_key] = cached_modules
     return modules
 
 
@@ -4288,23 +4346,7 @@ def endpoint_is_output_capable(endpoint):
 
 def module_is_output_capable(module_name, mod=None):
     module_type = module_info_type(module_name).lower()
-    if not module_type_has_output(module_type):
-        return False
-    if mod is None:
-        with loaded_modules_lock:
-            mod = loaded_modules.get(module_name)
-    if mod is not None and hasattr(mod, "get_endpoint_status"):
-        try:
-            status_info = mod.get_endpoint_status()
-            if isinstance(status_info, dict):
-                if status_info.get("output_capable") is False:
-                    return False
-                for endpoint in status_info.get("endpoints") or []:
-                    if endpoint_is_output_capable(endpoint):
-                        return True
-        except Exception as exc:
-            log(f"module_is_output_capable status error module={module_name}: {exc}")
-    return True
+    return module_type_has_output(module_type)
 
 
 def output_module_names():
@@ -4878,12 +4920,18 @@ def load_module(module_dir, entry):
     with loaded_modules_lock:
         loaded_modules[module_dir] = mod
         module_load_errors.pop(module_dir, None)
+    with module_status_lock:
+        module_status_cache.pop(module_dir, None)
+        module_status_tasks.pop(module_dir, None)
     log(f"load_module {module_dir}")
 
 
 def mark_module_load_error(module_dir, exc):
     with loaded_modules_lock:
         module_load_errors[module_dir] = str(exc)
+    with module_status_lock:
+        module_status_cache.pop(module_dir, None)
+        module_status_tasks.pop(module_dir, None)
     log(f"load_module error {module_dir}: {exc}")
 
 
@@ -4897,6 +4945,9 @@ def unload_module(module_dir):
     with loaded_modules_lock:
         loaded_modules.pop(module_dir, None)
         module_load_errors.pop(module_dir, None)
+    with module_status_lock:
+        module_status_cache.pop(module_dir, None)
+        module_status_tasks.pop(module_dir, None)
     log(f"unload_module {module_dir}")
 
 
@@ -5079,7 +5130,10 @@ def send_ipc_json(conn, payload):
 
 def decode_ipc_json_token(token):
     raw = base64.b64decode(str(token or "").encode("ascii"), validate=True)
-    return json.loads(raw.decode("utf-8"))
+    text = raw.decode("utf-8", errors="replace").strip()
+    if not text:
+        raise ValueError("IPC payload is empty")
+    return json.loads(text)
 
 
 def start_ipc_server():
@@ -5430,6 +5484,152 @@ def handle_ready(conn, parts):
     conn.sendall(b"ACK\n")
 
 
+def normalize_module_status_endpoints(module_info):
+    endpoints = module_info.get("endpoints")
+    if not isinstance(endpoints, list):
+        endpoints = []
+        module_info["endpoints"] = endpoints
+    for endpoint in endpoints:
+        if not isinstance(endpoint, dict):
+            continue
+        direction = str(endpoint.get("direction") or endpoint.get("input_type") or "").lower()
+        if "output" in direction:
+            endpoint.setdefault("bell_capable", True)
+            capabilities = endpoint.get("capabilities")
+            if not isinstance(capabilities, list):
+                capabilities = []
+            if "bells" not in capabilities:
+                capabilities.append("bells")
+            endpoint["capabilities"] = capabilities
+    module_info["count"] = len(endpoints)
+    return module_info
+
+
+def normalize_status_collection_error(exc):
+    if isinstance(exc, json.JSONDecodeError):
+        if exc.pos == 0:
+            return "Module returned an empty or invalid JSON response"
+        return f"Module returned invalid JSON: {exc}"
+    return str(exc)
+
+
+def cached_module_status_entry(module_name):
+    with module_status_lock:
+        entry = module_status_cache.get(module_name)
+        if entry is None:
+            return None
+        return dict(entry)
+
+
+def start_module_status_collection(module_name, builder):
+    with module_status_lock:
+        existing = module_status_tasks.get(module_name)
+        if existing is not None and existing["thread"].is_alive():
+            if (time.monotonic() - existing.get("started_at", 0.0)) <= MODULE_STATUS_TASK_STALE_SECONDS:
+                return existing
+            module_status_tasks.pop(module_name, None)
+            log(f"module_status stale task discarded module={module_name}")
+        state = {
+            "module_name": module_name,
+            "done": threading.Event(),
+            "started_at": time.monotonic(),
+        }
+        module_status_tasks[module_name] = state
+
+    def worker():
+        payload = None
+        error = None
+        try:
+            payload = builder()
+            if not isinstance(payload, dict):
+                payload = {}
+        except Exception as exc:
+            error = normalize_status_collection_error(exc)
+        with module_status_lock:
+            existing_cache = module_status_cache.get(module_name)
+            cache_entry = {
+                "payload": payload,
+                "error": error,
+                "warning": None,
+                "started_at": state["started_at"],
+                "updated_at": time.monotonic(),
+            }
+            if error and existing_cache and not existing_cache.get("error") and isinstance(existing_cache.get("payload"), dict):
+                cache_entry["payload"] = dict(existing_cache["payload"])
+                cache_entry["error"] = None
+                cache_entry["warning"] = error
+                log(f"module_status refresh failed module={module_name}: {error}; keeping last good payload")
+            if existing_cache is None or existing_cache.get("started_at", 0.0) <= state["started_at"]:
+                module_status_cache[module_name] = cache_entry
+            current = module_status_tasks.get(module_name)
+            if current is state:
+                module_status_tasks.pop(module_name, None)
+        state["done"].set()
+
+    state["thread"] = threading.Thread(target=worker, daemon=True)
+    state["thread"].start()
+    return state
+
+
+def resolve_module_status(module_name, display_name, timeout_seconds, **fallback_fields):
+    cached = cached_module_status_entry(module_name)
+    if cached is not None and (time.monotonic() - cached.get("updated_at", 0.0)) <= MODULE_STATUS_CACHE_TTL:
+        return finalize_module_status(module_name, display_name, cached, **fallback_fields)
+    return finish_module_status_collection(module_name, display_name, timeout_seconds, cached, **fallback_fields)
+
+
+def finish_module_status_collection(module_name, display_name, timeout_seconds, cached_entry=None, **fallback_fields):
+    with module_status_lock:
+        state = module_status_tasks.get(module_name)
+    if state is not None:
+        state["done"].wait(max(0.0, timeout_seconds))
+    cached = cached_module_status_entry(module_name)
+    if cached is not None and (state is None or state["done"].is_set()):
+        return finalize_module_status(module_name, display_name, cached, **fallback_fields)
+    if cached_entry is not None:
+        return finalize_module_status(module_name, display_name, cached_entry, **fallback_fields)
+    if state is not None and not state["done"].is_set():
+        timed_out = {
+            "module": module_name,
+            "display_name": display_name or module_name,
+            "count": 0,
+            "endpoints": [],
+            "error": "Timed out while collecting endpoint status",
+        }
+        timed_out.update(fallback_fields)
+        return timed_out
+    failed = {
+        "module": module_name,
+        "display_name": display_name or module_name,
+        "count": 0,
+        "endpoints": [],
+        "error": "Endpoint status unavailable",
+    }
+    failed.update(fallback_fields)
+    return failed
+
+
+def finalize_module_status(module_name, display_name, cached_entry, **fallback_fields):
+    if cached_entry.get("error"):
+        failed = {
+            "module": module_name,
+            "display_name": display_name or module_name,
+            "count": 0,
+            "endpoints": [],
+            "error": cached_entry["error"],
+        }
+        failed.update(fallback_fields)
+        return failed
+    payload = cached_entry.get("payload") or {}
+    payload["module"] = payload.get("module") or module_name
+    payload["display_name"] = payload.get("display_name") or display_name or payload["module"]
+    if cached_entry.get("warning") and not payload.get("warning"):
+        payload["warning"] = cached_entry["warning"]
+    for key, value in fallback_fields.items():
+        payload.setdefault(key, value)
+    return normalize_module_status_endpoints(payload)
+
+
 def handle_list_endpoints(conn):
     sync_error = None
     try:
@@ -5441,60 +5641,46 @@ def handle_list_endpoints(conn):
         modules_snapshot = list(loaded_modules.items())
         load_errors_snapshot = dict(module_load_errors)
     modules = []
+    pending = []
     if not any(module_name == "siptrunks" for module_name, _mod in modules_snapshot):
-        try:
-            sip_info = get_siptrunks_endpoint_status()
-            sip_info["count"] = len(sip_info.get("endpoints") or [])
-            modules.append(sip_info)
-        except Exception as exc:
-            modules.append(
+        pending.append(
+            (
+                "siptrunks",
+                "SIP Trunks",
                 {
-                    "module": "siptrunks",
-                    "display_name": "SIP Trunks",
-                    "count": 0,
-                    "endpoints": [],
-                    "error": str(exc),
                     "system_builtin": True,
-                }
+                    "enabled": True,
+                    "loaded": True,
+                    "trusted": True,
+                    "can_load": True,
+                },
             )
+        )
+        start_module_status_collection("siptrunks", get_siptrunks_endpoint_status)
     for module_name, mod in modules_snapshot:
-        module_info = {
-            "module": module_name,
-            "display_name": module_name,
-            "count": 0,
-            "endpoints": [],
+        fallback = {
             "input_capable": module_is_input_capable(module_name),
             "output_capable": module_is_output_capable(module_name, mod),
         }
-        try:
-            if hasattr(mod, "get_endpoint_status"):
-                status_info = mod.get_endpoint_status()
-                if isinstance(status_info, dict):
-                    module_info.update(status_info)
-            else:
-                module_info["error"] = "Module does not support endpoint status"
-        except Exception as exc:
-            module_info["error"] = str(exc)
-            log(f"get_endpoint_status error in {module_name}: {exc}")
-        endpoints = module_info.get("endpoints")
-        if not isinstance(endpoints, list):
-            endpoints = []
-            module_info["endpoints"] = endpoints
-        for endpoint in endpoints:
-            if not isinstance(endpoint, dict):
-                continue
-            direction = str(endpoint.get("direction") or endpoint.get("input_type") or "").lower()
-            if "output" in direction:
-                endpoint.setdefault("bell_capable", True)
-                capabilities = endpoint.get("capabilities")
-                if not isinstance(capabilities, list):
-                    capabilities = []
-                if "bells" not in capabilities:
-                    capabilities.append("bells")
-                endpoint["capabilities"] = capabilities
-        module_info["module"] = module_info.get("module") or module_name
-        module_info["display_name"] = module_info.get("display_name") or module_info["module"]
-        module_info["count"] = len(endpoints)
+        if hasattr(mod, "get_endpoint_status"):
+            pending.append((module_name, module_name, fallback))
+            start_module_status_collection(module_name, mod.get_endpoint_status)
+        else:
+            module_info = {
+                "module": module_name,
+                "display_name": module_name,
+                "count": 0,
+                "endpoints": [],
+                "error": "Module does not support endpoint status",
+                **fallback,
+            }
+            modules.append(module_info)
+    deadline = time.monotonic() + LIST_ENDPOINTS_STATUS_TIMEOUT
+    for module_name, display_name, fallback in pending:
+        remaining = deadline - time.monotonic()
+        module_info = resolve_module_status(module_name, display_name, remaining, **fallback)
+        if module_info.get("error"):
+            log(f"get_endpoint_status error in {module_name}: {module_info['error']}")
         modules.append(module_info)
     for module_name, error in sorted(load_errors_snapshot.items()):
         modules.append(

@@ -74,6 +74,7 @@ DB_NAME = os.getenv("DB_NAME")
 APP_DEBUG = str(os.getenv("DEBUG", "")).strip().lower() in {"1", "true", "yes", "on"}
 TRACEBACKS = {}
 API_TOKEN_LABEL_LENGTH = 120
+ENDPOINT_IPC_TIMEOUT = max(2.0, float(os.getenv("OPS_ENDPOINT_IPC_TIMEOUT", "5")))
 API_TOKEN_HASHER = PasswordHasher() if PasswordHasher is not None else None
 MESSAGE_VENDOR_SCHEMA_READY = False
 WEB_RATE_LIMIT_BUCKETS = {}
@@ -897,13 +898,22 @@ def load_endpoint_web(module):
         abort(404)
 
 
+def safe_load_endpoint_web_module(module_name, trusted=False):
+    if not trusted:
+        return None, ""
+    try:
+        return endpoints.load_endpoint_web_module(module_name, missing_ok=True), ""
+    except Exception as exc:
+        return None, str(exc)
+
+
 def discovered_endpoint_modules():
     modules = {}
     for module_name, package in endpoints.discover_endpoint_packages(extract_if_trusted=True).items():
         manifest = package.get("manifest") or {}
         verification = package.get("verification") or {}
         trusted = bool(package.get("trusted"))
-        web_mod = endpoints.load_endpoint_web_module(module_name, missing_ok=True) if trusted else None
+        web_mod, web_load_error = safe_load_endpoint_web_module(module_name, trusted=trusted)
         modules[module_name] = {
             "module": module_name,
             "name": manifest.get("name") or module_name,
@@ -921,6 +931,7 @@ def discovered_endpoint_modules():
             "signature_label": verification.get("signature_label") or "",
             "signer": verification.get("organization") or "",
             "load_error": "" if trusted else package.get("load_error") or endpoints.UNSIGNED_ERROR,
+            "web_load_error": web_load_error,
             "has_settings_page": bool(getattr(web_mod, "render_settings", None)) if web_mod else False,
             "has_forms": bool(getattr(web_mod, "forms", None)) if web_mod else False,
         }
@@ -950,8 +961,8 @@ def endpoint_module_state_map(modules=None):
 
 
 def builtin_endpoint_modules():
-    sip_web_mod = endpoints.load_endpoint_web_module("siptrunks", missing_ok=True)
-    multicast_web_mod = endpoints.load_endpoint_web_module(endpoints.MULTICAST_RTP_MODULE, missing_ok=True)
+    sip_web_mod, sip_web_error = safe_load_endpoint_web_module("siptrunks", trusted=True)
+    multicast_web_mod, multicast_web_error = safe_load_endpoint_web_module(endpoints.MULTICAST_RTP_MODULE, trusted=True)
     return {
         "siptrunks": {
             "module": "siptrunks",
@@ -967,6 +978,7 @@ def builtin_endpoint_modules():
             "system_builtin": True,
             "input_capable": True,
             "output_capable": True,
+            "web_load_error": sip_web_error,
             "has_settings_page": False,
             "has_forms": bool(getattr(sip_web_mod, "forms", None)) if sip_web_mod else False,
         },
@@ -984,6 +996,7 @@ def builtin_endpoint_modules():
             "system_builtin": True,
             "input_capable": False,
             "output_capable": True,
+            "web_load_error": multicast_web_error,
             "has_settings_page": False,
             "has_forms": bool(getattr(multicast_web_mod, "forms", None)) if multicast_web_mod else False,
         },
@@ -1331,9 +1344,16 @@ def user_settings():
 
 def endpoint_ipc(command):
     try:
-        with endpoints.connect_endpoint_ipc(timeout=2) as sock:
+        with endpoints.connect_endpoint_ipc(timeout=ENDPOINT_IPC_TIMEOUT) as sock:
             sock.sendall(command.encode() + b"\n")
-            return json.loads(sock.recv(1024 * 1024).decode())
+            raw = endpoints.recv_line(sock)
+            text = raw.decode("utf-8", errors="replace").strip()
+            if not text:
+                return {"ok": False, "error": "Endpoint manager returned an empty response", "modules": []}
+            try:
+                return json.loads(text)
+            except Exception:
+                return {"ok": False, "error": f"Invalid endpoint manager response: {text[:200]}", "modules": []}
     except Exception as exc:
         return {"ok": False, "error": str(exc), "modules": []}
 
