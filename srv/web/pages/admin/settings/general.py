@@ -23,6 +23,7 @@ def handle_request():
     show_docs_checked = " checked" if data.get("show_online_docs", "1") == "1" else ""
     analytics_checked = " checked" if data.get("analytics", "0") == "1" else ""
     allow_multicast_gateway_checked = " checked" if data.get("allow_multicast_gateway", "0") == "1" else ""
+    demo = demo_mode_enabled()
     docs_link = "https://www.openpagingserver.org/software/multicastgateway/"
     gateway_name = f'<a href="{docs_link}" target="_blank" rel="noopener">Multicast Gateway</a>' if data.get("show_online_docs", "1") == "1" else "Multicast Gateway"
     manage_servers_style = (
@@ -129,6 +130,7 @@ document.addEventListener('DOMContentLoaded', function(){
   var manageButton = document.getElementById('manageMulticastGatewayBtn');
   var managerBackdrop = document.getElementById('mgManagerBackdrop');
   var managerRoot = document.getElementById('mgManagerRoot');
+  var demoModeEnabled = __OPS_DEMO_MODE__;
   function closeMainModal() {
     if (managerBackdrop) managerBackdrop.classList.remove('active');
     if (managerRoot) managerRoot.innerHTML = '';
@@ -175,6 +177,10 @@ document.addEventListener('DOMContentLoaded', function(){
   }
   if (manageButton) {
     manageButton.addEventListener('click', function() {
+      if (demoModeEnabled) {
+        if (window.openDemoModePopup) openDemoModePopup('settings');
+        return;
+      }
       refreshManager();
     });
   }
@@ -214,5 +220,5 @@ document.addEventListener('DOMContentLoaded', function(){
     });
   }
 });
-"""
+""".replace("__OPS_DEMO_MODE__", "true" if demo else "false")
     return settings_page("General Settings", ctx, "general", body, script)

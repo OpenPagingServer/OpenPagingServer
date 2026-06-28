@@ -95,15 +95,17 @@ def handle_request():
     user = require_admin()
     if not isinstance(user, dict):
         return user
-    ensure_peer_table()
-    identity = ensure_ops_identity()
     wants_fragment = request.args.get("fragment") == "1" or request.headers.get("X-Requested-With") == "XMLHttpRequest"
 
+    if demo_mode_enabled():
+        if wants_fragment:
+            return demo_mode_iframe_html("settings")
+        return redirect("/admin/settings/general")
+
+    ensure_peer_table()
+    identity = ensure_ops_identity()
+
     if request.method == "POST":
-        if demo_mode_enabled():
-            if wants_fragment:
-                return jsonify(status="error", message="Demo Mode is enabled.", html=popup_content_html(identity, "Demo Mode is enabled.", "error"))
-            return redirect("/admin/settings/general")
         action = str(request.form.get("action") or "").strip().lower()
         status = "success"
         message = ""
