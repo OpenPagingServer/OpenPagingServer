@@ -294,7 +294,7 @@ def handle_request():
                     _record_login_attempt(ip, username, False, ua)
                     session.pop("temp_challenge", None)
                     session.pop("temp_user", None)
-                    return jsonify(success=False, message="Only the maintenance user can sign in right now.")
+                    return jsonify(success=False, message="This demo server is currently in maintenance mode by a clerk or system administrator. Please try again later. We apologize for any inconvenience.")
                 ok = bool(user and challenge and request.form.get("response") == expected)
                 _record_login_attempt(ip, username, ok, ua)
                 if ok:
