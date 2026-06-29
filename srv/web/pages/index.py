@@ -256,7 +256,10 @@ def handle_request():
         data = {}
         login_error = "Initialization failed: " + str(exc)
 
-    if session.get("user_id") is not None and session.get("user_id") != "":
+    maintenance_popup_open = demo_mode_maintenance_popup_pending()
+    maintenance_state = demo_mode_maintenance_state(data) if maintenance_popup_open else None
+
+    if session.get("user_id") is not None and session.get("user_id") != "" and not maintenance_popup_open:
         return redirect("/dashboard")
 
     if request.method == "POST":
@@ -274,7 +277,8 @@ def handle_request():
                 challenge = secrets.token_hex(32)
                 session["temp_challenge"] = challenge
                 session["temp_user"] = username
-                salt = user["salt"] if user and user.get("salt") is not None else _fake_salt(username)
+                use_fake_salt = demo_mode_maintenance_block_enabled(data) and not demo_mode_maintenance_username_matches(username)
+                salt = _fake_salt(username) if use_fake_salt else (user["salt"] if user and user.get("salt") is not None else _fake_salt(username))
                 return jsonify(success=True, salt=salt, challenge=challenge)
 
             if "response" in request.form:
@@ -286,12 +290,22 @@ def handle_request():
                 challenge = session.get("temp_challenge", "")
                 user = query_one("SELECT id, username, password FROM users WHERE username=%s OR email=%s LIMIT 1", (username, username))
                 expected = hashlib.sha256(((user or {}).get("password", "") + challenge).encode()).hexdigest() if user and challenge else ""
+                if demo_mode_maintenance_block_enabled(data) and not demo_mode_maintenance_username_matches((user or {}).get("username") or username):
+                    _record_login_attempt(ip, username, False, ua)
+                    session.pop("temp_challenge", None)
+                    session.pop("temp_user", None)
+                    return jsonify(success=False, message="Only the maintenance user can sign in right now.")
                 ok = bool(user and challenge and request.form.get("response") == expected)
                 _record_login_attempt(ip, username, ok, ua)
                 if ok:
                     session.clear()
                     session["user_id"] = user["id"]
                     session["username"] = user["username"]
+                    if demo_mode_maintenance_username_matches(user["username"]):
+                        session[DEMO_MODE_MAINTENANCE_SESSION_KEY] = "1"
+                        session[DEMO_MODE_MAINTENANCE_PENDING_KEY] = "1"
+                        demo_mode_maintenance_touch()
+                        return jsonify(success=True, maintenance_popup=True, maintenance=demo_mode_maintenance_state(data))
                     return jsonify(success=True)
                 session.pop("temp_challenge", None)
                 session.pop("temp_user", None)
@@ -316,12 +330,31 @@ def handle_request():
     captcha_html = _captcha_markup(captcha_provider, captcha_site_key)
     captcha_script = _captcha_script_tag(captcha_provider)
     demo_mode_html = ""
-    if demo_mode_enabled():
+    if demo_mode_active():
         demo_mode_html = """
         <div class="demo-mode-login">
           <i class="fa-solid fa-bag-shopping"></i>
           <span>Demo Mode</span>
         </div>"""
+    maintenance_popup_html = """
+    <div id="maintenance-popup-overlay" class="maintenance-popup-overlay">
+      <div class="maintenance-popup" role="dialog" aria-modal="true" aria-labelledby="maintenancePopupTitle">
+        <h3 id="maintenancePopupTitle">Demo Mode Maintenance</h3>
+        <div class="maintenance-option-row">
+          <label class="maintenance-checkbox-label" for="maintenance-block-users">Block non-maintenance users</label>
+          <input type="checkbox" id="maintenance-block-users" />
+        </div>
+        <div class="maintenance-save-row">
+          <button type="button" id="maintenance-save-btn" class="maintenance-action-btn secondary">Save</button>
+        </div>
+        <div id="maintenance-popup-status" class="maintenance-popup-status" aria-live="polite"></div>
+        <div class="maintenance-actions">
+          <button type="button" id="maintenance-enter-btn" class="maintenance-action-btn">Enter Web</button>
+          <button type="button" id="maintenance-restart-btn" class="maintenance-action-btn danger">Restart OPS Systemd</button>
+          <button type="button" id="maintenance-reboot-btn" class="maintenance-action-btn danger">Reboot Server</button>
+        </div>
+      </div>
+    </div>"""
 
     favicon_html = f'<link rel="icon" href="{h(favicon)}" type="image/x-icon">' if favicon else ""
     dark_logo_css = ".logo-light { display: none; }\n        .logo-dark { display: block; }" if separate_dark_logo else ""
@@ -401,6 +434,20 @@ def handle_request():
       @keyframes spin {{ from {{ transform: rotate(0deg); }} to {{ transform: rotate(360deg); }} }}
       .error {{ color: #d32f2f; font-size: 0.9em; margin-top: 10px; min-height: 1.2em; }}
       .demo-mode-login {{ position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); z-index: 2; color: #000; font-size: 0.95em; display: flex; align-items: center; justify-content: center; gap: 8px; }}
+      .maintenance-popup-overlay {{ display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.72); z-index: 10; align-items: center; justify-content: center; padding: 20px; box-sizing: border-box; }}
+      .maintenance-popup-overlay.active {{ display: flex; }}
+      .maintenance-popup {{ width: min(460px, 100%); background: #fff; border-radius: 10px; padding: 24px; box-shadow: 0 18px 45px rgba(0,0,0,0.35); text-align: left; }}
+      .maintenance-popup h3 {{ margin: 0 0 18px 0; color: #1976d2; font-weight: 500; }}
+      .maintenance-option-row {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 12px; }}
+      .maintenance-checkbox-label {{ font-size: 15px; color: #333; }}
+      .maintenance-save-row {{ margin-bottom: 16px; }}
+      .maintenance-popup-status {{ min-height: 20px; font-size: 0.92em; margin-bottom: 14px; color: #555; }}
+      .maintenance-popup-status.success {{ color: #2e7d32; }}
+      .maintenance-popup-status.error {{ color: #c62828; }}
+      .maintenance-actions {{ display: flex; flex-direction: column; gap: 10px; }}
+      .maintenance-action-btn {{ width: 100%; padding: 12px; border: none; border-radius: 4px; cursor: pointer; font-size: 15px; text-transform: uppercase; background: #1976d2; color: #fff; }}
+      .maintenance-action-btn.secondary {{ width: auto; min-width: 120px; background: #5f6368; }}
+      .maintenance-action-btn.danger {{ background: #c62828; }}
       @media (prefers-color-scheme: dark) {{
         body, html {{ background: #121212; color: #fff; }}
         .login-banner {{ background: #3e2723; border: 1px solid #5d4037; color: #ffb74d; }}
@@ -412,6 +459,15 @@ def handle_request():
         .login-box button {{ background-color: #90caf9; color: #121212; }}
         .error {{ color: #ffcdd2; }}
         .demo-mode-login {{ color: #fff; }}
+        .maintenance-popup {{ background: #1e1e1e; }}
+        .maintenance-popup h3 {{ color: #fff; }}
+        .maintenance-checkbox-label {{ color: #e0e0e0; }}
+        .maintenance-popup-status {{ color: #bbb; }}
+        .maintenance-popup-status.success {{ color: #81c784; }}
+        .maintenance-popup-status.error {{ color: #ef9a9a; }}
+        .maintenance-action-btn {{ background: #90caf9; color: #121212; }}
+        .maintenance-action-btn.secondary {{ background: #5f6368; color: #fff; }}
+        .maintenance-action-btn.danger {{ background: #ef5350; color: #fff; }}
         {dark_logo_css}
       }}
       @media (prefers-color-scheme: dark) and (max-width: 768px) {{ body {{ background: #121212; }} }}
@@ -439,6 +495,7 @@ def handle_request():
       </div>
       {demo_mode_html}
     </div>
+    {maintenance_popup_html}
     <script>
       function rectsOverlap(a, b) {{
         return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
@@ -476,6 +533,56 @@ def handle_request():
       Array.from(document.images).forEach((img) => img.addEventListener('load', adjustLogoPosition));
 
       const captchaProvider = "{captcha_provider}";
+      let maintenanceState = __OPS_MAINTENANCE_STATE__;
+      const maintenancePopupInitiallyOpen = __OPS_MAINTENANCE_POPUP_OPEN__;
+
+      function maintenanceElements() {{
+        return {{
+          overlay: document.getElementById('maintenance-popup-overlay'),
+          checkbox: document.getElementById('maintenance-block-users'),
+          status: document.getElementById('maintenance-popup-status'),
+          restartButton: document.getElementById('maintenance-restart-btn'),
+          rebootButton: document.getElementById('maintenance-reboot-btn')
+        }};
+      }}
+
+      function setMaintenanceStatus(message, kind) {{
+        const els = maintenanceElements();
+        if (!els.status) return;
+        els.status.textContent = message || '';
+        els.status.className = 'maintenance-popup-status' + (kind ? ' ' + kind : '');
+      }}
+
+      function applyMaintenanceState(state) {{
+        maintenanceState = state || {{}};
+        const els = maintenanceElements();
+        if (els.checkbox) els.checkbox.checked = !!maintenanceState.block_non_maintenance_users;
+        if (els.restartButton) els.restartButton.style.display = maintenanceState.can_restart_ops_systemd ? '' : 'none';
+        if (els.rebootButton) els.rebootButton.style.display = maintenanceState.show_reboot_server === false ? 'none' : '';
+      }}
+
+      function openMaintenancePopup(state) {{
+        const els = maintenanceElements();
+        applyMaintenanceState(state);
+        if (els.overlay) els.overlay.classList.add('active');
+      }}
+
+      async function postMaintenanceAction(action, extras) {{
+        const payload = new URLSearchParams({{ action: action }});
+        Object.entries(extras || {{}}).forEach(([key, value]) => payload.append(key, value));
+        const response = await fetch('/demo-mode-maintenance', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
+          body: payload
+        }});
+        const data = await response.json();
+        if (data && data.state) applyMaintenanceState(data.state);
+        if (data && data.message) setMaintenanceStatus(data.message, data.status === 'success' ? 'success' : 'error');
+        if (!data || data.status !== 'success') throw new Error((data && data.message) || 'Maintenance action failed.');
+        if (data.redirect) {{
+          window.location.href = data.redirect;
+        }}
+      }}
 
       function refreshBasicCaptcha() {{
         const image = document.getElementById('basic-captcha-image');
@@ -557,7 +664,11 @@ def handle_request():
 
           const data2 = await res2.json();
 
-          if (data2.success) {{
+          if (data2.success && data2.maintenance_popup) {{
+            btn.classList.remove('loading');
+            btn.innerHTML = 'Login';
+            openMaintenancePopup(data2.maintenance || {{}});
+          }} else if (data2.success) {{
             window.location.href = '/dashboard';
           }} else {{
             throw new Error(data2.message || 'Invalid username or password.');
@@ -569,7 +680,46 @@ def handle_request():
           btn.innerHTML = 'Login';
         }}
       }}
+
+      document.addEventListener('DOMContentLoaded', function() {{
+        const saveBtn = document.getElementById('maintenance-save-btn');
+        const enterBtn = document.getElementById('maintenance-enter-btn');
+        const restartBtn = document.getElementById('maintenance-restart-btn');
+        const rebootBtn = document.getElementById('maintenance-reboot-btn');
+        const checkbox = document.getElementById('maintenance-block-users');
+        if (saveBtn) {{
+          saveBtn.addEventListener('click', async function() {{
+            try {{
+              await postMaintenanceAction('save', {{ block_non_maintenance_users: checkbox && checkbox.checked ? '1' : '0' }});
+            }} catch (_error) {{}}
+          }});
+        }}
+        if (enterBtn) {{
+          enterBtn.addEventListener('click', async function() {{
+            try {{
+              await postMaintenanceAction('enter_web');
+            }} catch (_error) {{}}
+          }});
+        }}
+        if (restartBtn) {{
+          restartBtn.addEventListener('click', async function() {{
+            try {{
+              await postMaintenanceAction('restart_ops_systemd');
+            }} catch (_error) {{}}
+          }});
+        }}
+        if (rebootBtn) {{
+          rebootBtn.addEventListener('click', async function() {{
+            try {{
+              await postMaintenanceAction('reboot_server');
+            }} catch (_error) {{}}
+          }});
+        }}
+        if (maintenancePopupInitiallyOpen) {{
+          openMaintenancePopup(maintenanceState || {{}});
+        }}
+      }});
     </script>
   </body>
-</html>"""
+</html>""".replace("__OPS_MAINTENANCE_STATE__", json.dumps(maintenance_state or {})).replace("__OPS_MAINTENANCE_POPUP_OPEN__", "true" if maintenance_popup_open else "false")
     return Response(body, mimetype="text/html")

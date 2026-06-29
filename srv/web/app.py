@@ -6,7 +6,9 @@ import json
 import os
 import re
 import secrets
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -93,6 +95,13 @@ app.config.update(
     MAX_CONTENT_LENGTH=128 * 1024 * 1024,
 )
 DEMO_MODE = str(os.getenv("DEMO_MODE", "")).strip().lower() in {"1", "true", "yes", "on"}
+DEMO_MODE_MAINTENANCE_USER = str(os.getenv("DEMOMODE_MAINTENANCE_USER", "") or "").strip()
+DEMO_MODE_MAINTENANCE_SESSION_KEY = "demo_mode_maintenance"
+DEMO_MODE_MAINTENANCE_PENDING_KEY = "demo_mode_maintenance_pending"
+DEMO_MODE_MAINTENANCE_LAST_ACTIVITY_KEY = "demo_mode_maintenance_last_activity"
+DEMO_MODE_MAINTENANCE_IDLE_TIMEOUT_SECONDS = 600
+DEMO_MODE_MAINTENANCE_BLOCK_SETTING = "demo_mode_block_non_maintenance"
+OPS_SYSTEMD_UNIT = "openpagingserver.service"
 
 
 def int_env(name, default):
@@ -159,6 +168,42 @@ def enforce_web_rate_limits():
         response = check_rate_limit(scope, key, limit, window_seconds)
         if response is not None:
             return response
+    return None
+
+
+@app.before_request
+def enforce_demo_mode_maintenance_controls():
+    if not demo_mode_active() or not demo_mode_maintenance_username():
+        return None
+
+    path = request.path or ""
+    exempt_paths = {"/", "/index", "/logout", "/login/basic-captcha.svg", "/favicon.ico", "/demo-mode-maintenance"}
+    exempt_prefixes = ("/bundled-assets/", "/assets/", "/demo-mode")
+    is_exempt = path in exempt_paths or any(path.startswith(prefix) for prefix in exempt_prefixes)
+    now_value = time.time()
+
+    if demo_mode_maintenance_session_active():
+        try:
+            last_activity = float(session.get(DEMO_MODE_MAINTENANCE_LAST_ACTIVITY_KEY, "0") or 0)
+        except (TypeError, ValueError):
+            last_activity = 0
+        if last_activity and (now_value - last_activity) > DEMO_MODE_MAINTENANCE_IDLE_TIMEOUT_SECONDS:
+            session.clear()
+            return redirect("/")
+        if not is_exempt:
+            demo_mode_maintenance_touch(now_value)
+        if demo_mode_maintenance_popup_pending():
+            allowed_paths = {"/", "/index", "/logout", "/demo-mode-maintenance"}
+            allowed_prefixes = ("/bundled-assets/", "/assets/", "/demo-mode")
+            if path not in allowed_paths and not any(path.startswith(prefix) for prefix in allowed_prefixes):
+                return redirect("/")
+        return None
+
+    if demo_mode_maintenance_block_enabled():
+        user_id = session.get("user_id")
+        if user_id not in (None, ""):
+            session.clear()
+            return redirect("/")
     return None
 
 
@@ -275,8 +320,130 @@ def truthy(value):
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def demo_mode_enabled():
+def demo_mode_active():
     return DEMO_MODE
+
+
+def demo_mode_maintenance_username():
+    return DEMO_MODE_MAINTENANCE_USER
+
+
+def demo_mode_maintenance_username_matches(username):
+    configured = demo_mode_maintenance_username()
+    candidate = str(username or "").strip()
+    return bool(configured and candidate and configured.lower() == candidate.lower())
+
+
+def demo_mode_maintenance_session_active():
+    if not demo_mode_active():
+        return False
+    if not session.get(DEMO_MODE_MAINTENANCE_SESSION_KEY):
+        return False
+    return demo_mode_maintenance_username_matches(session.get("username"))
+
+
+def demo_mode_maintenance_popup_pending():
+    return demo_mode_maintenance_session_active() and truthy(session.get(DEMO_MODE_MAINTENANCE_PENDING_KEY))
+
+
+def demo_mode_maintenance_touch(now_value=None):
+    if not demo_mode_maintenance_session_active():
+        return
+    session[DEMO_MODE_MAINTENANCE_LAST_ACTIVITY_KEY] = str(float(now_value if now_value is not None else time.time()))
+
+
+def demo_mode_maintenance_clear():
+    session.pop(DEMO_MODE_MAINTENANCE_SESSION_KEY, None)
+    session.pop(DEMO_MODE_MAINTENANCE_PENDING_KEY, None)
+    session.pop(DEMO_MODE_MAINTENANCE_LAST_ACTIVITY_KEY, None)
+
+
+def demo_mode_maintenance_block_enabled(data=None):
+    if not demo_mode_active() or not demo_mode_maintenance_username():
+        return False
+    source = data if isinstance(data, dict) else settings()
+    return truthy((source or {}).get(DEMO_MODE_MAINTENANCE_BLOCK_SETTING, "0"))
+
+
+def systemctl_available():
+    return shutil.which("systemctl") is not None
+
+
+def systemd_unit_exists(unit=OPS_SYSTEMD_UNIT):
+    if not systemctl_available():
+        return False
+    for command in (
+        ["systemctl", "list-unit-files", unit],
+        ["systemctl", "list-units", "--all", unit],
+    ):
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=5, check=False)
+        except Exception:
+            continue
+        output = (result.stdout or "") + (result.stderr or "")
+        if unit in output:
+            return True
+    return False
+
+
+def demo_mode_maintenance_can_restart_ops_systemd():
+    if os.name == "nt":
+        return False
+    if not demo_mode_active() or not demo_mode_maintenance_username():
+        return False
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return False
+    if not Path("/run/systemd/system").exists():
+        return False
+    return systemd_unit_exists()
+
+
+def _spawn_background_command(command):
+    kwargs = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "stdin": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    else:
+        kwargs["start_new_session"] = True
+    subprocess.Popen(command, **kwargs)
+
+
+def demo_mode_maintenance_restart_ops_systemd():
+    if not demo_mode_maintenance_can_restart_ops_systemd():
+        raise RuntimeError("OPS systemd restart is not available.")
+    _spawn_background_command(["systemctl", "restart", OPS_SYSTEMD_UNIT])
+
+
+def demo_mode_maintenance_reboot_server():
+    if os.name == "nt":
+        _spawn_background_command(["shutdown", "/r", "/t", "0"])
+        return
+    if Path("/run/systemd/system").exists() and systemctl_available():
+        _spawn_background_command(["systemctl", "reboot"])
+        return
+    reboot_binary = shutil.which("reboot")
+    if reboot_binary:
+        _spawn_background_command([reboot_binary])
+        return
+    raise RuntimeError("Server reboot is not supported on this system.")
+
+
+def demo_mode_maintenance_state(data=None):
+    source = data if isinstance(data, dict) else settings()
+    return {
+        "maintenance_user": demo_mode_maintenance_username(),
+        "block_non_maintenance_users": demo_mode_maintenance_block_enabled(source),
+        "can_restart_ops_systemd": demo_mode_maintenance_can_restart_ops_systemd(),
+        "show_reboot_server": True,
+    }
+
+
+def demo_mode_enabled():
+    return demo_mode_active() and not demo_mode_maintenance_session_active()
 
 
 def api_token_hash(token):
@@ -394,7 +561,7 @@ def ops_sidebar_brand_html(data, product_name):
     light_logo = str(data.get("sidebar_logo_light") or "/assets/OPENPAGINGSERVER-768x576-LIGHTMODE.png").strip()
     dark_logo = str(data.get("sidebar_logo_dark") or "/assets/OPENPAGINGSERVER-768x576-DARKMODE.png").strip()
     demo_badge = ""
-    if demo_mode_enabled():
+    if demo_mode_active():
         demo_badge = '<span class="sidebar-demo-mode"><i class="fa-solid fa-bag-shopping"></i> Demo Mode</span>'
     if not use_logo or not light_logo:
         return f'<div class="sidebar-brand"><div class="sidebar-brand-inner"><span>{h(product_name)}</span>{demo_badge}</div></div>'
@@ -1085,6 +1252,11 @@ def login_basic_captcha():
 @alias("/logout")
 def logout():
     return dispatch_web_page("logout")
+
+
+@alias("/demo-mode-maintenance", methods=["GET", "POST"])
+def demo_mode_maintenance():
+    return dispatch_web_page("demo-mode-maintenance")
 
 
 def desktop_authorized_user():
