@@ -8,7 +8,12 @@ import time
 from pathlib import Path
 import shutil
 
-import mysql.connector
+try:
+    import mysql.connector
+except ModuleNotFoundError:
+    print("Missing dependency: mysql-connector-python")
+    print("Install it with: python3 -m pip install mysql-connector-python")
+    sys.exit(1)
 
 DATABASE_NAME = "openpagingserver"
 DATABASE_USER = "openpagingserver"
@@ -76,22 +81,29 @@ def run_systemctl(action):
     subprocess.run(["systemctl", action, unit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
 
 
+def download_file(url, destination):
+    if shutil.which("wget") is None:
+        print(f"Skipping download because wget is not installed: {url}")
+        return False
+
+    try:
+        subprocess.run(
+            ["wget", "-q", "-O", str(destination), url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=True,
+        )
+        return True
+    except subprocess.CalledProcessError:
+        print(f"Warning: failed to download {url}")
+        return False
+
+
 def install_project_root_ca():
     TRUSTED_CA_DIR.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["wget", "-q", "-O", str(PROJECT_CA_PATH), PROJECT_CA_URL],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        check=True,
-    )
-    subprocess.run(
-        ["wget", "-q", "-O", str(TRUSTED_CA_README_PATH), TRUSTED_CA_README_URL],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        check=True,
-    )
+    download_file(PROJECT_CA_URL, PROJECT_CA_PATH)
+    download_file(TRUSTED_CA_README_URL, TRUSTED_CA_README_PATH)
 
 
 def connect_as_admin():
@@ -141,7 +153,7 @@ def execute_schema(cursor):
             logincount INT DEFAULT 0,
             lastlogin DATETIME DEFAULT NULL,
             accountexpire DATE DEFAULT NULL,
-            accountcreated DATE DEFAULT (CURRENT_DATE),
+            accountcreated DATE DEFAULT CURRENT_DATE,
             adminperm LONGTEXT DEFAULT NULL,
             msgsendperm LONGTEXT DEFAULT NULL,
             userperm LONGTEXT DEFAULT NULL
@@ -305,7 +317,6 @@ def seed_defaults(cursor):
             endpoint_module_dirs,
         )
 
-    # Use IGNORE to avoid primary key constraints if seed items are already in place
     cursor.execute(
         "INSERT IGNORE INTO bell_schedules (id, name, enabled, timezone) VALUES (1, 'Default Bell Schedule', 1, 'server')"
     )
@@ -368,13 +379,12 @@ def seed_defaults(cursor):
         ("sip_external_ipv4", "", "Manual SIP external IPv4 address"),
         ("sip_rtp_port_start", "40000", "SIP RTP port range start"),
         ("sip_rtp_port_end", "50000", "SIP RTP port range end"),
-        # FIXED: Added missing commas below
         ("sip_intrusion_prevention", "1", "WARNING!!! Disabling this setting WILL compromise the security of this server, especially if the SIP port is exposed to WAN. There's usually no reason to disable this in production. The Open Paging Server project is NOT responsible for any financial loss caused by abuse of telephone service by malicious bots. CONTINUE AT YOUR OWN RISK!!!"),
         ("sip_block_scanners", "1", "WARNING!!! Disabling this setting WILL compromise the security of this server, especially if the SIP port is exposed to WAN. There's usually no reason to disable this in production. The Open Paging Server project is NOT responsible for any financial loss caused by abuse of telephone service by malicious bots. CONTINUE AT YOUR OWN RISK!!!"),
         ("login_banner_enabled", "1", "Enable or disable the login page banner (0/1)"),
         (
             "login_banner_message",
-            "OPS is currently in early devlopment stages, and is not yet suitable for production use.  Visit our website at https://www.openpagingserver.org to learn how to contribute and to join our Discord. Thank you for installing the Open Paging Server beta!",
+            "OPS is currently in early devlopment stages, and is not yet suitable for production use. Visit our website at https://www.openpagingserver.org to learn how to contribute and to join our Discord. Thank you for installing the Open Paging Server beta!",
             "Message text for the login page banner",
         ),
         ("login_banner_title", "Welcome to Open Paging Server Beta!!!", "Optional title for the login page banner"),
@@ -436,8 +446,6 @@ WEB_REVERSE_PROXY_ALLOWED=127.0.0.1
 API_REVERSE_PROXY_ALLOWED=127.0.0.1
 DEMO_MODE=false
 
-# Restart the applaction to have changes take effect
-
 """
 
     os.makedirs("/var/lib/openpagingserver/assets", exist_ok=True)
@@ -447,30 +455,48 @@ DEMO_MODE=false
         pass
 
 
-def main():
-    conn = connect_as_admin()
-    cursor = conn.cursor()
+def recreate_database_user(cursor, db_password):
+    hosts = ["localhost", "127.0.0.1"]
 
-    # FIXED: Handled non-destructive database updates safely
-    cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{DATABASE_NAME}` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci")
-    cursor.execute(f"USE `{DATABASE_NAME}`")
+    for host in hosts:
+        cursor.execute(f"DROP USER IF EXISTS '{DATABASE_USER}'@'{host}'")
+        cursor.execute(f"CREATE USER '{DATABASE_USER}'@'{host}' IDENTIFIED BY {sql_string(db_password)}")
+        cursor.execute(f"GRANT ALL PRIVILEGES ON `{DATABASE_NAME}`.* TO '{DATABASE_USER}'@'{host}'")
 
-    db_password = random_password()
-    cursor.execute(f"DROP USER IF EXISTS '{DATABASE_USER}'@'localhost'")
-    cursor.execute(f"CREATE USER '{DATABASE_USER}'@'localhost' IDENTIFIED BY {sql_string(db_password)}")
-    cursor.execute(f"GRANT ALL PRIVILEGES ON `{DATABASE_NAME}`.* TO '{DATABASE_USER}'@'localhost'")
     cursor.execute("FLUSH PRIVILEGES")
 
-    execute_schema(cursor)
-    seed_defaults(cursor)
 
-    conn.commit()
-    cursor.close()
-    conn.close()
+def main():
+    conn = None
+    cursor = None
 
-    write_config(db_password)
-    install_project_root_ca()
-    print("Database initialized successfully")
+    try:
+        conn = connect_as_admin()
+        cursor = conn.cursor()
+
+        cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{DATABASE_NAME}` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci")
+        cursor.execute(f"USE `{DATABASE_NAME}`")
+
+        db_password = random_password()
+        recreate_database_user(cursor, db_password)
+
+        execute_schema(cursor)
+        seed_defaults(cursor)
+
+        conn.commit()
+        write_config(db_password)
+        install_project_root_ca()
+        print("Database initialized successfully")
+    except mysql.connector.Error as exc:
+        if conn:
+            conn.rollback()
+        print("Database setup failed:", exc)
+        sys.exit(1)
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
 
 
 def wrapped_main():
