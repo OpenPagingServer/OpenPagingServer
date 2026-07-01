@@ -379,6 +379,16 @@ def bell_window_start_seconds(day_value, reference):
     return bell_time_seconds(reference)
 
 
+def bounded_catchup_reference(day_value, reference, now_value):
+    floor = max(
+        datetime.combine(day_value, datetime.min.time()) - timedelta(seconds=1),
+        now_value - timedelta(seconds=BELL_STARTUP_GRACE_SECONDS),
+    )
+    if reference is None:
+        return floor
+    return max(reference, floor)
+
+
 def bell_audio_duration_seconds(audio_value):
     audio_key = str(audio_value or "").strip()
     if not audio_key:
@@ -670,13 +680,16 @@ def main():
                         last_seen = max(day_start, now - timedelta(seconds=BELL_STARTUP_GRACE_SECONDS))
                     if now.date() != last_seen.date():
                         last_seen = day_start
+                    last_seen = bounded_catchup_reference(now.date(), last_seen, now)
                     if last_seen > now:
                         last_seen_by_schedule[schedule_id] = last_seen
                         continue
                     due_events = fetch_due_events(schedule, last_seen, now)
                     advance_to = now
                     if due_events:
-                        schedule_events = fetch_schedule_events_after(schedule, now.date(), last_seen, now.strftime("%w"))
+                        first_due_start = bell_event_start(now.date(), due_events[0]) - timedelta(seconds=1)
+                        cluster_reference = bounded_catchup_reference(now.date(), first_due_start, now)
+                        schedule_events = fetch_schedule_events_after(schedule, now.date(), cluster_reference, now.strftime("%w"))
                         index = 0
                         while index < len(schedule_events):
                             event = schedule_events[index]
