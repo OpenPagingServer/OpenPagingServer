@@ -10,7 +10,6 @@ import shutil
 
 import mysql.connector
 
-
 DATABASE_NAME = "openpagingserver"
 DATABASE_USER = "openpagingserver"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -115,7 +114,7 @@ def connect_as_admin():
 def execute_schema(cursor):
     schema_statements = [
         """
-        CREATE TABLE messages (
+        CREATE TABLE IF NOT EXISTS messages (
             type ENUM('liveaudio','liveaudio+text','text','text+audio','audio','record','record+text','text+audio+live') DEFAULT NULL,
             messageid INT DEFAULT NULL,
             name VARCHAR(255) DEFAULT NULL,
@@ -131,7 +130,7 @@ def execute_schema(cursor):
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
         """,
         """
-        CREATE TABLE users (
+        CREATE TABLE IF NOT EXISTS users (
             id INT AUTO_INCREMENT PRIMARY KEY,
             username VARCHAR(100) UNIQUE NOT NULL,
             email VARCHAR(255) UNIQUE,
@@ -149,7 +148,7 @@ def execute_schema(cursor):
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
         """,
         """
-        CREATE TABLE login_attempts (
+        CREATE TABLE IF NOT EXISTS login_attempts (
             id INT AUTO_INCREMENT PRIMARY KEY,
             ip VARCHAR(45) DEFAULT NULL,
             username VARCHAR(255) DEFAULT NULL,
@@ -159,7 +158,7 @@ def execute_schema(cursor):
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
         """,
         """
-        CREATE TABLE endpointmodulesloaded (
+        CREATE TABLE IF NOT EXISTS endpointmodulesloaded (
             `dir` VARCHAR(100) NOT NULL,
             enabled ENUM('true','false') DEFAULT 'true',
             `tables` TEXT DEFAULT NULL,
@@ -173,14 +172,14 @@ def execute_schema(cursor):
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
         """,
         """
-        CREATE TABLE groups (
+        CREATE TABLE IF NOT EXISTS groups (
             id VARCHAR(100) DEFAULT NULL,
             name VARCHAR(100) DEFAULT NULL,
             members TEXT DEFAULT NULL
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
         """,
         """
-        CREATE TABLE broadcasts (
+        CREATE TABLE IF NOT EXISTS broadcasts (
             id VARCHAR(100) DEFAULT NULL,
             shortmessage VARCHAR(100) DEFAULT NULL,
             longmessage TEXT DEFAULT NULL,
@@ -202,7 +201,7 @@ def execute_schema(cursor):
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
         """,
         """
-        CREATE TABLE bell_schedules (
+        CREATE TABLE IF NOT EXISTS bell_schedules (
             id INT AUTO_INCREMENT PRIMARY KEY,
             name VARCHAR(100) NOT NULL,
             enabled TINYINT(1) NOT NULL DEFAULT 1,
@@ -211,7 +210,7 @@ def execute_schema(cursor):
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
         """,
         """
-        CREATE TABLE bell_lists (
+        CREATE TABLE IF NOT EXISTS bell_lists (
             id INT AUTO_INCREMENT PRIMARY KEY,
             schedule_id INT NOT NULL DEFAULT 0,
             name VARCHAR(100) NOT NULL,
@@ -220,7 +219,7 @@ def execute_schema(cursor):
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
         """,
         """
-        CREATE TABLE bell_events (
+        CREATE TABLE IF NOT EXISTS bell_events (
             id INT AUTO_INCREMENT PRIMARY KEY,
             list_id INT NOT NULL,
             fire_time TIME NOT NULL,
@@ -231,14 +230,14 @@ def execute_schema(cursor):
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
         """,
         """
-        CREATE TABLE bell_schedule_groups (
+        CREATE TABLE IF NOT EXISTS bell_schedule_groups (
             schedule_id INT NOT NULL,
             group_id VARCHAR(100) NOT NULL,
             PRIMARY KEY (schedule_id, group_id)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
         """,
         """
-        CREATE TABLE bell_calendar (
+        CREATE TABLE IF NOT EXISTS bell_calendar (
             schedule_id INT NOT NULL,
             bell_date DATE NOT NULL,
             list_id INT DEFAULT NULL,
@@ -246,7 +245,7 @@ def execute_schema(cursor):
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
         """,
         """
-        CREATE TABLE bell_calendar_lists (
+        CREATE TABLE IF NOT EXISTS bell_calendar_lists (
             schedule_id INT NOT NULL,
             bell_date DATE NOT NULL,
             list_id INT NOT NULL,
@@ -256,7 +255,7 @@ def execute_schema(cursor):
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
         """,
         """
-        CREATE TABLE history (
+        CREATE TABLE IF NOT EXISTS history (
             entryid INT NOT NULL AUTO_INCREMENT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
             actor VARCHAR(255) DEFAULT NULL,
@@ -268,7 +267,7 @@ def execute_schema(cursor):
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
         """
-        CREATE TABLE systemsettings (
+        CREATE TABLE IF NOT EXISTS systemsettings (
             parameter VARCHAR(128) NOT NULL,
             value TEXT NOT NULL,
             description TEXT NOT NULL,
@@ -276,7 +275,7 @@ def execute_schema(cursor):
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
         """,
         """
-        CREATE TABLE api_tokens (
+        CREATE TABLE IF NOT EXISTS api_tokens (
             id INT AUTO_INCREMENT PRIMARY KEY,
             user_id INT NOT NULL,
             token_hash VARCHAR(64) NOT NULL,
@@ -306,13 +305,12 @@ def seed_defaults(cursor):
             endpoint_module_dirs,
         )
 
+    # Use IGNORE to avoid primary key constraints if seed items are already in place
     cursor.execute(
-        "INSERT INTO bell_schedules (name, enabled, timezone) VALUES ('Default Bell Schedule', 1, 'server')"
+        "INSERT IGNORE INTO bell_schedules (id, name, enabled, timezone) VALUES (1, 'Default Bell Schedule', 1, 'server')"
     )
-    default_bell_schedule_id = cursor.lastrowid
     cursor.execute(
-        "INSERT INTO bell_lists (schedule_id, name) VALUES (%s, 'Regular Day')",
-        (default_bell_schedule_id,),
+        "INSERT IGNORE INTO bell_lists (id, schedule_id, name) VALUES (1, 1, 'Regular Day')"
     )
 
     messages = [
@@ -334,7 +332,7 @@ def seed_defaults(cursor):
 
     cursor.executemany(
         """
-        INSERT INTO messages (`type`, messageid, name, shortmessage, longmessage, audio, image, color, icon, expires, vendor_specific, priority)
+        INSERT IGNORE INTO messages (`type`, messageid, name, shortmessage, longmessage, audio, image, color, icon, expires, vendor_specific, priority)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         messages,
@@ -370,8 +368,9 @@ def seed_defaults(cursor):
         ("sip_external_ipv4", "", "Manual SIP external IPv4 address"),
         ("sip_rtp_port_start", "40000", "SIP RTP port range start"),
         ("sip_rtp_port_end", "50000", "SIP RTP port range end"),
-        ("sip_intrusion_prevention" "1", "WARNING!!! Disabling this setting WILL compromise the security of this server, especially if the SIP port is exposed to WAN. There's usually no reason to disable this in production. The Open Paging Server project is NOT responsible for any financial loss caused by abuse of telephone service by malicious bots. CONTINUE AT YOUR OWN RISK!!!"),
-        ("sip_block_scanners" "1", "WARNING!!! Disabling this setting WILL compromise the security of this server, especially if the SIP port is exposed to WAN. There's usually no reason to disable this in production. The Open Paging Server project is NOT responsible for any financial loss caused by abuse of telephone service by malicious bots. CONTINUE AT YOUR OWN RISK!!!"),
+        # FIXED: Added missing commas below
+        ("sip_intrusion_prevention", "1", "WARNING!!! Disabling this setting WILL compromise the security of this server, especially if the SIP port is exposed to WAN. There's usually no reason to disable this in production. The Open Paging Server project is NOT responsible for any financial loss caused by abuse of telephone service by malicious bots. CONTINUE AT YOUR OWN RISK!!!"),
+        ("sip_block_scanners", "1", "WARNING!!! Disabling this setting WILL compromise the security of this server, especially if the SIP port is exposed to WAN. There's usually no reason to disable this in production. The Open Paging Server project is NOT responsible for any financial loss caused by abuse of telephone service by malicious bots. CONTINUE AT YOUR OWN RISK!!!"),
         ("login_banner_enabled", "1", "Enable or disable the login page banner (0/1)"),
         (
             "login_banner_message",
@@ -452,17 +451,8 @@ def main():
     conn = connect_as_admin()
     cursor = conn.cursor()
 
-    cursor.execute(f"SHOW DATABASES LIKE {sql_string(DATABASE_NAME)}")
-    if cursor.fetchone():
-        overwrite = input("Database exists. Overwrite? (y/n): ")
-        if overwrite.lower() != "y":
-            print("Exiting.")
-            cursor.close()
-            conn.close()
-            sys.exit(0)
-        cursor.execute(f"DROP DATABASE `{DATABASE_NAME}`")
-
-    cursor.execute(f"CREATE DATABASE `{DATABASE_NAME}` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci")
+    # FIXED: Handled non-destructive database updates safely
+    cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{DATABASE_NAME}` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci")
     cursor.execute(f"USE `{DATABASE_NAME}`")
 
     db_password = random_password()
