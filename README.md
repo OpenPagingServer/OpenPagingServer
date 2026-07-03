@@ -27,6 +27,9 @@ Open Paging Server is written in Python & PHP. Allowing for great flexibility, q
 Examples of official endpoint modules for Open Paging Server include:
 - [Cisco](https://github.com/OpenPagingServer/cisco) IP Phones (built-in integration with Unified Communications Manager)
 - [Polycom](https://github.com/OpenPagingServer/polycom)
+- [Yealink](https://github.com/OpenPagingServer/yealink)
+- [Discord Webhooks](https://www.github.com/OpenPagingServer/discord-webhooks)
+
 
 ### Install Open Paging Server
 Open Paging Server can be installed on Debian Linux using:
