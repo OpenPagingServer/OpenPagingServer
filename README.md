@@ -28,7 +28,7 @@ Examples of official endpoint modules for Open Paging Server include:
 - [Cisco](https://github.com/OpenPagingServer/cisco) IP Phones (built-in integration with Unified Communications Manager)
 - [Polycom](https://github.com/OpenPagingServer/polycom)
 - [Yealink](https://github.com/OpenPagingServer/yealink)
-- [Discord Webhooks](https://www.github.com/OpenPagingServer/discord-webhooks)
+- [Discord Webhooks](https://www.github.com/OpenPagingServer/discord-webhook)
 
 
 ### Install Open Paging Server
