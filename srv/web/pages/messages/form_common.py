@@ -1305,7 +1305,7 @@ def message_icon_field_html(current_value=""):
                         <button type="button" class="message-icon-clear" id="messageIconClear" onclick="clearMessageIconSelection()"{" disabled" if not selected_name else ""}>Clear</button>
                     </div>
                 </div>
-                <div id="messageIconTransparencyNote" class="message-icon-note{' open' if note_open else ''}">This icon is not tranpsernt. It's recommended to sue transpernt icons.</div>
+                <div id="messageIconTransparencyNote" class="message-icon-note{' open' if note_open else ''}">This icon is not transparent. It is recommended to use transparent icons.</div>
                 <div id="messageIconPickerBackdrop" class="message-icon-picker-backdrop" onclick="closeMessageIconPicker()"></div>
                 <div id="messageIconPickerModal" class="message-icon-picker-modal" role="dialog" aria-modal="true" aria-labelledby="messageIconPickerTitle">
                     <div class="message-icon-picker-header">
