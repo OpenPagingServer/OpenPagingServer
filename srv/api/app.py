@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import threading
 import time
@@ -291,6 +292,43 @@ def request_vendor_specific(payload, module_id=""):
     return serialize_vendor_specific(decoded) if decoded else str(raw)
 
 
+def request_tts(payload):
+    raw = payload.get("tts")
+    text = str(payload.get("tts_text") or payload.get("tts_message") or "").strip()
+    voice = str(payload.get("tts_voice") or "").strip()
+    if isinstance(raw, dict):
+        text = str(raw.get("text") or raw.get("message") or text).strip()
+        voice = str(raw.get("voice") or voice).strip()
+    elif raw not in (None, "", False):
+        text = str(raw).strip()
+    if not text:
+        return None, ""
+    tts = {"text": text}
+    if voice:
+        tts["voice"] = voice
+    return tts, ""
+
+
+def merge_tts_vendor_specific(vendor_specific, tts, module_id=""):
+    if not tts:
+        return vendor_specific
+    values = parse_vendor_specific(vendor_specific or "")
+    target = module_id or "tts"
+    current = values.get(target, {})
+    if not isinstance(current, dict):
+        try:
+            current = json.loads(current) if isinstance(current, str) else {}
+        except (TypeError, ValueError):
+            current = {}
+    if not isinstance(current, dict):
+        current = {}
+    current["tts_text"] = tts["text"]
+    if tts.get("voice"):
+        current["tts_voice"] = tts["voice"]
+    values[target] = current
+    return serialize_vendor_specific(values)
+
+
 def create_api_custom_broadcast(values, groups, sender):
     ensure_message_vendor_schema()
     conn = db()
@@ -355,6 +393,9 @@ def send_message():
     sender, sender_error = resolve_sender(payload, token, module_id)
     if sender_error:
         return sender_error
+    tts, tts_error = request_tts(payload)
+    if tts_error:
+        return jsonify(error=tts_error), 400
     message_id = str(payload.get("message_id") or "").strip()
     group_id, group_error = validate_groups(payload.get("group_id") or payload.get("groups") or payload.get("group_ids"))
     if group_error:
@@ -372,6 +413,7 @@ def send_message():
     if priority:
         overrides["priority"] = priority
     vendor_specific = request_vendor_specific(payload, module_id)
+    vendor_specific = merge_tts_vendor_specific(vendor_specific, tts, module_id)
     if vendor_specific is not None:
         overrides["vendor_specific"] = vendor_specific
     create_broadcast(message_id, group_id, sender, overrides=overrides or None)
@@ -387,7 +429,12 @@ def send_message():
 
 
 def send_custom_message_payload(payload, _token, module_id, sender, group_id):
+    tts, tts_error = request_tts(payload)
+    if tts_error:
+        return jsonify(error=tts_error), 400
     msg_type = str(payload.get("type") or payload.get("message_type") or "").strip()
+    if not msg_type and tts:
+        msg_type = "text"
     if not msg_type:
         return jsonify(error="message_id is required unless a custom message type is provided"), 400
     priority, priority_error = request_priority(payload, default="Normal")
@@ -397,10 +444,12 @@ def send_custom_message_payload(payload, _token, module_id, sender, group_id):
     values["type"] = msg_type
     values["name"] = values.get("name") or "Custom message"
     values["priority"] = priority or "Normal"
+    if tts and not str(values.get("shortmessage") or values.get("longmessage") or "").strip():
+        values["shortmessage"] = tts["text"]
     if isinstance(values.get("audio"), (list, tuple)):
         values["audio"] = ":".join(str(item).strip() for item in values["audio"] if str(item).strip())
     vendor_specific = request_vendor_specific(payload, module_id)
-    values["vendor_specific"] = vendor_specific or ""
+    values["vendor_specific"] = merge_tts_vendor_specific(vendor_specific, tts, module_id) or ""
     broadcast_id = create_api_custom_broadcast(values, group_id, sender)
     return jsonify(
         status="sent",

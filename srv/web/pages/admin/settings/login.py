@@ -2,6 +2,23 @@
 from srv.web.app import *
 from srv.web.pages.admin.settings.common import settings_page
 
+VALID_CAPTCHA_PROVIDERS = {"disabled", "basic", "turnstile", "recaptcha"}
+CAPTCHA_PROVIDER_ALIASES = {
+    "none": "disabled",
+    "off": "disabled",
+    "0": "disabled",
+    "cloudflare": "turnstile",
+    "cloudflare-turnstile": "turnstile",
+    "google": "recaptcha",
+    "google-recaptcha": "recaptcha",
+}
+
+
+def normalized_captcha_provider(value):
+    provider = str(value or "disabled").strip().lower()
+    provider = CAPTCHA_PROVIDER_ALIASES.get(provider, provider)
+    return provider if provider in VALID_CAPTCHA_PROVIDERS else "disabled"
+
 
 def handle_request():
     user = require_admin()
@@ -9,15 +26,14 @@ def handle_request():
         return user
     data = settings()
     if request.method == "POST":
-        captcha_provider = str(request.form.get("login_captcha_provider") or "disabled").strip().lower()
+        captcha_provider = normalized_captcha_provider(request.form.get("login_captcha_provider"))
         captcha_site_key = str(request.form.get("login_captcha_site_key") or "").strip()
         captcha_secret_key = str(request.form.get("login_captcha_secret_key") or "").strip()
         existing_secret_key = str(data.get("login_captcha_secret_key") or "").strip()
         effective_secret_key = captcha_secret_key or existing_secret_key
         captcha_external_only = "1" if request.form.get("login_captcha_external_only") else "0"
-        valid_providers = {"disabled", "basic", "turnstile", "recaptcha"}
         errors = []
-        if captcha_provider not in valid_providers:
+        if captcha_provider not in VALID_CAPTCHA_PROVIDERS:
             errors.append("Select a valid CAPTCHA provider.")
             captcha_provider = "disabled"
         if captcha_provider in {"turnstile", "recaptcha"} and (not captcha_site_key or not effective_secret_key):
@@ -41,9 +57,7 @@ def handle_request():
     checked = " checked" if enabled else ""
     disabled = "" if enabled else " disabled"
     external_only_checked = " checked" if data.get("login_captcha_external_only", "1") == "1" else ""
-    captcha_provider = str(data.get("login_captcha_provider") or "disabled").strip().lower()
-    if captcha_provider not in {"disabled", "basic", "turnstile", "recaptcha"}:
-        captcha_provider = "disabled"
+    captcha_provider = normalized_captcha_provider(data.get("login_captcha_provider"))
 
     def option(value, label):
         selected = " selected" if captcha_provider == value else ""
@@ -59,17 +73,17 @@ def handle_request():
                     <span class="info-label">Enable Banner</span>
                     <span><label class="switch"><input type="checkbox" name="login_banner_enabled" id="bannerToggle"{checked}><span class="slider"></span></label></span>
                 </div>
-                <div class="info-row" style="flex-direction: column; align-items: flex-start; gap: 8px;">
+                <div class="info-row stacked">
                     <span class="info-label">Title</span>
                     <input type="text" name="login_banner_title" id="bannerTitle" value="{h(data.get("login_banner_title", ""))}"{disabled}>
                 </div>
-                <div class="info-row" style="flex-direction: column; align-items: flex-start; gap: 8px;">
+                <div class="info-row stacked">
                     <span class="info-label">Message</span>
                     <textarea name="login_banner_message" id="bannerMessage"{disabled}>{h(data.get("login_banner_message", ""))}</textarea>
                 </div>
                 <h4 style="margin-top:20px;">CAPTCHA</h4>
                 <p>Enabling CAPTCHA is highly recommended if you are making the web interface public to protect your server from automated login attempts. However, it's not a replacement for other security measures.</p>
-                <div class="info-row" style="flex-direction: column; align-items: flex-start; gap: 8px;">
+                <div class="info-row stacked">
                     <span class="info-label">Provider</span>
                     <select name="login_captcha_provider" id="captchaProvider">
                         {option("disabled", "Disabled")}
@@ -79,11 +93,11 @@ def handle_request():
                     </select>
                     <span id="captchaProviderHint" class="info-description"></span>
                 </div>
-                <div class="info-row captcha-key-row" id="captchaSiteKeyRow" style="flex-direction: column; align-items: flex-start; gap: 8px;">
+                <div class="info-row stacked captcha-key-row" id="captchaSiteKeyRow">
                     <span class="info-label">Site Key</span>
                     <input type="text" name="login_captcha_site_key" id="captchaSiteKey" value="{h(data.get("login_captcha_site_key", ""))}" autocomplete="off">
                 </div>
-                <div class="info-row captcha-key-row" id="captchaSecretKeyRow" style="flex-direction: column; align-items: flex-start; gap: 8px;">
+                <div class="info-row stacked captcha-key-row" id="captchaSecretKeyRow">
                     <span class="info-label">Secret Key</span>
                     <input type="password" name="login_captcha_secret_key" id="captchaSecretKey" value="" autocomplete="off" placeholder="Leave blank to keep current secret key">
                 </div>
@@ -95,7 +109,7 @@ def handle_request():
                     <span><label class="switch"><input type="checkbox" name="login_captcha_external_only" id="captchaExternalOnly"{external_only_checked}><span class="slider"></span></label></span>
                 </div>
                 <input type="hidden" name="save_login_settings" value="1">
-                <div style="margin-top:20px; display:flex; align-items:center;">
+                <div class="settings-actions">
                     <button type="button" id="saveLoginBtn">Save Settings</button>
                     <span id="save-status" class="save-status"></span>
                 </div>

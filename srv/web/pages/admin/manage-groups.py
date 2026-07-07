@@ -37,6 +37,7 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .group-actions { display:flex; align-items:center; gap:4px; }
 .icon-action { width:36px; height:36px; border-radius:50%; color:#555; display:inline-flex; align-items:center; justify-content:center; text-decoration:none; border:none; background:transparent; cursor:pointer; }
 .icon-action:hover { background:rgba(25,118,210,0.08); color:#1976D2; }
+.icon-action.delete { background:rgba(198,40,40,0.08); color:#C62828; }
 .icon-action.delete:hover { background:rgba(198,40,40,0.08); color:#C62828; }
 .editor-card { margin-top:18px; }
 .transfer-list-container { display:flex; gap:14px; align-items:stretch; margin-top:8px; }
@@ -75,6 +76,7 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 .tl-item.selected { background:#BB86FC; color:#000; border-color:#A370F7; }
 .icon-action { color:#BBB; }
 .icon-action:hover { background:rgba(187,134,252,0.1); color:#BB86FC; }
+.icon-action.delete { background:rgba(244,67,54,0.16); color:#EF9A9A; }
 .icon-action.delete:hover { background:rgba(244,67,54,0.12); color:#EF9A9A; }
 .error { background:#3B1515; border-color:#6D2A2A; color:#FFCDD2; }
 }
