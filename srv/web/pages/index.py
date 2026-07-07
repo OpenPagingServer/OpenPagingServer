@@ -10,6 +10,12 @@ from srv.web.app import *
 
 CAPTCHA_PROVIDERS = {"basic", "turnstile", "recaptcha"}
 CAPTCHA_DISABLED_VALUES = {"", "disabled", "none", "off", "0", "false"}
+CAPTCHA_PROVIDER_ALIASES = {
+    "cloudflare": "turnstile",
+    "cloudflare-turnstile": "turnstile",
+    "google": "recaptcha",
+    "google-recaptcha": "recaptcha",
+}
 CAPTCHA_TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 CAPTCHA_RECAPTCHA_VERIFY_URL = "https://www.google.com/recaptcha/api/siteverify"
 BASIC_CAPTCHA_SESSION_KEY = "login_basic_captcha_hash"
@@ -108,6 +114,7 @@ def _captcha_failed_response():
 
 def _captcha_provider(data):
     provider = str((data or {}).get("login_captcha_provider") or "disabled").strip().lower()
+    provider = CAPTCHA_PROVIDER_ALIASES.get(provider, provider)
     if provider in CAPTCHA_DISABLED_VALUES:
         return ""
     return provider if provider in CAPTCHA_PROVIDERS else ""
