@@ -7,6 +7,8 @@ from broadcasts import (
     put_active_broadcast,
     runtime_type,
 )
+from group_features import build_monitor_message_child_records
+from group_features import fetch_group_rows
 from srv.web.pages.messages.form_common import (
     MESSAGE_FORM_SCRIPT,
     MESSAGE_FORM_STYLE,
@@ -31,7 +33,8 @@ CUSTOM_EXTRA_STYLE = r"""
 .recipient-row.unavailable .md-checkmark{border-color:#BDBDBD;background:#F5F5F5;}
 .btn-send{background:#2E7D32;color:#FFF;border:none;padding:10px 16px;border-radius:6px;font-size:14px;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;}
 .btn-send:hover{background:#1B5E20;}
-.btn-cancel{color:#777;text-decoration:none;margin-left:10px;}
+.btn-cancel{color:#777;text-decoration:none;}
+.custom-form-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px;}
 @media(prefers-color-scheme:dark){
     .recipient-note{color:#9E9E9E;}
     .recipient-row.unavailable .md-checkmark{border-color:#555;background:#2A2A2A;}
@@ -78,6 +81,9 @@ def create_custom_broadcast(values, expires_rule):
     try:
         with conn.cursor() as cur:
             expand_broadcast_record_variables(cur, record, source_values=values)
+            excluded_targets, monitor_children = build_monitor_message_child_records(cur, record)
+            if excluded_targets:
+                record["exclude_targets"] = list(excluded_targets)
             columns = table_columns("broadcasts")
             insert_columns = [column for column in record if column in columns]
             cur.execute(
@@ -85,8 +91,10 @@ def create_custom_broadcast(values, expires_rule):
                 tuple(record[column] for column in insert_columns),
             )
             put_active_broadcast(record)
-            expire_message_rule_broadcasts(cur, normalized_rule, [broadcast_id])
-            expire_any_message_rule_broadcasts(cur, [broadcast_id])
+            for child in monitor_children:
+                put_active_broadcast(child)
+            expire_message_rule_broadcasts(cur, normalized_rule, [broadcast_id], trigger_groups=record.get("groups"))
+            expire_any_message_rule_broadcasts(cur, [broadcast_id], trigger_groups=record.get("groups"))
         conn.commit()
     finally:
         conn.close()
@@ -96,6 +104,8 @@ def handle_request():
     user = require_non_receiver()
     if not isinstance(user, dict):
         return user
+    if not can_send_messages(user):
+        abort(403)
     ctx = legacy_user_context(user)
     if demo_mode_enabled():
         return demo_mode_iframe_html("messages")
@@ -105,11 +115,19 @@ def handle_request():
         msg_type = request.form.get("type", "text")
         has_text = msg_type in {"text", "text+audio"}
         if request.form.get("send_all"):
-            groups_value = "0"
+            groups_value = all_group_ids_value(user)
         else:
-            selected = [str(int(group_id)) for group_id in request.form.getlist("groups[]")]
+            allowed_group_ids = {
+                str(group.get("id") or "").strip()
+                for group in filter_group_rows_for_user(
+                    user,
+                    query_all("SELECT id FROM `groups` ORDER BY name ASC"),
+                )
+                if str(group.get("id") or "").strip()
+            }
+            selected = [str(group_id or "").strip() for group_id in request.form.getlist("groups[]") if str(group_id or "").strip() in allowed_group_ids]
             groups_value = ".".join(selected)
-        if groups_value == "":
+        if groups_value in {"", "0"}:
             return redirect("/messages/custom")
         expires_rule = message_expiration_from_form(request.form)
         create_custom_broadcast(
@@ -131,8 +149,17 @@ def handle_request():
         )
         return redirect("/messages/")
 
-    groups = query_all("SELECT id, name, members FROM `groups` ORDER BY name ASC")
-    expiration_messages = query_all("SELECT messageid, name FROM messages ORDER BY name ASC, messageid ASC")
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            groups = fetch_group_rows(cur)
+    finally:
+        conn.close()
+    groups = filter_group_rows_for_user(user, groups)
+    expiration_messages = filter_message_rows_for_user(
+        user,
+        query_all("SELECT messageid, name FROM messages ORDER BY name ASC, messageid ASC"),
+    )
     endpoint_data = endpoint_ipc("LIST_ENDPOINTS")
     endpoint_error = None if endpoint_data.get("ok", True) else endpoint_data.get("error") or "Endpoint manager returned an error."
     endpoint_availability = endpoint_availability_map(endpoint_data)
@@ -143,7 +170,12 @@ def handle_request():
     if groups:
         group_rows = []
         for group in groups:
-            available = sum(1 for member in group_member_tokens(group.get("members")) if group_member_available(member, endpoint_availability))
+            recipients = list(group_member_tokens(group.get("members")))
+            if "messages" in set(group.get("monitor_categories") or []):
+                for member in group_member_tokens(group.get("monitor_members")):
+                    if member not in recipients:
+                        recipients.append(member)
+            available = sum(1 for member in recipients if group_member_available(member, endpoint_availability))
             has_available = endpoint_error is not None or available > 0
             row_cls = "" if has_available else " unavailable"
             disabled = "" if has_available else " disabled"
@@ -233,8 +265,10 @@ def handle_request():
                 </select>
             </div>
             {vendor_specific_html}
-            <button type="submit" class="btn-send"><i class="fa-solid fa-paper-plane" style="margin-right:8px;"></i> Send Custom Message</button>
-            <a href="/messages/" class="btn-cancel">Cancel</a>
+            <div class="custom-form-actions">
+                <button type="submit" class="btn-send"><i class="fa-solid fa-paper-plane" style="margin-right:8px;"></i> Send Custom Message</button>
+                <a href="/messages/" class="btn-cancel">Cancel</a>
+            </div>
         </form>
     </div>
 {message_variable_guide_html()}"""

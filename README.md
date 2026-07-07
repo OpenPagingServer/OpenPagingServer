@@ -14,23 +14,19 @@ Open Paging Server is currently in beta and not ready for production use yet.
 # 📢 Open Paging Server
 
 ### Open Paging Server is a free & open source public address, bell, and mass notification system that runs on existing VoIP infrastructure
-Open Paging Server can be used standalone or integrated via SIP with any PBX, Unified Communications stack, or service provider. It can page to almost any IP phone or speaker via multicast. It also has a comprehensive endpoint ecosystem of official and third-party endpoint modules to for proprietary protocols and additional functionally.
-Open Paging Server is written in Python. Allowing for great flexibility, quick deployment, and support for many systems.
+Open Paging Server can be used standalone or integrated via SIP with any PBX, Unified Communications stack, or service provider. It has a comprehensive endpoint ecosystem of official and third-party endpoint modules to support thousands of models of endpoints.
+Open Paging Server is written in Python & PHP. Allowing for great flexibility, quick deployment, and support for many systems.
 
 ### Features:
 - Live Paging
-- Mass Messaging (Visual & Audio)
+- Mass Notification Messages (Visual & Audio)
 - Bells
-- Multicast Gateway (for WAN/VPN)
 - More to come!
 
 ### Endpoint Support
 Examples of official endpoint modules for Open Paging Server include:
 - [Cisco](https://github.com/OpenPagingServer/cisco) IP Phones (built-in integration with Unified Communications Manager)
 - [Polycom](https://github.com/OpenPagingServer/polycom)
-- [Yealink](https://github.com/OpenPagingServer/yealink)
-- [Discord Webhooks](https://www.github.com/OpenPagingServer/discord-webhook)
-
 
 ### Install Open Paging Server
 Open Paging Server can be installed on Debian Linux using:

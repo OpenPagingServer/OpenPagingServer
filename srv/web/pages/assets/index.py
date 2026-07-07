@@ -30,10 +30,10 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .page-title h1{ margin:0; font-weight:400; font-size:2em; }
 .muted{ color:#5F6368; font-size:.92em; }
 .toolbar{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
-.button{ background:#1A73E8; color:#FFF; border:none; border-radius:999px; padding:10px 16px; cursor:pointer; font:inherit; display:inline-flex; align-items:center; gap:8px; text-decoration:none; box-shadow:0 1px 2px rgba(60,64,67,.25); }
-.button:hover{ background:#1765CC; }
+.button{ background:#1976D2; color:#FFF; border:none; border-radius:999px; padding:10px 16px; cursor:pointer; font:inherit; display:inline-flex; align-items:center; gap:8px; text-decoration:none; box-shadow:0 1px 2px rgba(60,64,67,.25); }
+.button:hover{ background:#1565C0; }
 .button.danger{ background:#C62828; border-radius:8px; box-shadow:none; }
-.button.subtle{ background:#FFF; color:#1A73E8; border:1px solid #DADCE0; box-shadow:none; border-radius:8px; }
+.button.subtle{ background:#FFF; color:#1976D2; border:1px solid #DADCE0; box-shadow:none; border-radius:8px; }
 .success{ background:#E6F4EA; border:1px solid #CEEAD6; color:#137333; padding:12px 14px; border-radius:12px; margin-bottom:14px; }
 .error{ background:#FCE8E6; border:1px solid #F6AEA9; color:#A50E0E; padding:12px 14px; border-radius:12px; margin-bottom:14px; }
 .asset-grid{ display:grid; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); gap:16px; }
@@ -58,6 +58,10 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .rename-inline .control{ width:100%; margin-bottom:8px; }
 .control{ padding:10px; border:1px solid #DADCE0; border-radius:8px; font:inherit; box-sizing:border-box; background:#FFF; color:#202124; }
 .empty-state{ background:#FFF; border:1px dashed #DADCE0; border-radius:16px; padding:36px; text-align:center; color:#5F6368; }
+.restricted-note{ background:#E8F0FE; border:1px solid #C6DAFC; border-radius:14px; padding:14px 16px; margin-bottom:16px; color:#174EA6; }
+.restricted-note p{ margin:0; line-height:1.5; }
+.docs-link{ display:inline-flex; align-items:center; gap:8px; margin-top:12px; color:#1A73E8; text-decoration:none; font-weight:500; }
+.docs-link:hover{ text-decoration:underline; }
 .modal-backdrop{ display:none; position:fixed; inset:0; background:rgba(32,33,36,.55); z-index:2000; align-items:center; justify-content:center; padding:20px; box-sizing:border-box; }
 .modal-backdrop.active{ display:flex; }
 .modal-card{ width:100%; max-width:460px; background:#FFF; border-radius:18px; box-shadow:0 20px 60px rgba(0,0,0,.28); overflow:hidden; }
@@ -72,12 +76,12 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 @media(max-width:767px){
 .page-top{ align-items:center; }
 .page-title h1{ font-size:1.45em; }
-.asset-grid{ display:block; }
-.asset-card{ display:flex; align-items:center; border-radius:14px; margin-bottom:10px; overflow:visible; }
-.preview-box{ width:56px; height:56px; flex:none; border-radius:12px; margin:10px; font-size:1.4em; }
-.preview-box audio{ display:none; }
-.asset-info{ flex:1; padding:10px 10px 10px 0; min-width:0; }
-.asset-icon{ display:none; }
+.asset-grid{ grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:12px; }
+.asset-card{ display:block; border-radius:14px; overflow:visible; }
+.preview-box{ width:100%; height:118px; border-radius:14px 14px 0 0; margin:0; font-size:1.6em; }
+.preview-box audio{ width:calc(100% - 16px); }
+.asset-info{ padding:10px 10px 12px 12px; min-width:0; }
+.asset-icon{ display:flex; }
 .asset-menu{ position:absolute; right:10px; top:54px; bottom:auto; }
 }
 @media(prefers-color-scheme:dark){
@@ -95,6 +99,8 @@ body,html{ background-color:#121212; color:#E8EAED; }
 .menu-link:hover,.menu-action:hover,.menu-button:hover,.modal-close:hover{ background:#333; }
 .file-meta,.muted,.asset-icon,.menu-button,.modal-close{ color:#BBB; }
 .control{ background:#171717; border-color:#444; color:#EEE; }
+.restricted-note{ background:#1B2A42; border-color:#31425E; color:#D2E3FC; }
+.docs-link{ color:#8AB4F8; }
 .button{ background:#BB86FC; color:#000; }
 .button:hover{ background:#A874E8; }
 .button.subtle{ background:transparent; color:#BB86FC; border-color:#BB86FC; }
@@ -160,16 +166,6 @@ document.addEventListener("DOMContentLoaded", function() {
   });
 });
 """
-
-
-def asset_perms(value):
-    return {part.strip().lower() for part in str(value or "").split(",") if part.strip()}
-
-
-def has_asset_perm(value):
-    perms = asset_perms(value)
-    return "all" in perms or "asset-edit" in perms
-
 
 def format_bytes(value):
     value = int(value or 0)
@@ -306,16 +302,16 @@ def replace_message_references(old_name, new_name):
 
 
 def user_asset_permissions(user):
-    row = query_one("SELECT role, userperm, adminperm FROM users WHERE id=%s LIMIT 1", (user.get("id"),)) or {}
-    role = row.get("role") or user.get("role") or ""
-    is_admin = role in {"admin", "tempadmin"}
-    can_user_edit = has_asset_perm(row.get("userperm"))
-    can_admin_edit = is_admin and has_asset_perm(row.get("adminperm"))
-    return is_admin, can_user_edit or can_admin_edit, can_admin_edit
+    is_admin = is_admin_user(user)
+    can_edit = can_edit_assets(user)
+    can_view_existing = is_admin or can_access_page(user, "assets")
+    return is_admin, can_view_existing, can_edit
 
 
-def render_asset_card(asset, can_edit, can_delete, demo=False):
+def render_asset_card(asset, demo=False):
     raw_url = "/assets/?raw=" + urlencode({"": asset["name"]})[1:]
+    can_manage = bool(asset.get("can_manage"))
+    can_delete = bool(asset.get("can_delete"))
     if asset["kind"] == "image":
         preview = f'<img src="{h(raw_url)}" alt="">'
         icon = "image"
@@ -329,7 +325,7 @@ def render_asset_card(asset, can_edit, can_delete, demo=False):
         preview = '<i class="fa-solid fa-file-circle-question"></i>'
         icon = "file-circle-question"
     rename = ""
-    if can_edit:
+    if can_manage:
         if demo:
             rename = """
                             <button class="menu-action" type="button" onclick="openDemoModePopup('assets')"><i class="fa-solid fa-pen"></i> Rename</button>"""
@@ -381,7 +377,8 @@ def handle_request():
         return user
     ctx = legacy_user_context(user)
     demo = demo_mode_enabled()
-    is_admin, can_edit, can_delete = user_asset_permissions(user)
+    is_admin, can_view_existing, can_edit = user_asset_permissions(user)
+    can_delete = can_edit
     ctx["is_admin"] = is_admin
 
     if request.args.get("raw"):
@@ -394,6 +391,8 @@ def handle_request():
         kind = asset_kind(path, path.name)
         if kind not in {"image", "audio", "text"}:
             abort(415)
+        if not user_can_access_asset(user, path.name):
+            abort(403)
         return send_file(path, mimetype=asset_mime(kind, path.name), as_attachment=False, download_name=path.name)
 
     errors = []
@@ -421,6 +420,7 @@ def handle_request():
                             target.unlink(missing_ok=True)
                             errors.append(validation_error)
                         else:
+                            grant_temporary_asset_access(user, name)
                             messages.append("Asset uploaded.")
                 except Exception:
                     errors.append("Upload failed.")
@@ -432,6 +432,8 @@ def handle_request():
                 new_path = safe_asset_path(new_name)
                 if not old_path.is_file() or not new_name:
                     errors.append("Rename failed because the asset path is invalid.")
+                elif not user_can_manage_asset(user, old_path.name):
+                    errors.append("You do not have permission to rename that asset.")
                 elif new_path.exists():
                     errors.append("Another asset already uses that name.")
                 else:
@@ -441,45 +443,67 @@ def handle_request():
                     else:
                         old_path.rename(new_path)
                         replace_message_references(old_name, new_name)
+                        rename_temporary_asset_access(old_name, new_name)
                         messages.append("Asset renamed.")
             except Exception as exc:
                 errors.append(str(exc) or "Rename failed.")
         elif action == "delete":
             if not can_delete:
-                errors.append("Only asset-edit in admin permissions can delete assets.")
+                errors.append("You do not have permission to delete assets.")
             else:
                 name = clean_asset_name(request.form.get("file"))
                 try:
                     path = safe_asset_path(name)
                     if not path.is_file():
                         errors.append("Delete failed because the asset path is invalid.")
+                    elif not user_can_manage_asset(user, path.name):
+                        errors.append("You do not have permission to delete that asset.")
                     elif messages_using_asset(name):
                         errors.append("This asset must be removed from all messages that uses it before it can be deleted.")
                     else:
                         path.unlink()
+                        revoke_temporary_asset_access(name)
                         messages.append("Asset deleted.")
                 except Exception:
                     errors.append("Delete failed.")
 
     assets = []
-    ASSET_DIR.mkdir(parents=True, exist_ok=True)
-    for path in sorted([p for p in ASSET_DIR.iterdir() if p.is_file()], key=lambda p: p.name.lower()):
+    for path in visible_asset_paths_for_user(user):
+        can_manage_asset = bool(can_edit and user_can_manage_asset(user, path.name))
         assets.append(
             {
                 "name": path.name,
                 "size": path.stat().st_size,
                 "modified": datetime.fromtimestamp(path.stat().st_mtime),
                 "kind": asset_kind(path, path.name),
+                "can_manage": can_manage_asset,
+                "can_delete": can_manage_asset,
             }
         )
 
     alerts = "".join(f'<div class="success alert-msg">{h(message)}</div>' for message in messages)
     alerts += "".join(f'<div class="error alert-msg">{h(error)}</div>' for error in errors)
     upload_button = '<button class="button" type="button" onclick="' + ("openDemoModePopup('assets')" if demo else "openUploadModal()") + '"><i class="fa-solid fa-plus"></i> Upload</button>' if can_edit else ""
+    restricted_notice = ""
+    if not can_view_existing:
+        if assets:
+            docs_link = ""
+            if str(ctx.get("show_online_docs") or "0") == "1":
+                docs_link = """
+            <a class="docs-link" href="https://docs.openpagingserver.org/user/assets" target="_blank" rel="noopener">
+                <i class="fa-solid fa-book"></i> Online Documentation
+            </a>"""
+            restricted_notice = """<div class="restricted-note">
+            <p>Because you don't have permission to view existing assets, you will have temporary access to add/use to resources, rename, and delete the assets you upload for up to 48 hours. Assets will remain in the resources (e.g. messages) you add them to even when you loose access to them. You will still be able to view, remove, or change the asset from resources you have access to.</p>""" + docs_link + """
+        </div>"""
+        else:
+            restricted_notice = """<div class="empty-state" style="margin-bottom:16px;">
+            <div>You don't have permission to view existing assets</div>
+        </div>"""
     if assets:
-        asset_grid = '<section class="asset-grid">' + "\n".join(render_asset_card(asset, can_edit, can_delete, demo) for asset in assets) + "</section>"
+        asset_grid = '<section class="asset-grid">' + "\n".join(render_asset_card(asset, demo) for asset in assets) + "</section>"
     else:
-        asset_grid = """<div class="empty-state">
+        asset_grid = "" if not can_view_existing else """<div class="empty-state">
             <i class="fa-solid fa-folder-open" style="font-size:2.2em;margin-bottom:12px;"></i>
             <div>No assets found.</div>
         </div>"""
@@ -499,6 +523,7 @@ def handle_request():
                 <div class="upload-box">
                     <i class="fa-solid fa-cloud-arrow-up" style="font-size:2em;"></i>
                     <div style="margin-top:10px;">Choose an asset to upload</div>
+                    <div class="muted" style="margin-top:10px;">You will have temporary access to assets you upload for up to 48 hours. Add them where necessary within that timeframe.</div>
                     <div class="muted" style="margin-top:6px;">Allowed: txt, jpg, png, bmp, wav, mp3. Limit: {h(format_bytes(MAX_UPLOAD_BYTES))}.</div>
                     <input class="control" type="file" name="asset_file" accept=".txt,.jpg,.png,.bmp,.wav,.mp3,text/plain,image/jpeg,image/png,image/bmp,audio/wav,audio/mpeg" required>
                 </div>
@@ -520,6 +545,7 @@ def handle_request():
     </div>
 
     {alerts}
+    {restricted_notice}
     {asset_grid}
     {upload_modal}"""
     return legacy_page("Assets", ctx, "assets", ASSETS_STYLE, content, ASSETS_SCRIPT)

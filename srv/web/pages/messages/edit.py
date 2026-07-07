@@ -19,7 +19,7 @@ def handle_request():
     if not isinstance(user, dict):
         return user
     ctx = legacy_user_context(user)
-    if not ctx["is_admin"]:
+    if not can_edit_messages(user):
         abort(403)
     if demo_mode_enabled():
         return demo_mode_iframe_html("messages")
@@ -31,6 +31,8 @@ def handle_request():
     row = query_one("SELECT * FROM messages WHERE messageid=%s LIMIT 1", (msgid,))
     if not row:
         abort(404)
+    if not user_can_access_message(user, msgid):
+        abort(403)
     columns = table_columns("messages")
     message_type = str(row.get("type") or "")
     show_visual = message_type in {"text", "text+audio", "liveaudio+text"}
@@ -76,9 +78,12 @@ def handle_request():
             row.update(request.form.to_dict())
 
     selected_audio = [item for item in str(row.get("audio") or "").split(":") if item.strip()]
-    expiration_messages = query_all(
-        "SELECT messageid, name FROM messages WHERE messageid <> %s ORDER BY name ASC, messageid ASC",
-        (msgid,),
+    expiration_messages = filter_message_rows_for_user(
+        user,
+        query_all(
+            "SELECT messageid, name FROM messages WHERE messageid <> %s ORDER BY name ASC, messageid ASC",
+            (msgid,),
+        ),
     )
     color_value = str(row.get("color") or "").strip().lstrip("#").upper()
     color_picker = "#" + color_value if re.fullmatch(r"[A-Fa-f0-9]{6}", color_value) else "#000000"
@@ -114,7 +119,6 @@ def handle_request():
         audio_html = f"""
             <div id="audio-fields" class="form-group">
                 <label class="main-label">Audio</label>
-                <p class="help-text">Select audio files to include in this message. The files will play in the order listed in the selected column. You can click to select and use buttons, or drag and drop to move and reorder.</p>
                 {audio_transfer_html(audio_files(), selected_audio)}
             </div>"""
     vendor_specific_html = vendor_specific_editor_html(
@@ -160,5 +164,5 @@ def handle_request():
             </div>
         </form>
     </div>
-{message_variable_guide_html() if show_visual else ""}"""
+{message_variable_guide_html() if (show_visual or show_audio) else ""}"""
     return legacy_page("Edit Message", ctx, "messages", MESSAGE_FORM_STYLE, content, MESSAGE_FORM_SCRIPT)

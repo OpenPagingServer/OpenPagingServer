@@ -233,4 +233,7 @@ def schedule_or_404(schedule_id):
     row = query_one("SELECT id, name, enabled, timezone FROM bell_schedules WHERE id=%s LIMIT 1", (schedule_id,))
     if not row:
         abort(404)
+    user = current_user()
+    if isinstance(user, dict) and not user_can_access_bell_schedule(user, row.get("id")):
+        abort(404)
     return row

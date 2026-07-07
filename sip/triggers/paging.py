@@ -219,38 +219,164 @@ class SipLivePageSession(livepaged.LivePageSession):
     def start(self):
         if self.thread is None or not self.thread.is_alive():
             page_debug(f"start stream={self.stream_id} group={self.group_id!r}")
+            self.cleanup_after_run = False
             self.thread = threading.Thread(target=self.run, daemon=True)
             self.thread.start()
+            threading.Thread(target=self.enable_livepage_tracking, daemon=True).start()
+
+    def play_pre_tones_with_silence(self):
+        if not self.pre_tones:
+            self.pre_tone_completed = True
+            return
+        from endpoints import audio_frames, mix_ulaw_frames
+
+        self.pre_tone_active = True
+        frame_duration = 0.02
+        next_send = time.monotonic()
+        try:
+            for tone in self.pre_tones:
+                for frame in audio_frames(tone):
+                    if self.stop_event.is_set() and not self.end_requested.is_set():
+                        return
+                    if self.local_sock is not None:
+                        self.send_rtp(SILENCE_FRAME, poll_source=False)
+                    next_send += frame_duration
+                    live_payload = self.recv_pre_tone_payload_until(next_send)
+                    output_frame = self.normalize_audio_frame(frame)
+                    if live_payload:
+                        output_frame = mix_ulaw_frames([output_frame, self.normalize_audio_frame(live_payload)])
+                    else:
+                        sleep_for = next_send - time.monotonic()
+                        if sleep_for > 0:
+                            time.sleep(sleep_for)
+                        else:
+                            next_send = time.monotonic()
+                    self.forward_payload(output_frame, ignore_pause=True, ignore_stop=True)
+        finally:
+            self.pre_tone_active = False
+            self.pre_tone_completed = True
+            if self.end_requested.is_set():
+                self.stop_event.set()
+
+    def recv_pre_tone_payload_until(self, deadline):
+        payload = None
+        while not self.stop_event.is_set():
+            local_sock = self.local_sock
+            if local_sock is None:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                ready, _, _ = select.select([local_sock], [], [], remaining)
+            except Exception:
+                break
+            if not ready:
+                break
+            try:
+                packet, addr = local_sock.recvfrom(4096)
+            except Exception:
+                break
+            self.rtp_packets_received = int(getattr(self, "rtp_packets_received", 0) or 0) + 1
+            if self.rtp_packets_received <= 3 or self.rtp_packets_received % 50 == 0:
+                page_debug(
+                    f"pretone_rtp_recv stream={self.stream_id} packet={self.rtp_packets_received} "
+                    f"local={socket_name(self.local_sock)} remote={addr[0]}:{addr[1]} bytes={len(packet)}"
+                )
+            try:
+                self.learn_rtp_source(addr, packet)
+            except Exception:
+                pass
+            current = livepaged.parse_rtp_payload(packet)
+            if current:
+                payload = current
+        return payload
+
+    def forward_rtp_payloads_until(self, deadline, debug_label="beep_rtp_recv"):
+        while not self.stop_event.is_set():
+            local_sock = self.local_sock
+            if local_sock is None:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                ready, _, _ = select.select([local_sock], [], [], remaining)
+            except Exception:
+                break
+            if not ready:
+                break
+            try:
+                packet, addr = local_sock.recvfrom(4096)
+            except Exception:
+                break
+            self.rtp_packets_received = int(getattr(self, "rtp_packets_received", 0) or 0) + 1
+            if self.rtp_packets_received <= 3 or self.rtp_packets_received % 50 == 0:
+                page_debug(
+                    f"{debug_label} stream={self.stream_id} packet={self.rtp_packets_received} "
+                    f"local={socket_name(self.local_sock)} remote={addr[0]}:{addr[1]} bytes={len(packet)}"
+                )
+            try:
+                self.learn_rtp_source(addr, packet)
+            except Exception:
+                pass
+            payload = livepaged.parse_rtp_payload(packet)
+            if payload:
+                self.forward_live_payload(payload)
 
     def run(self):
+        live_audio_started = False
         try:
+            self.play_pre_tones_with_silence()
+            if self.end_requested.is_set():
+                page_debug(f"run_end_during_pretone stream={self.stream_id}")
+                return
             page_debug(f"run_beep_start stream={self.stream_id}")
+            next_send = time.monotonic()
             for _ in range(25):
                 if self.stop_event.is_set():
                     page_debug(f"run_stopped_during_beep stream={self.stream_id}")
                     return
-                start_time = time.time()
-                self.send_rtp(BEEP_FRAME)
-                elapsed = time.time() - start_time
-                if elapsed < 0.02:
-                    time.sleep(0.02 - elapsed)
-            time.sleep(0.5)
-            if self.local_sock is not None:
-                self.local_sock.setblocking(False)
-                try:
-                    while True:
-                        packet, addr = self.local_sock.recvfrom(4096)
-                        self.learn_rtp_source(addr, packet)
-                except Exception:
-                    pass
-                self.local_sock.setblocking(True)
-                self.local_sock.settimeout(0.5)
+                self.send_rtp(BEEP_FRAME, poll_source=False)
+                next_send += 0.02
+                self.forward_rtp_payloads_until(next_send)
             self.rtp_keepalive_payload = SILENCE_FRAME
+            live_audio_started = True
             page_debug(f"run_live_audio_start stream={self.stream_id} keepalive=20ms")
             super().run()
         finally:
+            if live_audio_started and self.post_tones:
+                try:
+                    self.play_post_tones()
+                except Exception as exc:
+                    page_debug(f"posttone_error stream={self.stream_id} error={exc.__class__.__name__}: {exc}")
             page_debug(f"run_cleanup stream={self.stream_id}")
             self.cleanup()
+
+    def stop(self):
+        self.request_end()
+        thread = self.thread
+        if thread is not None and thread.is_alive():
+            return
+        if self.pre_tone_active:
+            while self.pre_tone_active and not self.cleaned_up:
+                time.sleep(0.05)
+            if not self.cleaned_up:
+                self.cleanup()
+            return
+        if not self.cleaned_up:
+            if self.pre_tone_completed and self.post_tones:
+                try:
+                    self.play_post_tones()
+                except Exception as exc:
+                    page_debug(f"posttone_stop_error stream={self.stream_id} error={exc.__class__.__name__}: {exc}")
+            self.cleanup()
+
+    def handle_external_stop_request(self):
+        self.skip_post_tones = True
+        self.end_requested.set()
+        self.stop_event.set()
+        self.cleanup()
 
 
 def handle(arg, group=None, sender=None):

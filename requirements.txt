@@ -6,3 +6,6 @@ waitress
 argon2-cffi
 av
 miniaudio
+ldap3
+authlib
+python3-saml

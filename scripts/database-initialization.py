@@ -1,6 +1,8 @@
 import getpass
 import os
 import random
+import re
+import socket
 import string
 import subprocess
 import sys
@@ -24,10 +26,144 @@ PROJECT_CA_URL = "https://install.openpagingserver.org/rootca.crt"
 PROJECT_CA_PATH = TRUSTED_CA_DIR / "OpenPagingServerProject.crt"
 TRUSTED_CA_README_URL = "https://install.openpagingserver.org/trustedca-dir.md"
 TRUSTED_CA_README_PATH = TRUSTED_CA_DIR / "README.md"
+DEFAULT_WEB_PORT = 80
+WEB_PORT_FALLBACKS = [81, 82, 83, 84, 85, 8080, 7000, 7001, 7010, 7100]
+DEFAULT_SIP_PORT = 5060
+SIP_PORT_FALLBACKS = [5065, 5160, 5162, 5260, 17777, 17778, 18888, 18887]
+RANDOM_PORT_MIN = 1024
+RANDOM_PORT_MAX = 60999
+RANDOM_PORT_MAX_ATTEMPTS = 1000
 
 
 def random_password(length=32):
     return "".join(random.choices(string.ascii_letters + string.digits, k=length))
+
+
+def can_bind(port, socket_type, family):
+    address = "0.0.0.0" if family == socket.AF_INET else "::"
+
+    try:
+        sock = socket.socket(family, socket_type)
+    except OSError:
+        return True
+
+    try:
+        sock.bind((address, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def tcp_port_available(port):
+    return can_bind(port, socket.SOCK_STREAM, socket.AF_INET) and can_bind(port, socket.SOCK_STREAM, socket.AF_INET6)
+
+
+def udp_port_available(port):
+    return can_bind(port, socket.SOCK_DGRAM, socket.AF_INET) and can_bind(port, socket.SOCK_DGRAM, socket.AF_INET6)
+
+
+def web_port_available(port):
+    return tcp_port_available(port)
+
+
+def sip_port_available(port):
+    return tcp_port_available(port) and udp_port_available(port)
+
+
+def extract_process_from_output(output):
+    match = re.search(r'users:\(\(\"([^\"]+)\"', output)
+    if match:
+        return match.group(1)
+
+    lines = [line for line in output.splitlines() if line.strip()]
+    if len(lines) >= 2:
+        parts = lines[1].split()
+        if parts:
+            return parts[0]
+
+    return ""
+
+
+def find_port_service_with_ss(port, udp=False):
+    if shutil.which("ss") is None:
+        return ""
+
+    command = ["ss", "-H", "-lunp" if udp else "-ltnp", f"sport = :{port}"]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        return ""
+
+    return extract_process_from_output(result.stdout)
+
+
+def find_port_service_with_lsof(port, udp=False):
+    if shutil.which("lsof") is None:
+        return ""
+
+    if udp:
+        command = ["lsof", "-nP", f"-iUDP:{port}"]
+    else:
+        command = ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"]
+
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        return ""
+
+    return extract_process_from_output(result.stdout)
+
+
+def find_port_service(port, protocols):
+    for protocol in protocols:
+        udp = protocol == "udp"
+        service = find_port_service_with_ss(port, udp=udp)
+        if service:
+            return service
+
+        service = find_port_service_with_lsof(port, udp=udp)
+        if service:
+            return service
+
+    return "unknown service"
+
+
+def choose_random_port(port_available, blocked_ports):
+    blocked_ports = set(blocked_ports)
+
+    for _ in range(RANDOM_PORT_MAX_ATTEMPTS):
+        port = random.randint(RANDOM_PORT_MIN, RANDOM_PORT_MAX)
+        if port in blocked_ports:
+            continue
+        if port_available(port):
+            return port
+
+    for port in range(RANDOM_PORT_MIN, RANDOM_PORT_MAX + 1):
+        if port in blocked_ports:
+            continue
+        if port_available(port):
+            return port
+
+    raise RuntimeError("No available ports found")
+
+
+def select_port(default_port, fallback_ports, port_available, protocols, label):
+    if port_available(default_port):
+        return default_port
+
+    selected_port = None
+    for fallback_port in fallback_ports:
+        if port_available(fallback_port):
+            selected_port = fallback_port
+            break
+
+    if selected_port is None:
+        selected_port = choose_random_port(port_available, [default_port, *fallback_ports])
+
+    service = find_port_service(default_port, protocols)
+    print(f"Port {default_port} is already in use by {service}. {label} port will be set to {selected_port}")
+
+    return selected_port
 
 
 def sql_string(value):
@@ -132,12 +268,13 @@ def execute_schema(cursor):
             name VARCHAR(255) DEFAULT NULL,
             shortmessage TEXT DEFAULT NULL,
             longmessage TEXT DEFAULT NULL,
-            audio VARCHAR(255) DEFAULT NULL,
+            audio TEXT DEFAULT NULL,
             image VARCHAR(255) DEFAULT '',
             color VARCHAR(7) DEFAULT NULL,
             icon VARCHAR(255) DEFAULT '',
             expires VARCHAR(100) DEFAULT NULL,
             vendor_specific TEXT DEFAULT NULL,
+            owner_user_id INT DEFAULT NULL,
             priority ENUM('Low','Normal','High','Emergency') DEFAULT NULL
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
         """,
@@ -149,14 +286,23 @@ def execute_schema(cursor):
             password VARCHAR(64) NOT NULL,
             salt VARCHAR(64) NOT NULL,
             role ENUM('admin','tempadmin','user','tempuser','receiver','tempreceiver') NOT NULL,
+            auth_provider VARCHAR(32) NOT NULL DEFAULT 'local',
+            external_id VARCHAR(255) DEFAULT NULL,
+            display_name VARCHAR(255) DEFAULT NULL,
+            ldap_groups LONGTEXT DEFAULT NULL,
+            identity_recipient_groups LONGTEXT DEFAULT NULL,
             loginsleft INT DEFAULT 0,
             logincount INT DEFAULT 0,
             lastlogin DATETIME DEFAULT NULL,
-            accountexpire DATE DEFAULT NULL,
+            accountexpire DATETIME DEFAULT NULL,
             accountcreated DATE DEFAULT CURRENT_DATE,
             adminperm LONGTEXT DEFAULT NULL,
             msgsendperm LONGTEXT DEFAULT NULL,
-            userperm LONGTEXT DEFAULT NULL
+            userperm LONGTEXT DEFAULT NULL,
+            restrict_groups TINYINT(1) NOT NULL DEFAULT 0,
+            restrict_messages TINYINT(1) NOT NULL DEFAULT 0,
+            restrict_bell_schedules TINYINT(1) NOT NULL DEFAULT 0,
+            require_password_change TINYINT(1) NOT NULL DEFAULT 0
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
         """,
         """
@@ -187,7 +333,13 @@ def execute_schema(cursor):
         CREATE TABLE IF NOT EXISTS groups (
             id VARCHAR(100) DEFAULT NULL,
             name VARCHAR(100) DEFAULT NULL,
-            members TEXT DEFAULT NULL
+            members TEXT DEFAULT NULL,
+            monitor_members TEXT DEFAULT NULL,
+            monitor_categories VARCHAR(64) DEFAULT NULL,
+            page_pre_tone TEXT DEFAULT NULL,
+            page_post_tone TEXT DEFAULT NULL,
+            owner_user_id INT DEFAULT NULL,
+            suspend_bells_on_emergency TINYINT(1) NOT NULL DEFAULT 0
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
         """,
         """
@@ -203,7 +355,7 @@ def execute_schema(cursor):
             issued DATETIME DEFAULT NULL,
             `groups` TEXT DEFAULT NULL,
             image VARCHAR(100) DEFAULT NULL,
-            audio VARCHAR(10000) DEFAULT NULL,
+            audio TEXT DEFAULT NULL,
             sender VARCHAR(100) DEFAULT NULL,
             priority ENUM('Low','Normal','High','Emergency') DEFAULT NULL,
             delivery VARCHAR(100) DEFAULT NULL,
@@ -299,13 +451,68 @@ def execute_schema(cursor):
             KEY api_tokens_user_idx (user_id)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
         """,
+        """
+        CREATE TABLE IF NOT EXISTS user_group_access (
+            user_id INT NOT NULL,
+            group_id VARCHAR(100) NOT NULL,
+            PRIMARY KEY (user_id, group_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS user_message_access (
+            user_id INT NOT NULL,
+            message_id INT NOT NULL,
+            PRIMARY KEY (user_id, message_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS user_bell_schedule_access (
+            user_id INT NOT NULL,
+            schedule_id INT NOT NULL,
+            PRIMARY KEY (user_id, schedule_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS loginhistory (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            user_id INT DEFAULT NULL,
+            username VARCHAR(255) DEFAULT NULL,
+            auth_provider VARCHAR(32) NOT NULL DEFAULT 'local',
+            session_id VARCHAR(64) DEFAULT NULL,
+            session_type VARCHAR(16) NOT NULL DEFAULT 'web',
+            ip VARCHAR(64) DEFAULT NULL,
+            user_agent TEXT DEFAULT NULL,
+            login_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            KEY loginhistory_user_idx (user_id),
+            KEY loginhistory_session_idx (session_id),
+            KEY loginhistory_time_idx (login_time)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS user_sessions (
+            session_id VARCHAR(64) NOT NULL PRIMARY KEY,
+            user_id INT NOT NULL,
+            session_type VARCHAR(16) NOT NULL DEFAULT 'web',
+            auth_provider VARCHAR(32) NOT NULL DEFAULT 'local',
+            username VARCHAR(255) DEFAULT NULL,
+            ip VARCHAR(64) DEFAULT NULL,
+            user_agent TEXT DEFAULT NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_seen_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            expires_at DATETIME DEFAULT NULL,
+            revoked_at DATETIME DEFAULT NULL,
+            KEY user_sessions_user_idx (user_id),
+            KEY user_sessions_type_idx (session_type),
+            KEY user_sessions_revoked_idx (revoked_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+        """,
     ]
 
     for statement in schema_statements:
         cursor.execute(statement)
 
 
-def seed_defaults(cursor):
+def seed_defaults(cursor, webserver_http_port, insecure_sip_port):
     endpoint_module_dirs = [(module_dir, "true") for module_dir in discover_endpoint_module_packages()]
     if endpoint_module_dirs:
         cursor.executemany(
@@ -373,7 +580,7 @@ def seed_defaults(cursor):
             "Analytics secret. DO NOT SHARE.",
         ),
         ("favicon", "/assets/favicon.svg", "Browser Favicon. Path to file within web server."),
-        ("insecure_sip_port", "5060", "Port for UDP/TCP SIP"),
+        ("insecure_sip_port", str(insecure_sip_port), "Port for UDP/TCP SIP"),
         ("sip_nat_support", "1", "Enable NAT support for SIP (0/1)"),
         ("sip_external_ipv4_mode", "auto", "SIP external IPv4 mode (auto/manual)"),
         ("sip_external_ipv4", "", "Manual SIP external IPv4 address"),
@@ -420,9 +627,75 @@ def seed_defaults(cursor):
         ("webserver_https_cert", "", "HTTPS certificate path on the server. Must start with /"),
         ("webserver_http_to_https", "0", "Automatically redirect HTTP requests to HTTPS (0/1)"),
         ("webserver_hsts", "0", "Send HSTS headers over HTTPS (0/1)"),
-        ("webserver_http_port", "80", "HTTP Server Port (Default: 80)"),
+        ("webserver_http_port", str(webserver_http_port), "HTTP Server Port (Default: 80)"),
         ("api_http_enable", "0", "Enable REST API over HTTP (0/1)"),
         ("api_http_port", "8088", "REST API HTTP port"),
+        ("identity_provider", "local", ""),
+        ("identity_redirect_auto", "1", ""),
+        ("identity_allow_local_login", "0", ""),
+        ("ldap_enabled", "0", ""),
+        ("ldap_template", "generic", ""),
+        ("ldap_server_address", "", ""),
+        ("ldap_server_port", "389", ""),
+        ("ldap_secure", "0", ""),
+        ("ldap_ca_certificate", "", ""),
+        ("ldap_base_dn", "", ""),
+        ("ldap_bind_username", "", ""),
+        ("ldap_bind_password", "", ""),
+        ("ldap_password_change_url", "", ""),
+        ("ldap_login_field", "uid", ""),
+        ("ldap_user_search_filter", "({field}={username})", ""),
+        ("ldap_display_name_field", "cn", ""),
+        ("ldap_email_field", "mail", ""),
+        ("ldap_required_group", "", ""),
+        ("ldap_admin_group", "", ""),
+        ("ldap_auto_create_users", "0", ""),
+        ("ldap_local_login_fallback", "1", ""),
+        ("ldap_connection_timeout", "5", ""),
+        ("ldap_failure_behavior", "deny", ""),
+        ("ldap_group_sync", "1", ""),
+        ("ldap_default_role", "receiver", ""),
+        ("ldap_role_mappings", "[]", ""),
+        ("oidc_discovery_url", "", ""),
+        ("oidc_client_id", "", ""),
+        ("oidc_client_secret", "", ""),
+        ("oidc_password_change_url", "", ""),
+        ("oidc_scim_enabled", "0", ""),
+        ("oidc_scim_base_url", "", ""),
+        ("oidc_scim_bearer_token", "", ""),
+        ("oidc_scim_timeout", "5", ""),
+        ("oidc_scim_sync_groups", "1", ""),
+        ("oidc_scope", "openid profile email", ""),
+        ("oidc_username_claim", "preferred_username", ""),
+        ("oidc_display_name_claim", "name", ""),
+        ("oidc_email_claim", "email", ""),
+        ("oidc_groups_claim", "groups", ""),
+        ("oidc_required_group", "", ""),
+        ("oidc_admin_group", "", ""),
+        ("oidc_auto_create_users", "0", ""),
+        ("oidc_group_sync", "1", ""),
+        ("oidc_default_role", "receiver", ""),
+        ("oidc_role_mappings", "[]", ""),
+        ("saml_idp_entity_id", "", ""),
+        ("saml_sso_url", "", ""),
+        ("saml_x509_certificate", "", ""),
+        ("saml_password_change_url", "", ""),
+        ("saml_scim_enabled", "0", ""),
+        ("saml_scim_base_url", "", ""),
+        ("saml_scim_bearer_token", "", ""),
+        ("saml_scim_timeout", "5", ""),
+        ("saml_scim_sync_groups", "1", ""),
+        ("saml_username_attribute", "uid", ""),
+        ("saml_display_name_attribute", "displayName", ""),
+        ("saml_email_attribute", "mail", ""),
+        ("saml_groups_attribute", "groups", ""),
+        ("saml_required_group", "", ""),
+        ("saml_admin_group", "", ""),
+        ("saml_auto_create_users", "0", ""),
+        ("saml_group_sync", "1", ""),
+        ("saml_default_role", "receiver", ""),
+        ("saml_role_mappings", "[]", ""),
+        ("notify_users_about_account_expiration", "1", ""),
     ]
     cursor.executemany(
         """
@@ -481,7 +754,9 @@ def main():
         recreate_database_user(cursor, db_password)
 
         execute_schema(cursor)
-        seed_defaults(cursor)
+        webserver_http_port = select_port(DEFAULT_WEB_PORT, WEB_PORT_FALLBACKS, web_port_available, ["tcp"], "Web")
+        insecure_sip_port = select_port(DEFAULT_SIP_PORT, SIP_PORT_FALLBACKS, sip_port_available, ["tcp", "udp"], "SIP")
+        seed_defaults(cursor, webserver_http_port, insecure_sip_port)
 
         conn.commit()
         write_config(db_password)

@@ -10,12 +10,6 @@ from srv.web.app import *
 
 CAPTCHA_PROVIDERS = {"basic", "turnstile", "recaptcha"}
 CAPTCHA_DISABLED_VALUES = {"", "disabled", "none", "off", "0", "false"}
-CAPTCHA_PROVIDER_ALIASES = {
-    "cloudflare": "turnstile",
-    "cloudflare-turnstile": "turnstile",
-    "google": "recaptcha",
-    "google-recaptcha": "recaptcha",
-}
 CAPTCHA_TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 CAPTCHA_RECAPTCHA_VERIFY_URL = "https://www.google.com/recaptcha/api/siteverify"
 BASIC_CAPTCHA_SESSION_KEY = "login_basic_captcha_hash"
@@ -97,6 +91,10 @@ def _fake_salt(username):
     return hashlib.sha256(("missing-user:" + username + ":" + app.secret_key).encode()).hexdigest()
 
 
+def _can_use_local_login_record(user_row):
+    return str((user_row or {}).get("auth_provider") or "local").strip().lower() == "local"
+
+
 def _record_login_attempt(ip, username, success, user_agent):
     execute(
         "INSERT INTO login_attempts (ip, username, success, attempt_time, user_agent) VALUES (%s,%s,%s,NOW(),%s)",
@@ -114,7 +112,6 @@ def _captcha_failed_response():
 
 def _captcha_provider(data):
     provider = str((data or {}).get("login_captcha_provider") or "disabled").strip().lower()
-    provider = CAPTCHA_PROVIDER_ALIASES.get(provider, provider)
     if provider in CAPTCHA_DISABLED_VALUES:
         return ""
     return provider if provider in CAPTCHA_PROVIDERS else ""
@@ -263,7 +260,7 @@ def handle_request():
         data = {}
         login_error = "Initialization failed: " + str(exc)
 
-    maintenance_popup_open = demo_mode_maintenance_popup_pending()
+    maintenance_popup_open = demo_mode_active() and demo_mode_maintenance_popup_pending()
     maintenance_state = demo_mode_maintenance_state(data) if maintenance_popup_open else None
 
     if session.get("user_id") is not None and session.get("user_id") != "" and not maintenance_popup_open:
@@ -280,42 +277,66 @@ def handle_request():
 
             if "get_challenge" in request.form:
                 username = request.form.get("username", "").strip()
-                user = query_one("SELECT salt FROM users WHERE username=%s OR email=%s LIMIT 1", (username, username))
+                session["temp_user"] = username
+                forced_mode = str(request.form.get("login_mode") or "").strip().lower()
+                provider = "local" if forced_mode == "local" else configured_identity_provider(data)
+                session["temp_auth_mode"] = provider
+                if provider == "ldap":
+                    session.pop("temp_challenge", None)
+                    return jsonify(success=True, mode="ldap")
+                user = query_one("SELECT salt, auth_provider FROM users WHERE username=%s OR email=%s LIMIT 1", (username, username))
                 challenge = secrets.token_hex(32)
                 session["temp_challenge"] = challenge
-                session["temp_user"] = username
                 use_fake_salt = demo_mode_maintenance_block_enabled(data) and not demo_mode_maintenance_username_matches(username)
-                salt = _fake_salt(username) if use_fake_salt else (user["salt"] if user and user.get("salt") is not None else _fake_salt(username))
-                return jsonify(success=True, salt=salt, challenge=challenge)
+                salt = _fake_salt(username) if use_fake_salt else (user["salt"] if user and _can_use_local_login_record(user) and user.get("salt") is not None else _fake_salt(username))
+                return jsonify(success=True, mode="local", salt=salt, challenge=challenge)
 
-            if "response" in request.form:
+            if "response" in request.form or "password" in request.form:
                 if not _verify_captcha(data, ip):
                     session.pop("temp_challenge", None)
                     session.pop("temp_user", None)
+                    session.pop("temp_auth_mode", None)
                     return _captcha_failed_response()
                 username = session.get("temp_user", "")
+                auth_mode = session.get("temp_auth_mode") or configured_identity_provider(data)
                 challenge = session.get("temp_challenge", "")
-                user = query_one("SELECT id, username, password FROM users WHERE username=%s OR email=%s LIMIT 1", (username, username))
-                expected = hashlib.sha256(((user or {}).get("password", "") + challenge).encode()).hexdigest() if user and challenge else ""
-                if demo_mode_maintenance_block_enabled(data) and not demo_mode_maintenance_username_matches((user or {}).get("username") or username):
+                local_user = local_user_record(username)
+                if demo_mode_maintenance_block_enabled(data) and not demo_mode_maintenance_username_matches((local_user or {}).get("username") or username):
                     _record_login_attempt(ip, username, False, ua)
                     session.pop("temp_challenge", None)
                     session.pop("temp_user", None)
+                    session.pop("temp_auth_mode", None)
                     return jsonify(success=False, message="This demo server is currently in maintenance mode by a clerk or system administrator. Please try again later. We apologize for any inconvenience.")
-                ok = bool(user and challenge and request.form.get("response") == expected)
+                authed_user = None
+                if auth_mode == "ldap":
+                    password = request.form.get("password", "")
+                    result = authenticate_user_credentials(username, password, data)
+                    authed_user = result.get("user") if result.get("ok") else None
+                    ok = bool(authed_user)
+                    if not ok and str(result.get("reason") or "").strip().lower() == "denied":
+                        session.pop("temp_challenge", None)
+                        session.pop("temp_user", None)
+                        session.pop("temp_auth_mode", None)
+                        return jsonify(success=False, message=str(result.get("error") or identity_access_denied_message(data)))
+                else:
+                    expected = hashlib.sha256(((local_user or {}).get("password", "") + challenge).encode()).hexdigest() if local_user and challenge else ""
+                    ok = bool(local_user and _can_use_local_login_record(local_user) and challenge and request.form.get("response") == expected)
+                    authed_user = local_user if ok else None
                 _record_login_attempt(ip, username, ok, ua)
                 if ok:
-                    session.clear()
-                    session["user_id"] = user["id"]
-                    session["username"] = user["username"]
-                    if demo_mode_maintenance_username_matches(user["username"]):
+                    clear_sso_failure_state()
+                    auth_provider = result.get("provider") if auth_mode == "ldap" else "local"
+                    begin_web_login_session(authed_user, auth_provider)
+                    redirect_target = post_login_redirect_target(authed_user, auth_provider)
+                    if demo_mode_active() and demo_mode_maintenance_username_matches(authed_user["username"]):
                         session[DEMO_MODE_MAINTENANCE_SESSION_KEY] = "1"
                         session[DEMO_MODE_MAINTENANCE_PENDING_KEY] = "1"
                         demo_mode_maintenance_touch()
-                        return jsonify(success=True, maintenance_popup=True, maintenance=demo_mode_maintenance_state(data))
-                    return jsonify(success=True)
+                        return jsonify(success=True, maintenance_popup=True, maintenance=demo_mode_maintenance_state(data), redirect=redirect_target)
+                    return jsonify(success=True, redirect=redirect_target)
                 session.pop("temp_challenge", None)
                 session.pop("temp_user", None)
+                session.pop("temp_auth_mode", None)
                 return _invalid_login_response()
 
             return _invalid_login_response()
@@ -324,6 +345,16 @@ def handle_request():
 
     product_name = data.get("product_name") or "Open Paging Server"
     favicon = data.get("favicon") or ""
+    identity_provider = configured_identity_provider(data)
+    redirect_provider = identity_provider in REDIRECT_IDENTITY_PROVIDER_VALUES
+    sso_error = str(request.args.get("sso_error") or "").strip().lower()
+    sso_error_detail = pop_sso_error_detail()
+    local_mode = redirect_provider and str(request.args.get("local") or "").strip() == "1"
+    local_login_button_enabled = redirect_provider and (
+        identity_local_login_allowed(data) or sso_error == "cancelled" or sso_failure_count() >= 2
+    )
+    show_local_login_form = identity_provider in {"local", "ldap"} or local_mode
+    sso_auto_redirect = redirect_provider and identity_redirect_auto_enabled(data) and not local_mode and not sso_error
     banner_enabled = _setting_bool(data, "login_banner_enabled")
     banner_title = data.get("login_banner_title") or ""
     banner_message = data.get("login_banner_message") or ""
@@ -332,7 +363,7 @@ def handle_request():
     login_logo_light = data.get("login_logo_light") or ""
     login_logo_dark = data.get("login_logo_dark") or ""
     client_ip = request.remote_addr or ""
-    captcha_provider = _captcha_required(data, client_ip)
+    captcha_provider = _captcha_required(data, client_ip) if show_local_login_form else ""
     captcha_site_key = _captcha_site_key(data)
     captcha_html = _captcha_markup(captcha_provider, captcha_site_key)
     captcha_script = _captcha_script_tag(captcha_provider)
@@ -389,6 +420,51 @@ def handle_request():
           {message_html}
         </div>"""
 
+    local_login_switch = ""
+    if redirect_provider and not show_local_login_form and local_login_button_enabled:
+        local_login_switch = '<button type="button" class="text-action" onclick="showLocalLogin()">LOGIN (Local)</button>'
+    sso_retry_html = ""
+    if redirect_provider and not show_local_login_form and sso_error in {"failed", "denied"}:
+        sso_error_title = "Access denied" if sso_error == "denied" else "Login failed"
+        sso_error_message = (
+            h(sso_error_detail or identity_access_denied_message(data))
+            if sso_error == "denied"
+            else "Unable to connect to identity provider for login"
+        )
+        sso_retry_html = """
+        <div class="sso-error-title">""" + sso_error_title + """</div>
+        <div class="sso-error-message">""" + sso_error_message + """</div>""" + (
+            f'<div class="sso-error-detail">{h(sso_error_detail)}</div>' if sso_error == "failed" and sso_error_detail else ""
+        )
+    local_back_button = ""
+    if redirect_provider and show_local_login_form:
+        local_back_button = '<button type="button" class="text-action" onclick="showSsoOptions()">Back</button>'
+    if show_local_login_form:
+        login_box_inner = f"""
+        <h2>Login</h2>
+        <div class="input-field">
+          <input type="text" id="username" placeholder=" " required />
+          <label for="username">Username or Email</label>
+        </div>
+        <div class="input-field">
+          <input type="password" id="pw" placeholder=" " required />
+          <label for="pw">Password</label>
+        </div>
+        {captcha_html}
+        <button id="login-button" onclick="startLogin()">Login</button>
+        {local_back_button}
+        <p id="login-error" class="error">{h(login_error)}</p>"""
+    else:
+        sso_button_label = "LOGIN (SSO)" if local_login_button_enabled else "LOGIN"
+        if sso_error in {"failed", "denied"}:
+            sso_button_label = "Retry"
+        login_box_inner = f"""
+        <h2>Login</h2>
+        {sso_retry_html}
+        <button id="sso-login-button" onclick="startSsoLogin()">{h(sso_button_label)}</button>
+        {local_login_switch}
+        <p id="login-error" class="error">{h(login_error)}</p>"""
+
     body = f"""<!DOCTYPE html>
 <html lang="en">
   <head>
@@ -436,10 +512,15 @@ def handle_request():
       .captcha-answer-field {{ width: 100%; margin-bottom: 0; }}
       .cf-turnstile, .g-recaptcha {{ max-width: 100%; }}
       .login-box button {{ width: 100%; padding: 12px; background-color: #1976d2; border: none; color: #fff; font-size: 16px; border-radius: 4px; cursor: pointer; font-family: "Roboto", sans-serif; text-transform: uppercase; position: relative; height: 45px; display: inline-flex; align-items: center; justify-content: center; }}
+      .login-box .text-action {{ width: auto; height: auto; padding: 6px 0; margin-top: 10px; background: transparent; color: #1976d2; border-radius: 0; text-transform: none; font-size: 14px; justify-content: center; }}
+      .login-box .text-action:hover {{ background: transparent; text-decoration: underline; }}
       .login-box button.loading {{ pointer-events: none; background-color: #1565c0; }}
       .loading-circle {{ width: 24px; height: 24px; border: 2px solid rgba(255,255,255,0.3); border-top: 2px solid #fff; border-radius: 50%; animation: spin 1s linear infinite; position: absolute; }}
       @keyframes spin {{ from {{ transform: rotate(0deg); }} to {{ transform: rotate(360deg); }} }}
       .error {{ color: #d32f2f; font-size: 0.9em; margin-top: 10px; min-height: 1.2em; }}
+      .sso-error-title {{ color: #d32f2f; font-size: 1em; font-weight: 600; margin-bottom: 6px; }}
+      .sso-error-message {{ color: #555; font-size: 0.92em; line-height: 1.4; margin-bottom: 16px; }}
+      .sso-error-detail {{ color: #5f6368; font-size: 0.84em; line-height: 1.45; margin: -6px 0 16px 0; overflow-wrap: anywhere; }}
       .demo-mode-login {{ position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); z-index: 2; color: #000; font-size: 0.95em; display: flex; align-items: center; justify-content: center; gap: 8px; }}
       .maintenance-popup-overlay {{ display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.72); z-index: 10; align-items: center; justify-content: center; padding: 20px; box-sizing: border-box; }}
       .maintenance-popup-overlay.active {{ display: flex; }}
@@ -464,7 +545,11 @@ def handle_request():
         .input-field label {{ color: #ccc; }}
         .basic-captcha-row img {{ background: #2a2a2a; border-color: #555; }}
         .login-box button {{ background-color: #90caf9; color: #121212; }}
+        .login-box .text-action {{ color: #90caf9; }}
         .error {{ color: #ffcdd2; }}
+        .sso-error-title {{ color: #ffcdd2; }}
+        .sso-error-message {{ color: #bbb; }}
+        .sso-error-detail {{ color: #d0d0d0; }}
         .demo-mode-login {{ color: #fff; }}
         .maintenance-popup {{ background: #1e1e1e; }}
         .maintenance-popup h3 {{ color: #fff; }}
@@ -487,18 +572,7 @@ def handle_request():
     <div class="center-container">
       {banner_html}
       <div class="login-box">
-        <h2>Login</h2>
-        <div class="input-field">
-          <input type="text" id="username" placeholder=" " required />
-          <label for="username">Username or Email</label>
-        </div>
-        <div class="input-field">
-          <input type="password" id="pw" placeholder=" " required />
-          <label for="pw">Password</label>
-        </div>
-        {captcha_html}
-        <button id="login-button" onclick="startLogin()">Login</button>
-        <p id="login-error" class="error">{h(login_error)}</p>
+        {login_box_inner}
       </div>
       {demo_mode_html}
     </div>
@@ -540,8 +614,22 @@ def handle_request():
       Array.from(document.images).forEach((img) => img.addEventListener('load', adjustLogoPosition));
 
       const captchaProvider = "{captcha_provider}";
+      const localLoginMode = {"true" if redirect_provider and show_local_login_form else "false"};
+      const autoRedirectSso = {"true" if sso_auto_redirect else "false"};
       let maintenanceState = __OPS_MAINTENANCE_STATE__;
       const maintenancePopupInitiallyOpen = __OPS_MAINTENANCE_POPUP_OPEN__;
+
+      function startSsoLogin() {{
+        window.location.href = '/login/sso/start';
+      }}
+
+      function showLocalLogin() {{
+        window.location.href = '/?local=1';
+      }}
+
+      function showSsoOptions() {{
+        window.location.href = '/';
+      }}
 
       function maintenanceElements() {{
         return {{
@@ -624,10 +712,14 @@ def handle_request():
       }}
 
       async function startLogin() {{
-        const username = document.getElementById('username').value.trim();
-        const password = document.getElementById('pw').value;
+        const usernameField = document.getElementById('username');
+        const passwordField = document.getElementById('pw');
+        const username = usernameField ? usernameField.value.trim() : '';
+        const password = passwordField ? passwordField.value : '';
         const btn = document.getElementById('login-button');
         const err = document.getElementById('login-error');
+
+        if (!btn || !err) return;
 
         if (!username || !password) {{
           err.innerText = 'Enter username and password';
@@ -650,17 +742,21 @@ def handle_request():
           const res1 = await fetch('/', {{
             method: 'POST',
             headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
-            body: new URLSearchParams({{ get_challenge: 1, username: username }})
+            body: new URLSearchParams({{ get_challenge: 1, username: username, login_mode: localLoginMode ? 'local' : '' }})
           }});
 
           const data1 = await res1.json();
 
           if (!data1.success) throw new Error(data1.message || 'Invalid username or password.');
 
-          const verifier = sha256(password + data1.salt);
-          const proof = sha256(verifier + data1.challenge);
-
-          const proofPayload = new URLSearchParams({{ response: proof }});
+          let proofPayload;
+          if (data1.mode === 'ldap') {{
+            proofPayload = new URLSearchParams({{ password: password }});
+          }} else {{
+            const verifier = sha256(password + data1.salt);
+            const proof = sha256(verifier + data1.challenge);
+            proofPayload = new URLSearchParams({{ response: proof }});
+          }}
           Object.entries(captchaFields).forEach(([key, value]) => proofPayload.append(key, value));
 
           const res2 = await fetch('/', {{
@@ -676,7 +772,7 @@ def handle_request():
             btn.innerHTML = 'Login';
             openMaintenancePopup(data2.maintenance || {{}});
           }} else if (data2.success) {{
-            window.location.href = '/dashboard';
+            window.location.href = data2.redirect || '/dashboard';
           }} else {{
             throw new Error(data2.message || 'Invalid username or password.');
           }}
@@ -724,6 +820,9 @@ def handle_request():
         }}
         if (maintenancePopupInitiallyOpen) {{
           openMaintenancePopup(maintenanceState || {{}});
+        }}
+        if (autoRedirectSso) {{
+          startSsoLogin();
         }}
       }});
     </script>

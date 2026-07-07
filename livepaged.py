@@ -9,10 +9,16 @@ import threading
 import time
 import urllib.parse
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 import pymysql
 from dotenv import load_dotenv
+from active_broadcast_store import (
+    active_broadcast_stop_requested,
+    mark_active_broadcast_delivery,
+    put_active_broadcast,
+)
 from endpoints import connect_endpoint_ipc
 from clientd import (
     desktop_member_user_id,
@@ -20,6 +26,13 @@ from clientd import (
     send_stream_frame,
     start_desktop_livepage,
     user_has_connected_client,
+)
+from group_features import (
+    group_names_for_value,
+    monitor_targets_for_rows,
+    paging_tone_sequence,
+    regular_group_targets,
+    selected_group_rows,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -33,6 +46,7 @@ DB_NAME = os.getenv("DB_NAME")
 
 WS_HOST = os.getenv("LIVEPAGED_WS_HOST", "0.0.0.0")
 WS_PORT = int(os.getenv("LIVEPAGED_WS_PORT", "50010"))
+AUDIO_FRAME_BYTES = 160
 
 
 def page_debug(message):
@@ -102,6 +116,21 @@ def fetch_group_members(cur, group_id):
                 if member:
                     target_list.add(member)
     return target_list
+
+
+def resolve_group_rows(cur, group_id):
+    resolved_group = resolve_group_value(cur, group_id)
+    return resolved_group, selected_group_rows(cur, resolved_group)
+
+
+def paging_targets_from_rows(rows):
+    targets = []
+    seen = set()
+    for token in regular_group_targets(rows) + monitor_targets_for_rows(rows, "paging"):
+        if token not in seen:
+            seen.add(token)
+            targets.append(token)
+    return targets
 
 
 def page_group_from_sip_input(cur, extension):
@@ -192,23 +221,19 @@ def resolve_targets(group_id):
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            resolved_group = resolve_group_value(cur, group_id)
-            target_list = set()
-            if str(resolved_group) == "0":
+            resolved_group, rows = resolve_group_rows(cur, group_id)
+            if resolved_group != str(group_id or "").strip():
+                page_debug(f"resolve_targets_sip_input_group extension={group_id!r} stored_group={resolved_group!r}")
+            targets = paging_targets_from_rows(rows)
+            if not targets and str(resolved_group) == "0":
                 try:
                     cur.execute("SELECT `dir` FROM endpointmodulesloaded WHERE enabled = 'true' AND trusted = 'true'")
                     rows = cur.fetchall()
                 except Exception:
                     rows = []
-                page_debug(f"resolve_targets_all_modules rows={rows}")
                 for row in rows:
                     if row and row[0]:
-                        target_list.add(f"{row[0]}/all")
-            else:
-                if resolved_group != str(group_id or "").strip():
-                    page_debug(f"resolve_targets_sip_input_group extension={group_id!r} stored_group={resolved_group!r}")
-                target_list.update(fetch_group_members(cur, resolved_group))
-            targets = sorted(target_list)
+                        targets.append(f"{row[0]}/all")
             page_debug(f"resolve_targets_done group={group_id!r} resolved_group={resolved_group!r} targets={targets}")
             return resolved_group, targets
     except Exception as exc:
@@ -234,8 +259,8 @@ def connected_desktop_count(group_id):
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            resolved_group = resolve_group_value(cur, group_id)
-            if resolved_group == "0":
+            resolved_group, rows = resolve_group_rows(cur, group_id)
+            if resolved_group == "0" and not rows:
                 cur.execute(
                     """
                     SELECT id
@@ -246,7 +271,7 @@ def connected_desktop_count(group_id):
                 )
                 rows = cur.fetchall()
                 return sum(1 for row in rows if row and row[0] is not None and user_has_connected_client(row[0]))
-            members = fetch_group_members(cur, resolved_group)
+        members = paging_targets_from_rows(rows)
         return sum(1 for member in members if is_desktop_member_token(member) and user_has_connected_client(desktop_member_user_id(member)))
     finally:
         conn.close()
@@ -272,13 +297,253 @@ class LivePageSession:
         self.resolved_group_id = self.group_id
         self.targets = []
         self.desktop_clients = 0
+        self.group_names = []
+        self.pre_tones = []
+        self.post_tones = []
         self.cleanup_lock = threading.Lock()
+        self.forward_lock = threading.Lock()
+        self.pre_tone_mix_lock = threading.Lock()
         self.cleaned_up = False
         self.rtp_packets_received = 0
+        self.rtp_paused = False
+        self.pre_tone_active = False
+        self.pre_tone_completed = False
+        self.pre_tone_slot_frame = None
+        self.pre_tone_slot_consumed = False
+        self.end_requested = threading.Event()
+        self.livepage_record_registered = False
+        self.stop_monitor_thread = None
+        self.cleanup_after_run = True
+        self.skip_post_tones = False
         page_debug(
             f"session_init stream={self.stream_id} remote={self.remote_ip}:{self.remote_port} "
             f"group={self.group_id!r} sender={self.sender!r} local_port={self.local_port}"
         )
+
+    def load_group_runtime_context(self):
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                self.group_names = group_names_for_value(cur, self.resolved_group_id)
+                self.pre_tones = paging_tone_sequence(cur, self.resolved_group_id, "pre")
+                self.post_tones = paging_tone_sequence(cur, self.resolved_group_id, "post")
+        finally:
+            conn.close()
+
+    def register_livepage_record(self):
+        if self.livepage_record_registered:
+            return True
+        record = {
+            "id": self.stream_id,
+            "name": "Live Page",
+            "shortmessage": "",
+            "longmessage": "",
+            "icon": "fa-solid fa-microphone",
+            "color": "#c62828",
+            "vendor_specific": "",
+            "template_id": "",
+            "expires_rule": "manual",
+            "type": "Page",
+            "expires": None,
+            "issued": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "groups": self.resolved_group_id,
+            "image": "",
+            "audio": "",
+            "sender": self.sender or "Live Page",
+            "priority": "Normal",
+            "delivery": "live",
+            "runtime_kind": "livepage",
+        }
+        try:
+            put_active_broadcast(record)
+            self.livepage_record_registered = True
+            return True
+        except Exception as exc:
+            page_debug(
+                f"livepage_record_register_error stream={self.stream_id} group={self.resolved_group_id!r} "
+                f"error={exc.__class__.__name__}: {exc}"
+            )
+            return False
+
+    def start_stop_request_monitor(self):
+        if self.stop_monitor_thread is not None and self.stop_monitor_thread.is_alive():
+            return
+
+        def monitor():
+            while not self.cleaned_up and not self.stop_event.is_set():
+                try:
+                    if active_broadcast_stop_requested(self.stream_id):
+                        self.handle_external_stop_request()
+                        return
+                except Exception as exc:
+                    page_debug(
+                        f"livepage_stop_monitor_error stream={self.stream_id} "
+                        f"error={exc.__class__.__name__}: {exc}"
+                    )
+                time.sleep(0.2)
+
+        self.stop_monitor_thread = threading.Thread(target=monitor, daemon=True)
+        self.stop_monitor_thread.start()
+
+    def enable_livepage_tracking(self):
+        if self.register_livepage_record():
+            self.start_stop_request_monitor()
+
+    def request_end(self):
+        self.end_requested.set()
+        if not self.pre_tone_active:
+            self.stop_event.set()
+
+    def handle_external_stop_request(self):
+        self.skip_post_tones = True
+        self.stop()
+
+    def forward_payload(self, payload, ignore_pause=False, ignore_stop=False):
+        if (self.stop_event.is_set() and not ignore_stop) or self.cleaned_up:
+            return False
+        if self.rtp_paused and not ignore_pause:
+            return False
+        data = bytes(payload or b"")
+        if not data:
+            return False
+        with self.forward_lock:
+            if self.control_sock is not None:
+                try:
+                    self.control_sock.sendall(data)
+                except OSError as exc:
+                    page_debug(
+                        f"endpoint_audio_error stream={self.stream_id} resolved_group={self.resolved_group_id!r} "
+                        f"error={exc.__class__.__name__}: {exc}"
+                    )
+                    try:
+                        self.control_sock.close()
+                    except OSError:
+                        pass
+                    self.control_sock = None
+            try:
+                if self.desktop_stream_sock is not None:
+                    send_stream_frame(self.desktop_stream_sock, data)
+            except Exception as exc:
+                page_debug(
+                    f"desktop_audio_error stream={self.stream_id} resolved_group={self.resolved_group_id!r} "
+                    f"error={exc.__class__.__name__}: {exc}"
+                )
+        return True
+
+    def normalize_audio_frame(self, payload):
+        data = bytes(payload or b"")
+        if not data:
+            return b""
+        if len(data) < AUDIO_FRAME_BYTES:
+            return data.ljust(AUDIO_FRAME_BYTES, b"\xff")
+        if len(data) > AUDIO_FRAME_BYTES:
+            return data[:AUDIO_FRAME_BYTES]
+        return data
+
+    def begin_pre_tone_slot(self, frame):
+        with self.pre_tone_mix_lock:
+            self.pre_tone_slot_frame = self.normalize_audio_frame(frame)
+            self.pre_tone_slot_consumed = False
+
+    def finish_pre_tone_slot(self):
+        frame = None
+        with self.pre_tone_mix_lock:
+            if self.pre_tone_slot_frame is not None and not self.pre_tone_slot_consumed:
+                frame = self.pre_tone_slot_frame
+            self.pre_tone_slot_frame = None
+            self.pre_tone_slot_consumed = False
+        if frame is not None:
+            self.forward_payload(frame, ignore_pause=True, ignore_stop=True)
+
+    def clear_pre_tone_slot(self):
+        with self.pre_tone_mix_lock:
+            self.pre_tone_slot_frame = None
+            self.pre_tone_slot_consumed = False
+
+    def mix_pre_tone_payload(self, payload):
+        data = self.normalize_audio_frame(payload)
+        if not data:
+            return b""
+        if not self.pre_tone_active:
+            return data
+        tone_frame = None
+        with self.pre_tone_mix_lock:
+            if self.pre_tone_active and self.pre_tone_slot_frame is not None and not self.pre_tone_slot_consumed:
+                tone_frame = self.pre_tone_slot_frame
+                self.pre_tone_slot_consumed = True
+        if tone_frame is None:
+            return data
+        from endpoints import mix_ulaw_frames
+
+        return mix_ulaw_frames([tone_frame, data])
+
+    def before_pre_tone_slot(self, _frame):
+        return
+
+    def forward_live_payload(self, payload):
+        data = bytes(payload or b"")
+        if not data:
+            return False
+        if self.pre_tone_active:
+            return self.forward_payload(self.mix_pre_tone_payload(data), ignore_pause=True)
+        return self.forward_payload(data)
+
+    def play_tone_sequence(self, tones):
+        if not tones:
+            return
+        from endpoints import audio_frames
+
+        frame_duration = 160 / 8000
+        next_send_time = time.perf_counter()
+        for tone in tones:
+            for frame in audio_frames(tone):
+                self.forward_payload(frame, ignore_pause=True, ignore_stop=True)
+                next_send_time += frame_duration
+                sleep_time = next_send_time - time.perf_counter()
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                else:
+                    next_send_time = time.perf_counter()
+
+    def play_pre_tones(self):
+        if not self.pre_tones:
+            self.pre_tone_completed = True
+            return
+        self.pre_tone_active = True
+        try:
+            from endpoints import audio_frames
+
+            frame_duration = AUDIO_FRAME_BYTES / 8000
+            next_send_time = time.perf_counter()
+            for tone in self.pre_tones:
+                for frame in audio_frames(tone):
+                    if self.stop_event.is_set() and not self.end_requested.is_set():
+                        return
+                    self.begin_pre_tone_slot(frame)
+                    self.before_pre_tone_slot(frame)
+                    next_send_time += frame_duration
+                    sleep_time = next_send_time - time.perf_counter()
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+                    else:
+                        next_send_time = time.perf_counter()
+                    self.finish_pre_tone_slot()
+        finally:
+            self.clear_pre_tone_slot()
+            self.pre_tone_active = False
+            self.pre_tone_completed = True
+            if self.end_requested.is_set():
+                self.stop_event.set()
+
+    def play_post_tones(self):
+        if self.skip_post_tones or not self.post_tones:
+            return
+        paused = self.rtp_paused
+        self.rtp_paused = True
+        try:
+            self.play_tone_sequence(self.post_tones)
+        finally:
+            self.rtp_paused = paused
 
     def learn_rtp_source(self, addr, packet):
         if not getattr(self, "rtp_latching_enabled", False):
@@ -311,6 +576,7 @@ class LivePageSession:
     def preflight(self):
         page_debug(f"preflight_start stream={self.stream_id} group={self.group_id!r}")
         self.resolved_group_id, self.targets = resolve_targets(self.group_id)
+        self.load_group_runtime_context()
         try:
             self.desktop_clients = connected_desktop_count(self.group_id)
         except Exception as exc:
@@ -404,19 +670,8 @@ class LivePageSession:
                 payload = parse_rtp_payload(packet)
                 if not payload:
                     continue
-                if getattr(self, "rtp_paused", False):
-                    continue
                 try:
-                    if self.control_sock is not None:
-                        self.control_sock.sendall(payload)
-                    try:
-                        if self.desktop_stream_sock is not None:
-                            send_stream_frame(self.desktop_stream_sock, payload)
-                    except Exception as exc:
-                        page_debug(
-                            f"desktop_audio_error stream={self.stream_id} resolved_group={self.resolved_group_id!r} "
-                            f"error={exc.__class__.__name__}: {exc}"
-                        )
+                    self.forward_live_payload(payload)
                     packets += 1
                     bytes_sent += len(payload)
                     if packets == 1 or packets % 50 == 0:
@@ -431,7 +686,8 @@ class LivePageSession:
                 f"run_end stream={self.stream_id} packets={packets} bytes={bytes_sent} "
                 f"rtp_sent={getattr(self, 'rtp_packets_sent', 0)} rtp_recv={getattr(self, 'rtp_packets_received', 0)}"
             )
-            self.cleanup()
+            if self.cleanup_after_run:
+                self.cleanup()
 
     def stop(self):
         self.stop_event.set()
@@ -460,6 +716,15 @@ class LivePageSession:
         except OSError:
             pass
         self.desktop_stream_sock = None
+        if self.livepage_record_registered:
+            try:
+                mark_active_broadcast_delivery(self.stream_id, "stopped")
+            except Exception as exc:
+                page_debug(
+                    f"livepage_record_cleanup_error stream={self.stream_id} "
+                    f"error={exc.__class__.__name__}: {exc}"
+                )
+            self.livepage_record_registered = False
         if self.on_finish is not None:
             try:
                 self.on_finish()
@@ -472,21 +737,36 @@ class WebLivePageSession(LivePageSession):
     def start(self):
         return
 
+    def begin(self, websocket_conn):
+        threading.Thread(target=self.enable_livepage_tracking, daemon=True).start()
+        if not self.pre_tones:
+            self.pre_tone_completed = True
+            return
+
+        def run_pre_tones():
+            try:
+                self.play_pre_tones()
+                if not self.end_requested.is_set():
+                    send_ws_json(websocket_conn, {"type": "pretone_done"})
+            except Exception as exc:
+                page_debug(
+                    f"websocket_pretone_error stream={self.stream_id} error={exc.__class__.__name__}: {exc}"
+                )
+
+        threading.Thread(target=run_pre_tones, daemon=True).start()
+
+    def finish_page(self):
+        self.request_end()
+        if self.pre_tone_active:
+            while self.pre_tone_active and not self.cleaned_up:
+                time.sleep(0.05)
+            self.cleanup()
+            return
+        self.play_post_tones()
+        self.cleanup()
+
     def send_payload(self, payload):
-        if self.stop_event.is_set():
-            return
-        if not payload:
-            return
-        if self.control_sock is not None:
-            self.control_sock.sendall(payload)
-        try:
-            if self.desktop_stream_sock is not None:
-                send_stream_frame(self.desktop_stream_sock, payload)
-        except Exception as exc:
-            page_debug(
-                f"desktop_audio_error stream={self.stream_id} resolved_group={self.resolved_group_id!r} "
-                f"error={exc.__class__.__name__}: {exc}"
-            )
+        self.forward_live_payload(payload)
 
 def recv_until(sock, marker, limit=8192):
     data = b""
@@ -525,8 +805,18 @@ def send_ws_json(sock, payload):
     send_ws_frame(sock, 0x1, json.dumps(payload))
 
 
+def read_ws_exact(sock, length):
+    payload = b""
+    while len(payload) < length:
+        chunk = sock.recv(length - len(payload))
+        if not chunk:
+            break
+        payload += chunk
+    return payload
+
+
 def read_ws_frame(sock):
-    header = sock.recv(2)
+    header = read_ws_exact(sock, 2)
     if len(header) < 2:
         return None, b""
     first, second = header
@@ -534,16 +824,21 @@ def read_ws_frame(sock):
     masked = bool(second & 0x80)
     length = second & 0x7F
     if length == 126:
-        length = struct.unpack("!H", sock.recv(2))[0]
+        extended = read_ws_exact(sock, 2)
+        if len(extended) < 2:
+            return None, b""
+        length = struct.unpack("!H", extended)[0]
     elif length == 127:
-        length = struct.unpack("!Q", sock.recv(8))[0]
-    mask = sock.recv(4) if masked else b""
-    payload = b""
-    while len(payload) < length:
-        chunk = sock.recv(length - len(payload))
-        if not chunk:
-            break
-        payload += chunk
+        extended = read_ws_exact(sock, 8)
+        if len(extended) < 8:
+            return None, b""
+        length = struct.unpack("!Q", extended)[0]
+    mask = read_ws_exact(sock, 4) if masked else b""
+    if masked and len(mask) < 4:
+        return None, b""
+    payload = read_ws_exact(sock, length)
+    if len(payload) < length:
+        return None, b""
     if masked:
         payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
     return opcode, payload
@@ -602,9 +897,23 @@ def handle_websocket_client(conn, addr, request=None):
             page_debug(f"websocket_preflight_error addr={addr} group={group_id!r} error={exc}")
             send_ws_json(conn, {"type": "error", "message": "Unable to start live page."})
             return
-        send_ws_json(conn, {"type": "ready", "stream_id": session.stream_id})
+        send_ws_json(conn, {"type": "ready", "stream_id": session.stream_id, "pretone": bool(session.pre_tones)})
+        session.begin(conn)
+        try:
+            conn.settimeout(0.25)
+        except OSError:
+            pass
         while True:
-            opcode, payload = read_ws_frame(conn)
+            if session.end_requested.is_set() or session.stop_event.is_set():
+                break
+            try:
+                opcode, payload = read_ws_frame(conn)
+            except socket.timeout:
+                continue
+            except BlockingIOError:
+                continue
+            except TimeoutError:
+                continue
             if opcode is None or opcode == 0x8:
                 break
             if opcode == 0x9:
@@ -616,7 +925,7 @@ def handle_websocket_client(conn, addr, request=None):
         page_debug(f"websocket_client_error addr={addr} error={exc.__class__.__name__}: {exc}")
     finally:
         if session is not None:
-            session.stop()
+            session.finish_page()
         try:
             send_ws_frame(conn, 0x8, b"")
         except Exception:

@@ -27,6 +27,8 @@ from endpoints import (
     module_type_has_output,
     multicast_rtp_endpoint_count,
 )
+from group_features import fetch_group_rows, regular_group_targets
+from tts import decode_tts_token, iter_tts_ffmpeg_chunks, split_audio_entries
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -96,8 +98,17 @@ def resolve_group_targets(group_id):
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
+            group_ids = []
+            for gid in str(group_id or "").split("."):
+                token = gid.strip()
+                if token and token not in group_ids:
+                    group_ids.append(token)
+            rows = fetch_group_rows(cur, None if "0" in group_ids else group_ids)
+            targets = regular_group_targets(rows)
+            if targets:
+                return targets
             target_list = set()
-            if str(group_id) == "0":
+            if "0" in group_ids:
                 try:
                     cur.execute("SELECT `dir` FROM endpointmodulesloaded WHERE enabled = 'true' AND trusted = 'true'")
                     rows = cur.fetchall()
@@ -108,20 +119,32 @@ def resolve_group_targets(group_id):
                         target_list.add(f"{row[0]}/all")
                 if module_is_output_capable(MULTICAST_RTP_MODULE):
                     target_list.add(f"{MULTICAST_RTP_MODULE}/all")
-            else:
-                for gid in str(group_id or "").split("."):
-                    gid = gid.strip()
-                    if not gid:
-                        continue
-                    cur.execute("SELECT members FROM groups WHERE id = %s", (gid,))
-                    group_row = cur.fetchone()
-                    if group_row and group_row[0]:
-                        for member in str(group_row[0]).replace(",", " ").split():
-                            if member:
-                                target_list.add(member)
             return sorted(target_list)
     finally:
         conn.close()
+
+
+def broadcast_target_tokens(broadcast):
+    explicit = (broadcast or {}).get("explicit_targets")
+    exclude = (broadcast or {}).get("exclude_targets")
+    targets = []
+    seen = set()
+    if isinstance(explicit, (list, tuple, set)):
+        source = explicit
+    elif explicit:
+        source = str(explicit).replace(",", " ").split()
+    else:
+        source = resolve_group_targets((broadcast or {}).get("groups"))
+    for item in source:
+        token = str(item or "").strip()
+        if token and token not in seen:
+            seen.add(token)
+            targets.append(token)
+    if isinstance(exclude, (list, tuple, set)):
+        excluded = {str(item or "").strip() for item in exclude if str(item or "").strip()}
+    else:
+        excluded = {token for token in str(exclude or "").replace(",", " ").split() if token}
+    return [token for token in targets if token not in excluded]
 
 def is_8k_ulaw(file_path):
     try:
@@ -159,9 +182,7 @@ def resolve_audio_file(audio_file):
 
 def get_all_audio_frames(audio_files_str):
     yielded = False
-    audio_files = audio_files_str.split(":")
-    for audio_file in audio_files:
-        audio_file = audio_file.strip()
+    for audio_file in split_audio_entries(audio_files_str):
         if not audio_file:
             continue
 
@@ -176,36 +197,47 @@ def get_all_audio_frames(audio_files_str):
                     yield silence_payload
             except ValueError:
                 continue
-        else:
-            file_path = resolve_audio_file(audio_file)
-            if not file_path:
-                continue
+            continue
+        tts_payload = decode_tts_token(audio_file)
+        if tts_payload:
+            for chunk in iter_tts_ffmpeg_chunks(
+                tts_payload,
+                ["-ar", str(SAMPLE_RATE), "-ac", "1", "-f", "mulaw", "-flush_packets", "1", "pipe:1"],
+                chunk_size=FRAME_SIZE,
+                pad_byte=b"\xff",
+            ):
+                yielded = True
+                yield chunk
+            continue
+        file_path = resolve_audio_file(audio_file)
+        if not file_path:
+            continue
 
-            if is_8k_ulaw(file_path):
-                with open(file_path, 'rb') as f:
-                    while True:
-                        chunk = f.read(FRAME_SIZE)
-                        if not chunk:
-                            break
-                        if len(chunk) < FRAME_SIZE:
-                            chunk = chunk.ljust(FRAME_SIZE, b'\xff')
-                        yielded = True
-                        yield chunk
-            else:
-                ffmpeg = subprocess.Popen([
-                    "ffmpeg", "-v", "quiet", "-i", file_path,
-                    "-ar", str(SAMPLE_RATE), "-ac", "1", "-f", "mulaw", "-flush_packets", "1", "pipe:1"
-                ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        if is_8k_ulaw(file_path):
+            with open(file_path, 'rb') as f:
                 while True:
-                    chunk = ffmpeg.stdout.read(FRAME_SIZE)
+                    chunk = f.read(FRAME_SIZE)
                     if not chunk:
                         break
                     if len(chunk) < FRAME_SIZE:
                         chunk = chunk.ljust(FRAME_SIZE, b'\xff')
                     yielded = True
                     yield chunk
-                ffmpeg.stdout.close()
-                ffmpeg.wait()
+        else:
+            ffmpeg = subprocess.Popen([
+                "ffmpeg", "-v", "quiet", "-i", file_path,
+                "-ar", str(SAMPLE_RATE), "-ac", "1", "-f", "mulaw", "-flush_packets", "1", "pipe:1"
+            ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            while True:
+                chunk = ffmpeg.stdout.read(FRAME_SIZE)
+                if not chunk:
+                    break
+                if len(chunk) < FRAME_SIZE:
+                    chunk = chunk.ljust(FRAME_SIZE, b'\xff')
+                yielded = True
+                yield chunk
+            ffmpeg.stdout.close()
+            ffmpeg.wait()
     return yielded
 
 def send_broadcast_ipc(stream_id, broadcast_id):
@@ -230,7 +262,7 @@ def send_broadcast_ipc(stream_id, broadcast_id):
 def send_legacy_ipc(stream_id, broadcast, dispatch_message_id=None):
     broadcast_id = broadcast.get("id")
     msg_id = dispatch_message_id or broadcast_id
-    targets = resolve_group_targets(broadcast.get("groups"))
+    targets = broadcast_target_tokens(broadcast)
     if not targets:
         debug_log(f"fallback no_targets stream={stream_id} broadcast={broadcast_id} groups={broadcast.get('groups')}")
         return False
@@ -311,8 +343,8 @@ def main():
                 print(f"Message '{message_id}' was not found", file=sys.stderr)
                 sys.exit(1)
             broadcast_id, expires_rule = create_broadcast_from_template(cur, template, group_id, sender="sendmsgd")
-            expire_message_rule_broadcasts(cur, expires_rule, exclude_broadcast_ids=[broadcast_id])
-            expire_broadcasts_triggered_by_template(cur, message_id, exclude_broadcast_ids=[broadcast_id])
+            expire_message_rule_broadcasts(cur, expires_rule, exclude_broadcast_ids=[broadcast_id], trigger_groups=group_id)
+            expire_broadcasts_triggered_by_template(cur, message_id, exclude_broadcast_ids=[broadcast_id], trigger_groups=group_id)
         conn.commit()
     finally:
         conn.close()

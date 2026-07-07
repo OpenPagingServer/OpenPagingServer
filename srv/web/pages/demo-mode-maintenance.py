@@ -6,7 +6,7 @@ def _unauthorized_response():
 
 
 def handle_request():
-    if not demo_mode_maintenance_session_active():
+    if not demo_mode_active() or not demo_mode_maintenance_session_active():
         return _unauthorized_response()
 
     state = demo_mode_maintenance_state()

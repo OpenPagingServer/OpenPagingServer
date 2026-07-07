@@ -7,14 +7,12 @@ from pathlib import Path
 
 import pymysql
 from dotenv import load_dotenv
-from active_broadcast_store import (
-    expire_active_broadcasts_by_template_ids,
-    expire_active_broadcasts_triggered_by_template,
-    put_active_broadcast,
-)
+from active_broadcast_store import put_active_broadcast
 from audio_utils import generate_wav
 from broadcasts import (
     expand_broadcast_record_variables,
+    expire_broadcasts_triggered_by_template as shared_expire_broadcasts_triggered_by_template,
+    expire_message_rule_broadcasts as shared_expire_message_rule_broadcasts,
     message_expiration_trigger_targets,
     parse_message_expiration,
 )
@@ -219,41 +217,21 @@ def resolve_group_and_message(cursor, raw, sender=""):
     return "", message_id
 
 
-def expire_triggered_broadcasts(cursor, template_id, exclude_broadcast_ids=None):
-    columns = table_columns(cursor, "broadcasts")
-    if "delivery" not in columns:
-        return
-    expired_ids = expire_active_broadcasts_triggered_by_template(
+def expire_triggered_broadcasts(cursor, template_id, groups, exclude_broadcast_ids=None):
+    shared_expire_broadcasts_triggered_by_template(
+        cursor,
         template_id,
         exclude_broadcast_ids=exclude_broadcast_ids,
-    )
-    if not expired_ids:
-        return
-    placeholders = ", ".join(["%s"] * len(expired_ids))
-    cursor.execute(
-        f"UPDATE broadcasts SET delivery = %s WHERE id IN ({placeholders})",
-        tuple(["expired"] + expired_ids),
+        trigger_groups=groups,
     )
 
 
-def expire_message_rule_broadcasts(cursor, expires_rule, exclude_broadcast_ids=None):
-    template_ids = message_expiration_trigger_targets(expires_rule)["message_ids"]
-    if not template_ids:
-        return
-    excluded = exclude_broadcast_ids or []
-    expired_ids = expire_active_broadcasts_by_template_ids(
-        template_ids,
-        exclude_broadcast_ids=excluded,
-    )
-    if not expired_ids:
-        return
-    columns = table_columns(cursor, "broadcasts")
-    if "delivery" not in columns:
-        return
-    placeholders = ", ".join(["%s"] * len(expired_ids))
-    cursor.execute(
-        f"UPDATE broadcasts SET delivery = %s WHERE id IN ({placeholders})",
-        tuple(["expired"] + expired_ids),
+def expire_message_rule_broadcasts(cursor, expires_rule, groups, exclude_broadcast_ids=None):
+    shared_expire_message_rule_broadcasts(
+        cursor,
+        expires_rule,
+        exclude_broadcast_ids=exclude_broadcast_ids,
+        trigger_groups=groups,
     )
 
 
@@ -313,8 +291,8 @@ def _create_broadcast(arg, sender=""):
                     return
 
                 broadcast_id, expires_rule = insert_broadcast(cur, template, group_id, sender)
-                expire_message_rule_broadcasts(cur, expires_rule, exclude_broadcast_ids=[broadcast_id])
-                expire_triggered_broadcasts(cur, message_id, exclude_broadcast_ids=[broadcast_id])
+                expire_message_rule_broadcasts(cur, expires_rule, group_id, exclude_broadcast_ids=[broadcast_id])
+                expire_triggered_broadcasts(cur, message_id, group_id, exclude_broadcast_ids=[broadcast_id])
             conn.commit()
         finally:
             conn.close()

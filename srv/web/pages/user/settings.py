@@ -56,6 +56,24 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .general-row { display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; }
 .general-row h2 { margin-bottom:6px; }
 .general-row p { margin:0; color:#666; }
+.session-table { border:1px solid #E0E0E0; border-radius:12px; background:#FFF; overflow:hidden; }
+.session-head,.session-row { display:grid; grid-template-columns:minmax(120px,.8fr) minmax(120px,.85fr) minmax(130px,.8fr) minmax(260px,2fr) auto; gap:12px; align-items:start; padding:10px 14px; }
+.session-head { background:#F8F9FA; color:#5F6368; font-size:0.78em; font-weight:600; letter-spacing:.03em; text-transform:uppercase; }
+.session-row { border-top:1px solid #ECEFF1; }
+.session-cell { min-width:0; color:#202124; line-height:1.32; overflow-wrap:anywhere; font-size:0.92em; }
+.session-cell.muted { color:#5F6368; }
+.session-primary { min-width:0; }
+.session-title { font-weight:500; color:#202124; line-height:1.28; }
+.session-subtitle { margin-top:2px; color:#5F6368; font-size:0.86em; line-height:1.34; white-space:pre-wrap; }
+.session-actions { display:flex; gap:6px; justify-content:flex-end; flex-wrap:wrap; align-self:center; }
+.session-badge { display:inline-flex; align-items:center; padding:4px 8px; border-radius:999px; background:#E3F2FD; color:#1565C0; font-size:0.78em; font-weight:500; }
+.session-badge.current { background:#E8F5E9; color:#1B5E20; }
+.session-footer { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-top:12px; flex-wrap:wrap; }
+.session-limit-form { display:flex; align-items:center; gap:8px; flex-wrap:wrap; color:#666; }
+.session-limit-form select { border:1px solid #CCC; border-radius:6px; padding:8px 10px; font:inherit; background:#FFF; }
+.session-empty { padding:22px; text-align:center; color:#777; }
+.session-history-card { margin-top:18px; }
+@media(max-width:767px){ .session-head{display:none;} .session-row{grid-template-columns:1fr;gap:10px;} .session-cell[data-label]::before,.session-actions[data-label]::before{content:attr(data-label);display:block;font-size:0.76em;font-weight:600;letter-spacing:.03em;text-transform:uppercase;color:#777;margin-bottom:4px;} .session-actions{justify-content:flex-start;} }
 @media(min-width:768px){ #mobile-header{ display:none; } }
 @media(prefers-color-scheme:dark){
 body,html{ background-color:#121212; color:#E0E0E0; }
@@ -80,6 +98,14 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 .token-name { color:#EDEDED; }
 .token-modal { background:#1E1E1E; }
 .token-modal h3 { color:#BB86FC; }
+.session-table { background:#1E1E1E; border-color:#333; }
+.session-head { background:#202124; color:#BBB; }
+.session-row { border-top-color:#333; background:#1E1E1E; }
+.session-cell,.session-title { color:#EDEDED; }
+.session-cell.muted,.session-subtitle,.session-limit-form,.session-empty { color:#BBB; }
+.session-badge { background:#2A2433; color:#D9B8FF; }
+.session-badge.current { background:#12301A; color:#C8E6C9; }
+.session-limit-form select { background:#121212; border-color:#444; color:#E0E0E0; }
 }
 """
 
@@ -120,14 +146,36 @@ def fetch_api_tokens(user_id):
     )
 
 
+def session_history_limit_value(raw_value):
+    value = str(raw_value or "").strip().lower()
+    if value == "all":
+        return "all"
+    try:
+        number = int(value or "50")
+    except ValueError:
+        return 50
+    return number if number in {50, 100, 250, 500} else 50
+
+
+def session_limit_option_html(current, value, label):
+    selected = str(current) == str(value)
+    return f'<option value="{h(value)}"{" selected" if selected else ""}>{h(label)}</option>'
+
+
 def handle_request():
     user = require_user()
     if not isinstance(user, dict):
         return user
     ctx = legacy_user_context(user)
-    api_enabled = str(ctx["settings"].get("api_http_enable", "0")) == "1"
+    auth_provider = str((user or {}).get("auth_provider") or "local").strip().lower()
+    synced_user = auth_provider in {"ldap", "oidc", "saml"}
+    synced_password_change_url = identity_password_change_url(user, ctx["settings"])
+    forced_password_change = user_requires_password_change(user)
+    api_enabled = str(ctx["settings"].get("api_http_enable", "0")) == "1" and not forced_password_change
     requested_tab = str(request.args.get("tab") or "").strip()
-    active_tab = requested_tab if requested_tab in {"general", "api-keys"} else "general"
+    history_limit = session_history_limit_value(request.args.get("limit"))
+    open_password_modal = str(request.args.get("open") or "").strip().lower() == "password" or forced_password_change
+    active_tab = requested_tab if requested_tab in {"general", "api-keys", "sessions"} else "general"
     if active_tab == "api-keys" and not api_enabled:
         active_tab = "general"
     flash = ""
@@ -137,29 +185,39 @@ def handle_request():
     if request.method == "POST":
         action = str(request.form.get("action") or "").strip()
         active_tab = str(request.form.get("tab") or active_tab).strip()
-        if active_tab not in {"general", "api-keys"}:
+        if active_tab not in {"general", "api-keys", "sessions"}:
             active_tab = "general"
         if active_tab == "api-keys" and not api_enabled:
             active_tab = "general"
+        if active_tab == "sessions":
+            history_limit = session_history_limit_value(request.form.get("limit") or history_limit)
         if demo_mode_enabled() and action in {"change_password", "create_api_token"}:
             return demo_mode_iframe_html("user-settings")
         if action == "change_password":
-            current_password = str(request.form.get("current_password") or "")
-            new_password = str(request.form.get("new_password") or "")
-            confirm_password = str(request.form.get("confirm_password") or "")
-            row = query_one("SELECT password, salt FROM users WHERE id=%s LIMIT 1", (user.get("id"),)) or {}
-            current_hash = hashlib.sha256((current_password + str(row.get("salt") or "")).encode()).hexdigest()
-            if not current_password or not new_password:
-                error_html = '<div class="error">Current password and new password are required.</div>'
-            elif current_hash != str(row.get("password") or ""):
-                error_html = '<div class="error">Current password is incorrect.</div>'
-            elif new_password != confirm_password:
-                error_html = '<div class="error">Password confirmation does not match.</div>'
-            else:
-                password_hash, salt = hash_password_value(new_password)
-                execute("UPDATE users SET password=%s, salt=%s WHERE id=%s", (password_hash, salt, user.get("id")))
-                flash = '<div class="flash success">Password updated.</div>'
+            if synced_user:
+                error_html = '<div class="error">To change your password, go through your Single Sign-On provider. Contact your system administrator for more information.</div>'
                 active_tab = "general"
+                open_password_modal = False
+            else:
+                current_password = str(request.form.get("current_password") or "")
+                new_password = str(request.form.get("new_password") or "")
+                confirm_password = str(request.form.get("confirm_password") or "")
+                row = query_one("SELECT password, salt FROM users WHERE id=%s LIMIT 1", (user.get("id"),)) or {}
+                current_hash = hashlib.sha256((current_password + str(row.get("salt") or "")).encode()).hexdigest()
+                if not current_password or not new_password:
+                    error_html = '<div class="error">Current password and new password are required.</div>'
+                    open_password_modal = True
+                elif current_hash != str(row.get("password") or ""):
+                    error_html = '<div class="error">Current password is incorrect.</div>'
+                    open_password_modal = True
+                elif new_password != confirm_password:
+                    error_html = '<div class="error">Password confirmation does not match.</div>'
+                    open_password_modal = True
+                else:
+                    password_hash, salt = hash_password_value(new_password)
+                    execute("UPDATE users SET password=%s, salt=%s, require_password_change=0 WHERE id=%s", (password_hash, salt, user.get("id")))
+                    flash = '<div class="flash success">Password updated.</div>'
+                    active_tab = "general"
         elif action == "create_api_token" and api_enabled:
             active_tab = "api-keys"
             token_label = str(request.form.get("api_token_label") or "").strip()[:API_TOKEN_LABEL_LENGTH]
@@ -180,14 +238,46 @@ def handle_request():
                     return redirect("/user/settings?tab=api-keys")
                 except RuntimeError as exc:
                     error_html = f'<div class="error">{h(str(exc))}</div>'
+        elif action in {"revoke_session", "logout_current_session"}:
+            active_tab = "sessions"
+            target_session_id = str(request.form.get("session_id") or "").strip()
+            current_session_id = str(session.get("web_session_id") or "").strip()
+            if not target_session_id:
+                error_html = '<div class="error">Session not found.</div>'
+            elif not active_user_session_record(target_session_id, user.get("id")):
+                error_html = '<div class="error">Session not found.</div>'
+            else:
+                revoke_user_session_record(target_session_id, user.get("id"))
+                if action == "logout_current_session" or target_session_id == current_session_id:
+                    session.clear()
+                    return redirect("/index")
+                flash = '<div class="flash success">Session ended.</div>'
 
     tabs = ['<a class="subtab-link' + (" active" if active_tab == "general" else "") + '" href="/user/settings?tab=general">General</a>']
     if api_enabled:
         tabs.append('<a class="subtab-link' + (" active" if active_tab == "api-keys" else "") + '" href="/user/settings?tab=api-keys">API Keys</a>')
+    tabs.append('<a class="subtab-link' + (" active" if active_tab == "sessions" else "") + '" href="/user/settings?tab=sessions">Sessions</a>')
     tabs_html = '<div class="subtabs">' + "".join(tabs) + "</div>"
     demo_form_attr = ' onsubmit="openDemoModePopup(\'user-settings\'); return false;"' if demo_mode_enabled() else ""
 
-    general_panel = f"""
+    if synced_user:
+        password_body = (
+            f'<a class="btn-primary" href="{h(synced_password_change_url)}" target="_blank" rel="noopener noreferrer"><i class="fa-solid fa-arrow-up-right-from-square"></i> Change Password</a>'
+            if synced_password_change_url
+            else '<p class="muted">To change your password, go through your Single Sign-On provider. Contact your system administrator for more information.</p>'
+        )
+        general_panel = f"""
+    <div class="card">
+        <div class="general-row">
+            <div>
+                <h2>Password</h2>
+            </div>
+            {password_body}
+        </div>
+    </div>"""
+        open_password_modal = False
+    else:
+        general_panel = f"""
     <div class="card">
         <div class="general-row">
             <div>
@@ -196,7 +286,7 @@ def handle_request():
             <button class="btn-primary" type="button" onclick="openPasswordModal()"><i class="fa-solid fa-key"></i> Change Password</button>
         </div>
     </div>
-    <div id="passwordModal" class="token-modal-backdrop">
+    <div id="passwordModal" class="token-modal-backdrop{' active' if open_password_modal else ''}">
         <div class="token-modal">
             <h3>Change Password</h3>
             <form method="POST" action="/user/settings"{demo_form_attr}>
@@ -292,6 +382,107 @@ def handle_request():
     {create_modal}
     {reveal_modal}"""
 
+    active_sessions = fetch_active_user_sessions(user.get("id"))
+    current_session_id = str(session.get("web_session_id") or "").strip()
+    history_rows = fetch_login_history_rows(user.get("id"), history_limit)
+    history_total = login_history_total(user.get("id"))
+    history_shown = len(history_rows)
+    active_session_rows = ""
+    if active_sessions:
+        rendered_rows = []
+        for row in active_sessions:
+            row_session_id = str(row.get("session_id") or "").strip()
+            is_current = row_session_id == current_session_id
+            action_label = "Logout" if is_current else "End Session"
+            action_name = "logout_current_session" if is_current else "revoke_session"
+            badge = '<span class="session-badge current">Current Session</span>' if is_current else '<span class="session-badge">Active</span>'
+            rendered_rows.append(
+                f"""<div class="session-row">
+                    <div class="session-primary">
+                        <div class="session-title">{badge}</div>
+                        <div class="session-subtitle">{h(str(row.get("auth_provider") or "local").upper())} / {h(str(row.get("session_type") or "web").capitalize())}</div>
+                    </div>
+                    <div class="session-cell" data-label="Logged In">{h(format_datetime(row.get("created_at")))}</div>
+                    <div class="session-cell" data-label="IP Address">{h(row.get("ip") or "Unknown")}</div>
+                    <div class="session-cell" data-label="User Agent">{h(row.get("user_agent") or "Unknown")}</div>
+                    <div class="session-actions" data-label="Actions">
+                        <form method="POST" action="/user/settings">
+                            <input type="hidden" name="action" value="{action_name}">
+                            <input type="hidden" name="tab" value="sessions">
+                            <input type="hidden" name="limit" value="{h(history_limit)}">
+                            <input type="hidden" name="session_id" value="{h(row_session_id)}">
+                            <button class="btn-secondary" type="submit">{action_label}</button>
+                        </form>
+                    </div>
+                </div>"""
+            )
+        active_session_rows = f"""<div class="session-table">
+            <div class="session-head">
+                <div>Status</div>
+                <div>Logged In</div>
+                <div>IP Address</div>
+                <div>User Agent</div>
+                <div>Actions</div>
+            </div>
+            {''.join(rendered_rows)}
+        </div>"""
+    else:
+        active_session_rows = '<div class="session-empty">No active sessions found.</div>'
+
+    history_render_rows = ""
+    if history_rows:
+        rendered_rows = []
+        for row in history_rows:
+            rendered_rows.append(
+                f"""<div class="session-row">
+                    <div class="session-primary">
+                        <div class="session-title">{h(str(row.get("auth_provider") or "local").upper())}</div>
+                        <div class="session-subtitle">{h(str(row.get("session_type") or "web").capitalize())}</div>
+                    </div>
+                    <div class="session-cell" data-label="Logged In">{h(format_datetime(row.get("login_time")))}</div>
+                    <div class="session-cell" data-label="IP Address">{h(row.get("ip") or "Unknown")}</div>
+                    <div class="session-cell" data-label="User Agent">{h(row.get("user_agent") or "Unknown")}</div>
+                    <div class="session-cell muted" data-label="Session">{h(str(row.get("session_id") or "")[:18] + ('...' if len(str(row.get('session_id') or '')) > 18 else '')) or 'N/A'}</div>
+                </div>"""
+            )
+        history_render_rows = f"""<div class="session-table">
+            <div class="session-head">
+                <div>Provider</div>
+                <div>Logged In</div>
+                <div>IP Address</div>
+                <div>User Agent</div>
+                <div>Session</div>
+            </div>
+            {''.join(rendered_rows)}
+        </div>"""
+    else:
+        history_render_rows = '<div class="session-empty">No login history yet.</div>'
+
+    limit_options = "".join(
+        session_limit_option_html(history_limit, value, label)
+        for value, label in (("50", "50"), ("100", "100"), ("250", "250"), ("500", "500"), ("all", "All"))
+    )
+    sessions_panel = f"""
+    <div class="card">
+        <h2>Current Sessions</h2>
+        {active_session_rows}
+    </div>
+    <div class="card session-history-card">
+        <h2>Login History</h2>
+        {history_render_rows}
+        <div class="session-footer">
+            <div class="muted">Showing {h(history_shown)} of {h(history_total)}</div>
+            <form method="GET" action="/user/settings" class="session-limit-form">
+                <input type="hidden" name="tab" value="sessions">
+                <label for="session_history_limit">Showing</label>
+                <select id="session_history_limit" name="limit" onchange="this.form.submit()">
+                    {limit_options}
+                </select>
+                <span>of {h(history_total)}</span>
+            </form>
+        </div>
+    </div>"""
+
     script = """
 <script>
 function openPasswordModal() {
@@ -347,5 +538,6 @@ document.addEventListener('click', function(event) {
 {tabs_html}
 {general_panel if active_tab == "general" else ""}
 {api_panel if active_tab == "api-keys" and api_enabled else ""}
+{sessions_panel if active_tab == "sessions" else ""}
 {script}"""
     return legacy_page("User Settings", ctx, "user-settings", USER_SETTINGS_STYLE, content)

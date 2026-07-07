@@ -21,7 +21,7 @@ def handle_request():
         return user
 
     ctx = legacy_user_context(user)
-    if not ctx["is_admin"]:
+    if not can_create_messages(user):
         abort(403)
     if demo_mode_enabled():
         return demo_mode_iframe_html("messages")
@@ -58,8 +58,10 @@ def handle_request():
         }
 
         columns = table_columns("messages")
-        wanted = ["messageid", "name", "type", "shortmessage", "longmessage", "color", "icon", "audio", "expires", "priority", "vendor_specific"]
+        wanted = ["messageid", "name", "type", "shortmessage", "longmessage", "color", "icon", "audio", "expires", "priority", "vendor_specific", "owner_user_id"]
         insert = {k: values.get(k, "") for k in wanted if k in columns}
+        if "owner_user_id" in insert:
+            insert["owner_user_id"] = user.get("id")
 
         execute(
             f"INSERT INTO messages ({', '.join('`'+k+'`' for k in insert)}) VALUES ({', '.join(['%s'] * len(insert))})",
@@ -91,9 +93,9 @@ def handle_request():
                 {type_group}
             </div>
 
-            <div style="margin-top: 20px;">
+            <div class="form-actions">
                 <button type="submit" class="btn-primary">Continue</button>
-                <a href="/messages/" style="margin-left:10px; color:#777; text-decoration:none;">Cancel</a>
+                <a href="/messages/" style="color:#777; text-decoration:none;">Cancel</a>
             </div>
         </form>
     </div>"""
@@ -101,7 +103,10 @@ def handle_request():
 
     has_audio = selected_type in ("text+audio", "audio")
     has_text = selected_type in ("text+audio", "text")
-    expiration_messages = query_all("SELECT messageid, name FROM messages ORDER BY name ASC, messageid ASC")
+    expiration_messages = filter_message_rows_for_user(
+        user,
+        query_all("SELECT messageid, name FROM messages ORDER BY name ASC, messageid ASC"),
+    )
 
     visual_fields = ""
     if has_text:
@@ -135,7 +140,6 @@ def handle_request():
         transfer = audio_transfer_html(audio_files())
         audio_fields = f"""            <div class="form-group">
                 <label class="main-label">Audio</label>
-                <p class="help-text">Select audio files to include in this message. The files will play in the order listed in the selected column. You can click to select and use buttons, or drag and drop to move and reorder.</p>
                 {transfer}
             </div>
 """
@@ -172,12 +176,12 @@ def handle_request():
             </div>
 
 {vendor_specific_html}
-            <div style="margin-top: 20px;">
+            <div class="form-actions">
                 <button type="submit" class="btn-primary">Create Message</button>
-                <a href="/messages/" style="margin-left:10px; color:#777; text-decoration:none;">Cancel</a>
+                <a href="/messages/" style="color:#777; text-decoration:none;">Cancel</a>
             </div>
         </form>
     </div>
-{message_variable_guide_html() if has_text else ""}"""
+{message_variable_guide_html() if (has_text or has_audio) else ""}"""
 
     return legacy_page("New Message", ctx, "messages", MESSAGE_FORM_STYLE, content, MESSAGE_FORM_SCRIPT)

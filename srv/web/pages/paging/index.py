@@ -1,4 +1,5 @@
 from srv.web.app import *
+from group_features import fetch_group_rows
 
 PAGING_STYLE = r"""
 body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:300; background-color:#FFF; height:100%; }
@@ -37,9 +38,9 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .recipient-row.unavailable{ opacity:0.58; }
 .recipient-row.unavailable .md-checkbox-container{ cursor:not-allowed; }
 .recipient-row.unavailable .md-checkmark{ border-color:#BDBDBD; background:#F5F5F5; }
-.md-checkbox-container{ display:flex; align-items:center; position:relative; cursor:pointer; font-size:14px; font-weight:500; color:#555; user-select:none; width:100%; padding:5px 0; }
+.md-checkbox-container{ display:flex; align-items:center; position:relative; cursor:pointer; font-size:14px; font-weight:500; color:#555; user-select:none; width:100%; padding:5px 0; gap:12px; }
 .md-checkbox-container input{ position:absolute; opacity:0; cursor:pointer; height:0; width:0; }
-.md-checkmark{ position:relative; display:inline-block; flex:0 0 auto; height:20px; width:20px; background-color:#fff; border:2px solid #5f6368; border-radius:2px; margin-right:12px; transition:all 0.2s; }
+.md-checkmark{ position:relative; display:inline-block; flex:0 0 auto; height:20px; width:20px; background-color:#fff; border:2px solid #5f6368; border-radius:2px; transition:all 0.2s; }
 .md-checkbox-container:hover input ~ .md-checkmark{ border-color:#202124; }
 .md-checkbox-container input:checked ~ .md-checkmark{ background-color:#1976D2; border-color:#1976D2; }
 .md-checkmark:after{ content:""; position:absolute; display:none; left:6px; top:2px; width:4px; height:10px; border:solid white; border-width:0 2px 2px 0; transform:rotate(45deg); }
@@ -71,16 +72,17 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 #sidebar a.active,#sidebar a:hover{ background-color:#505050; }
 #content{ background-color:#121212; }
 .card{ border-color:#333; background-color:#1E1E1E; }
-.card h2{ color:#BB86FC; }
+.card h2{ color:#EDEDED; }
 .info-row{ border-bottom-color:#333; }
 .field label,.md-checkbox-container,.status,.helper{ color:#BBB; }
-.permission-title{ color:#BB86FC; }
+.permission-title{ color:#EDEDED; }
 .permission-message,.permission-details{ color:#BBB; }
 .tips-card p{ color:#BBB; }
 .recipient-note{ color:#9E9E9E; }
 .recipient-row.unavailable .md-checkmark{ border-color:#555; background:#2A2A2A; }
 .field select{ background:#121212; color:#E0E0E0; border-color:#444; }
 .md-checkmark{ border-color:#9AA0A6; background-color:#1E1E1E; }
+.md-checkbox-container:hover input ~ .md-checkmark{ border-color:#E8EAED; }
 .md-checkbox-container input:checked ~ .md-checkmark{ background-color:#8AB4F8; border-color:#8AB4F8; }
 .md-checkmark:after{ border-color:#1E1E1E; }
 .meter{ background:#333; }
@@ -107,6 +109,7 @@ let processor = null;
 let source = null;
 let stream = null;
 let socket = null;
+let processorSink = null;
 let paging = false;
 let sourceSampleRate = 48000;
 let resampleCarry = [];
@@ -137,7 +140,10 @@ function showPagingControls() {
   pageTitle.style.display = 'block';
 }
 function selectedGroupId() {
-  if (pageAll.checked) return '0';
+  if (pageAll.checked) {
+    const allGroups = groupCheckboxes.map(cb => cb.value).join('.');
+    return allGroups || '0';
+  }
   return groupCheckboxes.filter(cb => cb.checked).map(cb => cb.value).join('.');
 }
 function setControlsLocked(locked) {
@@ -221,9 +227,14 @@ async function startPaging() {
     stream = await navigator.mediaDevices.getUserMedia(constraints);
     await loadMicrophones();
     audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioContext.state === 'suspended') {
+      await audioContext.resume();
+    }
     sourceSampleRate = audioContext.sampleRate;
     source = audioContext.createMediaStreamSource(stream);
     processor = audioContext.createScriptProcessor(2048, 1, 1);
+    processorSink = audioContext.createGain();
+    processorSink.gain.value = 0;
     socket = new WebSocket(websocketUrl(groupId));
     socket.binaryType = 'arraybuffer';
     socket.onmessage = event => {
@@ -235,9 +246,17 @@ async function startPaging() {
           micButton.disabled = false;
           micButton.setAttribute('aria-label', 'End page');
           setControlsLocked(true);
-          setStatus('Paging is live. Press the microphone again to end.', 'live');
+          setStatus(
+            message.pretone
+              ? 'Playing pre-page tone... Paging is live. Press the microphone again to end.'
+              : 'Paging is live. Press the microphone again to end.',
+            'live'
+          );
           source.connect(processor);
-          processor.connect(audioContext.destination);
+          processor.connect(processorSink);
+          processorSink.connect(audioContext.destination);
+        } else if (message.type === 'pretone_done') {
+          setStatus('Paging is live. Press the microphone again to end.', 'live');
         } else if (message.type === 'error') {
           setStatus(message.message || 'Unable to start live page.', 'error');
           stopPaging();
@@ -301,6 +320,7 @@ function stopPaging() {
   meterBar.style.width = '0%';
   setControlsLocked(false);
   if (processor) processor.disconnect();
+  if (processorSink) processorSink.disconnect();
   if (source) source.disconnect();
   if (audioContext) audioContext.close();
   if (stream) stream.getTracks().forEach(track => track.stop());
@@ -310,6 +330,7 @@ function stopPaging() {
   audioContext = null;
   stream = null;
   socket = null;
+  processorSink = null;
   resampleCarry = [];
   frameCarry = new Uint8Array(0);
 }
@@ -355,7 +376,13 @@ def handle_request():
     ctx = legacy_user_context(user)
     data = ctx["settings"]
     username = user.get("username") or session.get("username") or "User"
-    groups = query_all("SELECT id, name, members FROM `groups` ORDER BY name ASC")
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            groups = fetch_group_rows(cur)
+    finally:
+        conn.close()
+    groups = filter_group_rows_for_user(user, groups)
 
     endpoint_data = endpoint_ipc("LIST_ENDPOINTS")
     endpoint_error = None if endpoint_data.get("ok", True) else endpoint_data.get("error") or "Endpoint manager returned an error."
@@ -367,11 +394,12 @@ def handle_request():
     if groups:
         group_rows = []
         for group in groups:
-            online = sum(
-                1
-                for member in group_member_tokens(group.get("members"))
-                if group_member_available(member, endpoint_availability)
-            )
+            recipients = list(group_member_tokens(group.get("members")))
+            if "paging" in set(group.get("monitor_categories") or []):
+                for member in group_member_tokens(group.get("monitor_members")):
+                    if member not in recipients:
+                        recipients.append(member)
+            online = sum(1 for member in recipients if group_member_available(member, endpoint_availability))
             has_online = endpoint_error is not None or online > 0
             row_cls = "" if has_online else " unavailable"
             disabled = "" if has_online else " disabled"

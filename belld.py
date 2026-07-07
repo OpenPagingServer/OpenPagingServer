@@ -16,6 +16,12 @@ from dotenv import load_dotenv
 from endpoints import ULAW_TO_LINEAR_TABLE, audio_frames, connect_endpoint_ipc, mix_ulaw_frames
 
 from active_broadcast_store import RUNTIME_DIR, mark_active_broadcast_delivery, put_active_broadcast
+from group_features import (
+    fetch_group_rows,
+    filtered_bell_group_ids,
+    monitor_targets_for_rows,
+    regular_group_targets,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -564,12 +570,33 @@ def mark_events_dispatched(schedule_id, day_value, event_ids, broadcast_id):
         conn.close()
 
 
+def bell_group_targets(groups_value):
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            group_ids = filtered_bell_group_ids(cur, groups_value)
+            if not group_ids:
+                return "", []
+            rows = fetch_group_rows(cur, group_ids)
+    finally:
+        conn.close()
+    by_id = {row["id"]: row for row in rows if row.get("id")}
+    ordered_rows = [by_id[group_id] for group_id in group_ids if group_id in by_id]
+    targets = []
+    seen = set()
+    for token in regular_group_targets(ordered_rows) + monitor_targets_for_rows(ordered_rows, "bells"):
+        if token not in seen:
+            seen.add(token)
+            targets.append(token)
+    return ".".join(group_ids), targets
+
+
 def fire_event(event, day_value):
     broadcast_id = uuid.uuid4().hex
     issued = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     schedule_name = event.get("schedule_name") or "Bell Schedule"
     list_name = event.get("list_name") or "Bell List"
-    group_ids = str(event.get("group_ids") or "").strip()
+    group_ids, explicit_targets = bell_group_targets(event.get("group_ids"))
     audio = str(event.get("audio") or "").strip()
     if not group_ids or not audio:
         log(f"skip event={event.get('event_id')} group_ids={group_ids!r} audio={audio!r}")
@@ -594,6 +621,8 @@ def fire_event(event, day_value):
         "sender": "belld",
         "priority": "Normal",
         "delivery": "pending",
+        "explicit_targets": explicit_targets,
+        "runtime_kind": "bell",
     }
     mark_events_dispatched(
         int(event.get("schedule_id") or 0),
@@ -611,7 +640,7 @@ def fire_event_cluster(cluster):
         fire_event(events[0], cluster["start_at"].date())
         return
     first_event = events[0]
-    group_ids = str(first_event.get("group_ids") or "").strip()
+    group_ids, explicit_targets = bell_group_targets(first_event.get("group_ids"))
     if not group_ids:
         log(f"skip cluster schedule={cluster['schedule_id']} missing groups")
         return
@@ -646,6 +675,8 @@ def fire_event_cluster(cluster):
         "sender": "belld",
         "priority": "Normal",
         "delivery": "pending",
+        "explicit_targets": explicit_targets,
+        "runtime_kind": "bell",
     }
     mark_events_dispatched(
         cluster["schedule_id"],

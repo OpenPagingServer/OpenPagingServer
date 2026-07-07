@@ -7,6 +7,8 @@ def handle_request():
     if not isinstance(user, dict):
         return user
     ensure_bell_schema()
+    if not can_create_bell_schedules(user):
+        abort(403)
     if demo_mode_enabled():
         if request.method == "POST":
             return bells_demo_return()

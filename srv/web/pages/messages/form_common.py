@@ -1,4 +1,5 @@
 import inspect
+import json
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -9,7 +10,8 @@ from broadcasts import (
     serialize_message_expiration,
     serialize_vendor_specific,
 )
-from srv.web.app import ASSET_DIR, asset_filename, asset_path, h
+from srv.web.app import ASSET_DIR, asset_filename, asset_inline_image_data_url, asset_path, current_user, h, user_can_access_asset, visible_asset_paths_for_user
+from tts import available_tts_voices, decode_tts_token, tts_preview_text, tts_voice_id_for_payload
 
 
 MESSAGE_ICON_MAX_DIMENSION = 1080
@@ -31,20 +33,23 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 #mobile-header .hamburger{ font-size:1.5em; cursor:pointer; }
 #overlay{ display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.3); z-index:900; }
 #overlay.active{ display:block; }
-#content{ margin-left:220px; padding:24px; height:100vh; overflow-y:auto; width:calc(100% - 220px); box-sizing:border-box; transition:margin-left 0s; }
+#content{ margin-left:220px; padding:20px; height:100vh; overflow-y:auto; width:calc(100% - 220px); box-sizing:border-box; transition:margin-left 0s; }
 @media(max-width:767px){ #content{ margin-left:0; width:100%; padding-top:70px; } }
 #content h1{ font-weight:400; }
-.info-card{ background:#FFF; padding:16px; border:1px solid #EEE; border-radius:8px; box-shadow:0 2px 4px rgba(0,0,0,0.1); margin-bottom:16px; }
+.info-card{ background:#FFF; padding:14px; border:1px solid #EEE; border-radius:8px; box-shadow:0 2px 4px rgba(0,0,0,0.1); margin-bottom:14px; }
 @media(min-width:768px){ #mobile-header{ display:none; } }
-.header-actions { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-.btn-primary { background:#1976D2; color:#FFF; border:none; padding:10px 16px; border-radius:6px; font-size:14px; cursor:pointer; text-decoration:none; display:inline-flex; align-items:center; }
+.header-actions { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+.btn-primary { background:#1976D2; color:#FFF; border:none; padding:10px 16px; border-radius:6px; font-size:14px; cursor:pointer; text-decoration:none; display:inline-flex; align-items:center; box-sizing:border-box; }
 .btn-primary:hover { background:#1565C0; }
-.form-group { margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid #F0F0F0; }
+.btn-primary:disabled,.btn-primary:disabled:hover { background:#DADCE0; color:#5F6368; cursor:not-allowed; }
+.form-group { margin-bottom: 18px; padding-bottom: 12px; border-bottom: 1px solid #F0F0F0; }
 .form-group:last-child { border-bottom: none; margin-bottom: 0; padding-bottom: 0; }
 .form-group label.main-label { display: block; margin-bottom: 4px; font-weight: 500; font-size: 1.1em; }
 .form-control { width: 100%; padding: 10px; border: 1px solid #DDD; border-radius: 4px; box-sizing: border-box; background: #FFF; color: #000; font-family: inherit; }
 .form-control.textarea-long { min-height: 140px; resize: vertical; white-space: pre-wrap; }
-.help-text { font-size: 0.9em; color: #666; margin-top: 0; margin-bottom: 12px; line-height: 1.4; }
+.help-text { font-size: 0.9em; color: #666; margin-top: 0; margin-bottom: 8px; line-height: 1.4; }
+.form-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px;}
+.checkbox-row{display:flex;flex-direction:column;gap:4px;}
 .radio-group label { display: block; margin-bottom: 8px; font-weight: normal; cursor: pointer; }
 .radio-group input[type="radio"] { margin-right: 8px; }
 .md-radio-group{display:flex;flex-direction:column;gap:10px;}
@@ -58,7 +63,7 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .md-radio-text{display:flex;align-items:center;min-width:0;}
 .color-picker-container { display: flex; align-items: center; gap: 12px; }
 .color-picker-input { height: 42px; width: 42px; padding: 0; border: 1px solid #DDD; border-radius: 4px; cursor: pointer; background: none; }
-.transfer-list-container { display: flex; gap: 15px; align-items: stretch; height: 300px; margin-top: 10px; }
+.transfer-list-container { display: flex; gap: 12px; align-items: stretch; height: 300px; margin-top: 8px; }
 .tl-panel { flex: 1; display: flex; flex-direction: column; border: 1px solid #DDD; border-radius: 4px; background: #FFF; overflow: hidden; }
 .tl-panel input.tl-search { border: none; border-bottom: 1px solid #DDD; border-radius: 0; padding: 10px; font-family: inherit; width: 100%; box-sizing: border-box; outline: none; }
 .tl-header { background: #F5F5F5; padding: 8px 10px; font-weight: 500; border-bottom: 1px solid #DDD; font-size: 0.9em; }
@@ -67,8 +72,44 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .tl-item:hover { background: #F0F0F0; }
 .tl-item.selected { background: #1976D2; color: #FFF; border-color: #1565C0; }
 .tl-item.dragging { opacity: 0.5; }
-.tl-controls { display: flex; flex-direction: column; justify-content: center; gap: 10px; }
+.tl-controls { display: flex; flex-direction: column; justify-content: center; gap: 8px; }
 .tl-controls .btn-primary { width: 40px; height: 40px; justify-content: center; padding: 0; font-size: 16px; }
+.audio-block-header{display:flex;align-items:center;justify-content:flex-start;gap:12px;}
+.audio-block-header-actions{display:flex;align-items:center;gap:6px;flex:0 0 auto;}
+.audio-block-header-button{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border:none;border-radius:4px;background:transparent;color:#5F6368;cursor:pointer;font:inherit;padding:0;}
+.audio-block-header-button:hover{background:transparent;color:#202124;}
+.audio-block-header-button:disabled{opacity:0.55;cursor:not-allowed;}
+.audio-block-list{display:block;}
+.audio-block-empty{display:none;}
+.audio-block-item{display:flex;align-items:center;gap:10px;padding:8px 10px;margin-bottom:4px;background:#FAFAFA;border:1px solid #EEE;border-radius:3px;}
+.audio-block-item.dragging{opacity:0.5;}
+.audio-block-grip{width:18px;display:flex;align-items:center;justify-content:center;color:#777;cursor:grab;flex:0 0 auto;}
+.audio-block-content{min-width:0;flex:1;}
+.audio-block-label{display:block;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:0.95em;}
+.audio-block-actions{display:flex;align-items:center;gap:4px;flex:0 0 auto;}
+.audio-block-secondary,.audio-block-delete{border:1px solid #DADCE0;background:#FFF;color:#374151;border-radius:6px;padding:8px 11px;cursor:pointer;font:inherit;}
+.audio-block-secondary:hover,.audio-block-delete:hover{background:#F9FAFB;}
+.audio-block-secondary:disabled{opacity:0.55;cursor:not-allowed;}
+.audio-block-row-button{border:none;background:transparent;color:#666;border-radius:4px;padding:4px 6px;cursor:pointer;font:inherit;line-height:1;}
+.audio-block-row-button:hover{background:#F0F0F0;color:#202124;}
+.audio-block-row-button:disabled{opacity:0.45;cursor:not-allowed;background:transparent;color:#999;}
+.audio-block-delete{color:#B3261E;}
+.audio-block-modal-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:1450;}
+.audio-block-modal-backdrop.open{display:block;}
+.audio-block-modal{display:none;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:min(760px,calc(100vw - 32px));max-height:calc(100vh - 40px);overflow:hidden;background:#FFF;border-radius:18px;box-shadow:0 18px 50px rgba(0,0,0,0.28);z-index:1500;}
+.audio-block-modal.open{display:flex;flex-direction:column;}
+.audio-block-modal-header{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 20px;border-bottom:1px solid #EEE;}
+.audio-block-modal-header h2{margin:0;font-size:1.2em;font-weight:500;}
+.audio-block-modal-close{border:none;background:transparent;color:#666;font-size:1.4em;cursor:pointer;line-height:1;padding:4px 6px;}
+.audio-block-modal-close:hover{background:transparent;color:#111;}
+.audio-block-modal-body{padding:18px 20px 20px;overflow-y:auto;}
+.audio-block-modal-actions{display:flex;justify-content:flex-end;gap:10px;padding:16px 20px;border-top:1px solid #EEE;flex-wrap:wrap;}
+.audio-block-modal-actions .btn-primary:disabled,.audio-block-modal-actions .btn-primary:disabled:hover{border:none;background:#DADCE0;color:#5F6368;opacity:1;}
+.audio-block-status{display:none;margin-top:12px;padding:11px 12px;border-radius:10px;border:1px solid #DDE6F1;background:#FAFCFF;color:#1F2937;font-size:0.92em;}
+.audio-block-status.open{display:block;}
+.audio-block-status.error{border-color:#F6AEA9;background:#FCE8E6;color:#A50E0E;}
+.audio-block-status.success{border-color:#CEEAD6;background:#E6F4EA;color:#137333;}
+.audio-tts-preview-player{width:100%;margin-top:14px;}
 .error { background:#FFEBEE; border:1px solid #EF9A9A; color:#B71C1C; padding:10px; border-radius:6px; margin-bottom:12px; }
 .vendor-specific-card { border:1px solid #E0E0E0; border-radius:8px; background:#FAFAFA; padding:14px; }
 .vendor-specific-card h2 { font-size:1.15em; font-weight:500; margin:0 0 12px; }
@@ -81,18 +122,19 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .vendor-module-body { border-top:1px solid #EEE; padding:14px; }
 .message-variable-wrap { position: relative; }
 .message-variable-wrap .form-control { padding-right: 42px; }
-.message-variable-badge { position: absolute; top: 12px; right: 10px; width: 24px; height: 24px; border: none; border-radius: 0; background: transparent; color: rgba(25, 118, 210, 0.78); font-size: 0.95em; font-weight: 400; font-family: "Times New Roman", serif; cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0; }
+.message-variable-badge { position: absolute; top: 12px; right: 10px; width: 24px; height: 24px; border: none; border-radius: 0; background: transparent; color: rgba(25, 118, 210, 0.78); font-size: 0.95em; font-weight: 400; font-family: "Times New Roman", serif; cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0; z-index:2; pointer-events:auto; }
 .message-variable-badge:hover { background: transparent; color: rgba(25, 118, 210, 1); }
 .message-variable-wrap-short .message-variable-badge { top: 50%; right: 10px; transform: translateY(-50%); font-weight: 700; }
 .message-variable-wrap-long .message-variable-badge { top: auto; bottom: 10px; right: 10px; transform: none; font-weight: 700; }
-.message-variable-modal-backdrop { display: none; position: fixed; inset: 0; background: rgba(0, 0, 0, 0.45); z-index: 1300; }
+.message-variable-modal-backdrop { display: none; position: fixed; inset: 0; background: rgba(0, 0, 0, 0.45); z-index: 1600; }
 .message-variable-modal-backdrop.open { display: block; }
-.message-variable-modal { display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: min(760px, calc(100vw - 32px)); max-height: calc(100vh - 40px); overflow-y: auto; background: #FFF; border-radius: 14px; box-shadow: 0 18px 50px rgba(0, 0, 0, 0.28); z-index: 1400; font-family: "Tahoma", sans-serif; }
+.message-variable-modal { display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: min(760px, calc(100vw - 32px)); max-height: calc(100vh - 40px); overflow-y: auto; background: #FFF; border-radius: 14px; box-shadow: 0 18px 50px rgba(0, 0, 0, 0.28); z-index: 1650; font-family: "Tahoma", sans-serif; }
 .message-variable-modal.open { display: block; }
 .message-variable-modal-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 20px; border-bottom: 1px solid #EEE; }
 .message-variable-modal-header h2 { margin: 0; font-size: 1.2em; font-weight: 500; }
 .message-variable-modal-header-actions { display: flex; align-items: center; gap: 8px; }
 .message-variable-modal-close, .message-variable-modal-back { border: none; background: transparent; color: #666; font-size: 1.4em; cursor: pointer; line-height: 1; padding: 4px 6px; }
+.message-variable-modal-close:hover, .message-variable-modal-back:hover { background: transparent; color: #111; }
 .message-variable-modal-back { display: none; font-size: 0.95em; font-weight: 600; }
 .message-variable-modal-back.visible { display: inline-flex; align-items: center; }
 .message-variable-modal-body { padding: 20px; }
@@ -111,7 +153,7 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .message-variable-option strong { display: block; font-size: 1em; font-weight: 600; margin-bottom: 4px; color: #0F3F77; font-family: "Tahoma", sans-serif; }
 .message-variable-option span { display: block; font-size: 0.92em; color: #5B6470; font-family: "Tahoma", sans-serif; }
 .message-variable-preview { display: block; margin-top: 8px; font-family: "Consolas", monospace; font-size: 0.88em; color: #334155; }
-.message-variable-actions { display: flex; gap: 10px; margin-top: 20px; flex-wrap: wrap; }
+.message-variable-actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
 .message-variable-secondary { background: #F3F4F6; color: #374151; border: 1px solid #D1D5DB; border-radius: 8px; padding: 9px 12px; cursor: pointer; }
 .message-variable-secondary:hover { background: #E5E7EB; }
 .message-variable-primary { background: #1976D2; color: #FFF; border: none; border-radius: 8px; padding: 9px 14px; cursor: pointer; }
@@ -150,7 +192,7 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .message-expiration-any-locked .md-checkmark{background:#d7dde3;border-color:#b0bec5;}
 .message-expiration-any-locked .md-checkmark:after{display:block;border-color:#5f6368;}
 .message-expiration-any-locked .message-expiration-text{color:#9aa0a6;}
-.message-icon-selection{display:flex;flex-direction:column;align-items:flex-start;gap:16px;}
+.message-icon-selection{display:flex;flex-direction:column;align-items:flex-start;gap:12px;}
 .message-icon-summary{display:flex;align-items:center;gap:14px;min-width:0;width:100%;flex:0 0 auto;}
 .message-icon-preview{width:72px;height:72px;border-radius:14px;border:1px solid #E0E0E0;background:#F8FAFD;display:flex;align-items:center;justify-content:center;overflow:hidden;color:#5F6368;font-size:1.4em;flex:0 0 auto;}
 .message-icon-preview img{width:100%;height:100%;object-fit:cover;}
@@ -170,14 +212,14 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .message-icon-picker-header{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 20px;border-bottom:1px solid #EEE;}
 .message-icon-picker-header h2{margin:0;font-size:1.2em;font-weight:500;}
 .message-icon-picker-close{border:none;background:transparent;color:#666;font-size:1.4em;cursor:pointer;line-height:1;padding:4px 6px;}
-.message-icon-picker-close:hover{color:#111;}
+.message-icon-picker-close:hover{background:transparent;color:#111;}
 .message-icon-picker-body{padding:18px 20px 20px;overflow-y:auto;}
 .message-icon-picker-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:14px;}
-.message-icon-asset-card{border:1px solid #DADCE0;border-radius:16px;background:#FFF;padding:0;cursor:pointer;text-align:left;color:inherit;overflow:hidden;box-shadow:0 1px 2px rgba(60,64,67,.08);}
-.message-icon-asset-card:hover{border-color:#B6C8E1;box-shadow:0 4px 10px rgba(60,64,67,.12);}
+.message-icon-asset-card{border:1px solid #DADCE0;border-radius:16px;background:#FFF;padding:0;cursor:pointer;text-align:left;color:inherit;overflow:hidden;box-shadow:0 1px 2px rgba(60,64,67,.08);display:block;width:100%;appearance:none;-webkit-appearance:none;}
+.message-icon-asset-card:hover{background:#FFF;border-color:#B6C8E1;box-shadow:0 4px 10px rgba(60,64,67,.12);}
 .message-icon-asset-card.selected{border-color:#1976D2;box-shadow:0 0 0 2px rgba(25,118,210,0.18);}
 .message-icon-asset-card.unsupported{opacity:0.48;}
-.message-icon-asset-card.unsupported:hover{border-color:#DADCE0;box-shadow:0 1px 2px rgba(60,64,67,.08);}
+.message-icon-asset-card.unsupported:hover{background:#FFF;border-color:#DADCE0;box-shadow:0 1px 2px rgba(60,64,67,.08);}
 .message-icon-asset-preview{height:132px;background:#F1F3F4;display:flex;align-items:center;justify-content:center;overflow:hidden;color:#5F6368;font-size:2em;}
 .message-icon-asset-preview img{width:100%;height:100%;object-fit:cover;}
 .message-icon-asset-info{padding:12px 14px 14px;}
@@ -205,10 +247,11 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
     .md-radio-option{color:#E0E0E0;}
     .md-radio-indicator{border-color:#9AA0A6;}
     .md-radio-option:hover .md-radio-indicator{border-color:#E8EAED;}
-    .md-radio-option input:checked + .md-radio-indicator{border-color:#8AB4F8;}
-    .md-radio-indicator:after{background:#8AB4F8;}
-    .btn-primary { background:#BB86FC; color:#000; }
-    .btn-primary:hover { background:#A370F7; }
+    .md-radio-option input:checked + .md-radio-indicator{border-color:#BB86FC;}
+    .md-radio-indicator:after{background:#BB86FC;}
+    .btn-primary { background:#BB86FC; color:#121212; box-sizing:border-box; }
+    .btn-primary:hover { background:#A874E8; }
+    .btn-primary:disabled,.btn-primary:disabled:hover { background:#3A3A3A; color:#9AA0A6; }
     .form-group { border-bottom: 1px solid #333; }
     .help-text { color: #AAA; }
     .color-picker-input { border: 1px solid #555; }
@@ -217,17 +260,34 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
     .tl-panel input.tl-search { background: #222; border-bottom-color: #444; color: #FFF; }
     .tl-item { background: #2A2A2A; border-color: #333; color: #E0E0E0; }
     .tl-item:hover { background: #333; }
-    .tl-item.selected { background: #BB86FC; color: #000; border-color: #A370F7; }
+    .tl-item.selected { background: #3B2A4D; color: #F6ECFF; border-color: #6F4F92; }
+    .audio-block-item,.audio-block-modal{background:#1E1E1E;border-color:#333;}
+    .audio-block-grip{color:#BBB;}
+    .audio-block-label{color:#E8EAED;}
+    .audio-block-secondary,.audio-block-delete{background:#252525;border-color:#444;color:#E5E7EB;}
+    .audio-block-secondary:hover,.audio-block-delete:hover{background:#303030;border-color:#555;}
+    .audio-block-header-button{background:transparent;color:#BBB;}
+    .audio-block-header-button:hover{background:transparent;color:#FFF;}
+    .audio-block-row-button{color:#BBB;}
+    .audio-block-row-button:hover{background:#333;color:#FFF;}
+    .audio-block-modal-header,.audio-block-modal-actions{border-color:#333;}
+    .audio-block-modal-close{color:#AAA;}
+    .audio-block-modal-close:hover{background:transparent;color:#FFF;}
+    .audio-block-modal-actions .btn-primary:disabled,.audio-block-modal-actions .btn-primary:disabled:hover{border:none;background:#3A3A3A;color:#9AA0A6;opacity:1;}
+    .audio-block-status{background:#1A1A1A;border-color:#333;color:#E0E0E0;}
+    .audio-block-status.error{background:#3B1515;border-color:#6D2A2A;color:#FFCDD2;}
+    .audio-block-status.success{background:#14351A;border-color:#2E7D32;color:#C8E6C9;}
     .error { background:#3B1515; border-color:#6D2A2A; color:#FFCDD2; }
     .vendor-specific-card { background:#202020; border-color:#333; }
     .vendor-module { background:#252525; border-color:#3A3A3A; }
     .vendor-module-body { border-top-color:#333; }
     .vendor-module summary:after { color:#AAA; }
-    .message-variable-badge { background: transparent; color: rgba(138, 180, 248, 0.82); }
-    .message-variable-badge:hover { background: transparent; color: rgba(138, 180, 248, 1); }
+    .message-variable-badge { background: transparent; color: rgba(187, 134, 252, 0.82); }
+    .message-variable-badge:hover { background: transparent; color: rgba(187, 134, 252, 1); }
     .message-variable-modal { background: #1E1E1E; }
     .message-variable-modal-header { border-bottom-color: #333; }
     .message-variable-modal-close, .message-variable-modal-back { color: #AAA; }
+    .message-variable-modal-close:hover, .message-variable-modal-back:hover { background: transparent; color: #FFF; }
     .message-variable-choice { background: #252525; border-color: #3A3A3A; color: #E5E7EB; }
     .message-variable-choice:hover { background: #2E2E2E; border-color: #4A4A4A; }
     .message-variable-row .hint { color: #AAA; }
@@ -238,14 +298,14 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
     .message-variable-preview { color: #AFC7E8; }
     .message-variable-secondary { background: #303030; border-color: #444; color: #E5E7EB; }
     .message-variable-secondary:hover { background: #3A3A3A; }
-    .message-variable-primary { background: #8AB4F8; color: #121212; }
-    .message-variable-primary:hover { background: #9CC0FA; }
+    .message-variable-primary { background: #BB86FC; color: #121212; }
+    .message-variable-primary:hover { background: #A874E8; }
     .message-variable-status { color: #C7C7C7; }
     .message-variable-test-result { background: #1A1A1A; border-color: #333; color: #E0E0E0; }
     .md-checkbox-container{color:#BBB;}
     .md-checkmark{border-color:#9AA0A6;background:#1E1E1E;}
     .md-checkbox-container:hover input ~ .md-checkmark{border-color:#E8EAED;}
-    .md-checkbox-container input:checked ~ .md-checkmark{background:#8AB4F8;border-color:#8AB4F8;}
+    .md-checkbox-container input:checked ~ .md-checkmark{background:#BB86FC;border-color:#BB86FC;}
     .md-checkmark:after{border-color:#1E1E1E;}
     .md-checkbox-container input:disabled ~ .md-checkmark{border-color:#5F6368;background:#3C4043;}
     .message-expiration-title{color:#E5E7EB;}
@@ -262,13 +322,15 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
     .message-icon-picker-modal{background:#1E1E1E;}
     .message-icon-picker-header{border-bottom-color:#333;}
     .message-icon-picker-close{color:#AAA;}
+    .message-icon-picker-close:hover{background:transparent;color:#FFF;}
     .message-icon-asset-card{background:#252525;border-color:#3A3A3A;box-shadow:none;}
-    .message-icon-asset-card:hover{border-color:#4A4A4A;box-shadow:none;}
-    .message-icon-asset-card.selected{border-color:#8AB4F8;box-shadow:0 0 0 2px rgba(138,180,248,0.18);}
+    .message-icon-asset-card:hover{background:#252525;border-color:#4A4A4A;box-shadow:none;}
+    .message-icon-asset-card.selected{border-color:#BB86FC;box-shadow:0 0 0 2px rgba(187,134,252,0.22);}
     .message-icon-asset-preview{background:#2A2A2A;color:#BBB;}
     .message-icon-asset-meta{color:#AAA;}
-    .message-icon-asset-status{color:#8AB4F8;}
+    .message-icon-asset-status{color:#BB86FC;}
     .message-icon-asset-card.unsupported .message-icon-asset-status{color:#EF9A9A;}
+    .message-icon-asset-card.unsupported:hover{background:#252525;border-color:#3A3A3A;box-shadow:none;}
     .message-icon-picker-empty{background:#202020;border-color:#333;color:#BBB;}
 }
 """
@@ -511,6 +573,355 @@ function getDragAfterElement(container, y) {
         return closest;
     }, { offset: Number.NEGATIVE_INFINITY }).element;
 }
+let draggedAudioBlock = null;
+let activeAudioTtsItem = null;
+function escapeHtml(value) {
+    return String(value == null ? '' : value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+function audioTtsVoiceData() {
+    const element = document.getElementById('audioTtsVoiceMap');
+    if (!element) return {};
+    try {
+        return JSON.parse(element.textContent || '{}');
+    } catch (_error) {
+        return {};
+    }
+}
+function summarizeAudioBlockText(value, limit) {
+    const maxLength = Number(limit || 120);
+    const text = String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
+    if (text.length <= maxLength) return text;
+    return text.slice(0, Math.max(0, maxLength - 3)).trimEnd() + '...';
+}
+function audioTtsVoiceName(voice, fallbackLabel) {
+    const engine = String((voice && voice.engine) || '').trim().toLowerCase();
+    const rawLabel = String((voice && (voice.display_name || voice.voice_label || voice.voice)) || fallbackLabel || 'Voice').trim();
+    if (engine === 'google' && rawLabel && !/^google\b/i.test(rawLabel)) return 'Google ' + rawLabel;
+    return rawLabel || 'Voice';
+}
+function audioTtsSelectLabel(voice, key) {
+    const engine = String((voice && voice.engine) || '').trim().toLowerCase();
+    const prefix = engine === 'google' ? 'Cloud: ' : 'Local: ';
+    return prefix + audioTtsVoiceName(voice, key);
+}
+function audioBlockList() {
+    return document.getElementById('audioBlockList');
+}
+function updateAudioBlockEmptyState() {
+    const empty = document.getElementById('audioBlockEmpty');
+    if (!empty) return;
+    empty.style.display = 'none';
+}
+function openAudioFilePicker() {
+    const modal = document.getElementById('audioFilePickerModal');
+    const backdrop = document.getElementById('audioFilePickerBackdrop');
+    if (modal) modal.classList.add('open');
+    if (backdrop) backdrop.classList.add('open');
+}
+function closeAudioFilePicker() {
+    const modal = document.getElementById('audioFilePickerModal');
+    const backdrop = document.getElementById('audioFilePickerBackdrop');
+    if (modal) modal.classList.remove('open');
+    if (backdrop) backdrop.classList.remove('open');
+}
+function audioBlockItemTemplate(data) {
+    const kind = data.kind === 'tts' ? 'tts' : 'file';
+    const voiceLabel = kind === 'tts'
+        ? audioTtsVoiceName({ engine: data.engine, display_name: data.voiceLabel, voice: data.voice }, data.voice || 'Voice')
+        : '';
+    const label = kind === 'tts'
+        ? ('TTS - ' + voiceLabel + ': ' + summarizeAudioBlockText(data.text || '', 72))
+        : ('Asset - ' + (data.title || data.value || ''));
+    const editButton = kind === 'tts'
+        ? `<button type="button" class="audio-block-row-button" onclick="editAudioTtsBlock(this)" title="Edit TTS"${data.voiceId ? '' : ' disabled'}><i class="fa-solid fa-pen"></i></button>`
+        : '';
+    return `
+        <div class="audio-block-grip"><i class="fa-solid fa-grip-lines"></i></div>
+        <div class="audio-block-content">
+            <span class="audio-block-label" title="${escapeHtml(label)}">${escapeHtml(label)}</span>
+        </div>
+        <div class="audio-block-actions">
+            ${editButton}
+            <button type="button" class="audio-block-row-button audio-block-delete" onclick="removeAudioBlock(this)" title="Delete"><i class="fa-solid fa-trash"></i></button>
+        </div>
+        <input type="hidden" name="audio_files[]" value="${escapeHtml(data.value || '')}">
+    `;
+}
+function createAudioBlockElement(data) {
+    const item = document.createElement('div');
+    item.className = 'audio-block-item';
+    item.draggable = true;
+    item.setAttribute('data-kind', data.kind === 'tts' ? 'tts' : 'file');
+    item.setAttribute('data-value', data.value || '');
+    item.setAttribute('ondragstart', 'audioBlockDragStart(event)');
+    if (data.kind === 'tts') {
+        item.setAttribute('data-text', data.text || '');
+        item.setAttribute('data-engine', data.engine || '');
+        item.setAttribute('data-voice', data.voice || '');
+        item.setAttribute('data-voice-label', data.voiceLabel || data.voice || '');
+        item.setAttribute('data-voice-id', data.voiceId || '');
+    }
+    item.innerHTML = audioBlockItemTemplate(data);
+    return item;
+}
+function appendAudioBlockItem(item) {
+    const list = audioBlockList();
+    if (!list || !item) return;
+    const empty = document.getElementById('audioBlockEmpty');
+    if (empty && empty.parentNode === list) list.insertBefore(item, empty);
+    else list.appendChild(item);
+    updateAudioBlockEmptyState();
+}
+function addAudioFileBlockFromPicker(button) {
+    const name = String(button && button.getAttribute('data-name') || '').trim();
+    const supported = String(button && button.getAttribute('data-supported') || '') === '1';
+    if (!name || !supported) return;
+    appendAudioBlockItem(createAudioBlockElement({ kind: 'file', title: name, value: name }));
+    closeAudioFilePicker();
+}
+function removeAudioBlock(button) {
+    const item = button && button.closest('.audio-block-item');
+    if (!item) return;
+    item.remove();
+    updateAudioBlockEmptyState();
+}
+function audioBlockDragStart(event) {
+    const item = event.target && event.target.closest('.audio-block-item');
+    if (!item) return;
+    draggedAudioBlock = item;
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', item.getAttribute('data-value') || '');
+    setTimeout(function() { item.classList.add('dragging'); }, 0);
+}
+document.addEventListener('dragend', function(event) {
+    if (event.target.classList && event.target.classList.contains('audio-block-item')) {
+        event.target.classList.remove('dragging');
+        draggedAudioBlock = null;
+    }
+});
+function allowAudioBlockDrop(event) {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'move';
+}
+function getAudioBlockAfterElement(container, y) {
+    const draggableElements = [...container.querySelectorAll('.audio-block-item:not(.dragging)')];
+    return draggableElements.reduce((closest, child) => {
+        const box = child.getBoundingClientRect();
+        const offset = y - box.top - (box.height / 2);
+        if (offset < 0 && offset > closest.offset) return { offset: offset, element: child };
+        return closest;
+    }, { offset: Number.NEGATIVE_INFINITY }).element;
+}
+function dropAudioBlock(event) {
+    event.preventDefault();
+    if (!draggedAudioBlock) return;
+    const list = audioBlockList();
+    if (!list) return;
+    const afterElement = getAudioBlockAfterElement(list, event.clientY);
+    if (!afterElement) list.appendChild(draggedAudioBlock);
+    else list.insertBefore(draggedAudioBlock, afterElement);
+}
+function audioTtsModalElements() {
+    return {
+        modal: document.getElementById('audioTtsModal'),
+        backdrop: document.getElementById('audioTtsBackdrop'),
+        title: document.getElementById('audioTtsModalTitle'),
+        text: document.getElementById('audioTtsText'),
+        voice: document.getElementById('audioTtsVoice'),
+        testButton: document.getElementById('audioTtsTestButton'),
+        saveButton: document.getElementById('audioTtsSaveButton'),
+        status: document.getElementById('audioTtsStatus'),
+        preview: document.getElementById('audioTtsPreviewPlayer')
+    };
+}
+function setAudioTtsStatus(message, kind) {
+    const elements = audioTtsModalElements();
+    if (!elements.status) return;
+    const text = String(message || '').trim();
+    elements.status.textContent = text;
+    elements.status.className = 'audio-block-status';
+    if (!text) return;
+    elements.status.classList.add('open');
+    if (kind === 'error') elements.status.classList.add('error');
+    if (kind === 'success') elements.status.classList.add('success');
+}
+function stopAudioTtsPreview() {
+    const preview = audioTtsModalElements().preview;
+    if (!preview) return;
+    try {
+        preview.pause();
+    } catch (_error) {
+        return;
+    }
+}
+function populateAudioTtsVoiceSelect(selectedId, fallbackLabel) {
+    const elements = audioTtsModalElements();
+    if (!elements.voice) return;
+    const data = audioTtsVoiceData();
+    const options = [];
+    let foundSelected = false;
+    Object.keys(data).forEach(function(key) {
+        const voice = data[key] || {};
+        const selected = String(selectedId || '') === key;
+        if (selected) foundSelected = true;
+        options.push(
+            '<option value="' + escapeHtml(key) + '"' + (selected ? ' selected' : '') + '>' +
+            escapeHtml(audioTtsSelectLabel(voice, key)) +
+            '</option>'
+        );
+    });
+    if (selectedId && !foundSelected && fallbackLabel) {
+        options.unshift('<option value="" selected>' + escapeHtml('Unavailable - ' + fallbackLabel) + '</option>');
+    }
+    if (!options.length) {
+        options.push('<option value="">No TTS voices available</option>');
+    }
+    elements.voice.innerHTML = options.join('');
+    if (!selectedId && elements.voice.options.length > 0) elements.voice.selectedIndex = 0;
+}
+function updateAudioTtsActionState() {
+    const elements = audioTtsModalElements();
+    const hasText = !!String(elements.text ? elements.text.value : '').trim();
+    const hasVoice = !!String(elements.voice ? elements.voice.value : '').trim();
+    const disabled = !(hasText && hasVoice);
+    if (elements.testButton) elements.testButton.disabled = disabled;
+    if (elements.saveButton) elements.saveButton.disabled = disabled;
+}
+function openAudioTtsModal() {
+    activeAudioTtsItem = null;
+    const elements = audioTtsModalElements();
+    if (elements.title) elements.title.textContent = 'Add TTS';
+    if (elements.saveButton) elements.saveButton.textContent = 'Add TTS';
+    if (elements.text) elements.text.value = '';
+    populateAudioTtsVoiceSelect('', '');
+    setAudioTtsStatus('');
+    if (elements.preview) {
+        elements.preview.style.display = 'none';
+        elements.preview.removeAttribute('src');
+        elements.preview.load();
+    }
+    if (elements.modal) elements.modal.classList.add('open');
+    if (elements.backdrop) elements.backdrop.classList.add('open');
+    updateAudioTtsActionState();
+    if (elements.text) elements.text.focus();
+}
+function closeAudioTtsModal() {
+    activeAudioTtsItem = null;
+    stopAudioTtsPreview();
+    const elements = audioTtsModalElements();
+    if (elements.modal) elements.modal.classList.remove('open');
+    if (elements.backdrop) elements.backdrop.classList.remove('open');
+}
+function editAudioTtsBlock(button) {
+    const item = button && button.closest('.audio-block-item');
+    if (!item) return;
+    activeAudioTtsItem = item;
+    const elements = audioTtsModalElements();
+    if (elements.title) elements.title.textContent = 'Edit TTS';
+    if (elements.saveButton) elements.saveButton.textContent = 'Save TTS';
+    if (elements.text) elements.text.value = item.getAttribute('data-text') || '';
+    populateAudioTtsVoiceSelect(item.getAttribute('data-voice-id') || '', item.getAttribute('data-voice-label') || item.getAttribute('data-voice') || '');
+    setAudioTtsStatus('');
+    if (elements.preview) {
+        elements.preview.style.display = 'none';
+        elements.preview.removeAttribute('src');
+        elements.preview.load();
+    }
+    if (elements.modal) elements.modal.classList.add('open');
+    if (elements.backdrop) elements.backdrop.classList.add('open');
+    updateAudioTtsActionState();
+    if (elements.text) elements.text.focus();
+}
+function buildAudioTtsPayload() {
+    const elements = audioTtsModalElements();
+    const voiceId = String(elements.voice ? elements.voice.value : '').trim();
+    const text = String(elements.text ? elements.text.value : '');
+    if (!voiceId) throw new Error('Select a TTS voice first.');
+    if (!text.trim()) throw new Error('Enter TTS text first.');
+    const voice = audioTtsVoiceData()[voiceId];
+    if (!voice) throw new Error('Selected TTS voice is not available.');
+    const payload = {
+        engine: voice.engine,
+        voice: voice.voice,
+        voice_label: voice.voice_label || voice.display_name || voice.voice,
+        text: text
+    };
+    if (voice.engine === 'piper') {
+        payload.model_path = voice.model_path || '';
+        payload.config_path = voice.config_path || '';
+        if (voice.sample_rate) payload.sample_rate = Number(voice.sample_rate);
+    }
+    return { payload: payload, voiceId: voiceId, text: text };
+}
+function encodeAudioTtsToken(payload) {
+    const jsonText = JSON.stringify(payload);
+    const bytes = new TextEncoder().encode(jsonText);
+    let binary = '';
+    bytes.forEach(function(byte) { binary += String.fromCharCode(byte); });
+    return '%tts(' + btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '') + ')';
+}
+function saveAudioTtsBlock() {
+    let built;
+    try {
+        built = buildAudioTtsPayload();
+    } catch (error) {
+        setAudioTtsStatus(error && error.message ? error.message : 'Unable to save TTS block.', 'error');
+        return;
+    }
+    const item = createAudioBlockElement({
+        kind: 'tts',
+        value: encodeAudioTtsToken(built.payload),
+        text: built.text,
+        engine: built.payload.engine,
+        voice: built.payload.voice,
+        voiceLabel: built.payload.voice_label,
+        voiceId: built.voiceId
+    });
+    if (activeAudioTtsItem && activeAudioTtsItem.parentNode) activeAudioTtsItem.parentNode.replaceChild(item, activeAudioTtsItem);
+    else appendAudioBlockItem(item);
+    updateAudioBlockEmptyState();
+    closeAudioTtsModal();
+}
+async function testAudioTts() {
+    let built;
+    try {
+        built = buildAudioTtsPayload();
+    } catch (error) {
+        setAudioTtsStatus(error && error.message ? error.message : 'Unable to test TTS block.', 'error');
+        return;
+    }
+    const elements = audioTtsModalElements();
+    setAudioTtsStatus('Generating');
+    try {
+        const response = await fetch('/messages/tts-preview', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest'
+            },
+            body: JSON.stringify({ voice_id: built.voiceId, text: built.text })
+        });
+        const payload = await response.json();
+        if (!response.ok || !payload.ok || !payload.preview_url) {
+            throw new Error((payload && payload.error) ? payload.error : 'Preview failed.');
+        }
+        if (elements.preview) {
+            stopAudioTtsPreview();
+            elements.preview.src = payload.preview_url + '&_=' + encodeURIComponent(String(Date.now()));
+            elements.preview.style.display = 'block';
+            elements.preview.load();
+            await elements.preview.play();
+        }
+        setAudioTtsStatus('');
+    } catch (error) {
+        setAudioTtsStatus(error && error.message ? error.message : 'Preview failed.', 'error');
+    }
+}
 let activeVariableFieldId = '';
 let activeVariableWizardKey = '';
 const variableWizardTitles = {
@@ -547,6 +958,12 @@ function insertVariableSnippet(snippet) {
     field.value = currentValue.slice(0, start) + snippet + currentValue.slice(end);
     const caret = start + snippet.length;
     if (typeof field.setSelectionRange === 'function') field.setSelectionRange(caret, caret);
+    try {
+        field.dispatchEvent(new Event('input', { bubbles: true }));
+        field.dispatchEvent(new Event('change', { bubbles: true }));
+    } catch (_error) {
+        if (activeVariableFieldId === 'audioTtsText') updateAudioTtsActionState();
+    }
     field.focus();
     closeVariableGuide();
 }
@@ -744,6 +1161,8 @@ document.addEventListener('keydown', function(event) {
     if (event.key === 'Escape') {
         closeVariableGuide();
         closeMessageIconPicker();
+        closeAudioFilePicker();
+        closeAudioTtsModal();
     }
 });
 document.addEventListener('DOMContentLoaded', function() {
@@ -773,7 +1192,7 @@ def message_variable_field_html(field_id, label, control_html, help_text=""):
                 {help_html}
                 <div class="{wrap_class}">
                     {control_html}
-                    <button type="button" class="message-variable-badge" onclick="openVariableGuide('{h(field_id)}')" title="Insert Variable">$&#40;x&#125;</button>
+                    <button type="button" class="message-variable-badge" onclick="openVariableGuide('{h(field_id)}')" title="Insert Variable">&#36;&#123;x&#125;</button>
                 </div>
             </div>
 """
@@ -1153,7 +1572,7 @@ def message_icon_asset_metadata(path):
     elif ext == "bmp":
         metadata = _bmp_image_metadata(path)
         preview_kind = "image"
-    elif ext in {"wav", "mp3"}:
+    elif ext in {"wav", "mp3", "ogg"}:
         preview_kind = "audio"
     elif ext == "txt":
         preview_kind = "text"
@@ -1190,6 +1609,15 @@ def message_icon_asset_metadata(path):
     }
 
 
+def _asset_picker_user():
+    user = current_user()
+    return user if isinstance(user, dict) else None
+
+
+def _visible_asset_files():
+    return visible_asset_paths_for_user(_asset_picker_user())
+
+
 def resolve_message_icon_value(raw_value, current_value=""):
     selected = asset_filename(raw_value)
     if not selected:
@@ -1205,6 +1633,11 @@ def resolve_message_icon_value(raw_value, current_value=""):
         if current and path.name.lower() == current.lower():
             return current_value or path.name
         raise RuntimeError("Unsupported format")
+    user = _asset_picker_user()
+    if not user_can_access_asset(user, path.name):
+        if current and path.name.lower() == current.lower():
+            return current_value or path.name
+        raise RuntimeError("Asset unavailable")
     metadata = message_icon_asset_metadata(Path(path))
     if metadata.get("supported"):
         return path.name
@@ -1214,37 +1647,43 @@ def resolve_message_icon_value(raw_value, current_value=""):
 
 
 def _message_icon_summary(current_value):
+    user = _asset_picker_user()
     selected_name = asset_filename(current_value)
     selected_meta = None
     options = []
-    ASSET_DIR.mkdir(parents=True, exist_ok=True)
     try:
         selected_path = asset_path(selected_name) if selected_name else None
     except Exception:
         selected_path = None
     canonical_selected = selected_path.name if selected_path and selected_path.is_file() else selected_name
-    try:
-        files = sorted([item for item in ASSET_DIR.iterdir() if item.is_file()], key=lambda item: item.name.lower())
-    except OSError:
-        files = []
-    for path in files:
+    for path in _visible_asset_files():
         item = message_icon_asset_metadata(path)
         item["selected"] = bool(canonical_selected) and path.name.lower() == canonical_selected.lower()
         if item["selected"]:
             selected_meta = item
         options.append(item)
     if selected_meta is None and selected_name:
-        selected_meta = {
-            "name": selected_name,
-            "preview_kind": "missing",
-            "preview_url": "",
-            "supported": False,
-            "reason": "Unsupported format",
-            "transparent": False,
-            "meta_text": "Asset not found",
-            "status_text": "Unsupported format",
-            "selected": True,
-        }
+        if selected_path and selected_path.is_file():
+            selected_meta = message_icon_asset_metadata(Path(selected_path))
+            if user is not None and not user_can_access_asset(user, selected_path.name):
+                selected_meta["preview_url"] = (
+                    asset_inline_image_data_url(selected_path)
+                    if selected_meta.get("preview_kind") == "image"
+                    else ""
+                )
+            selected_meta["selected"] = True
+        else:
+            selected_meta = {
+                "name": selected_name,
+                "preview_kind": "missing",
+                "preview_url": "",
+                "supported": False,
+                "reason": "Unsupported format",
+                "transparent": False,
+                "meta_text": "Asset not found",
+                "status_text": "Unsupported format",
+                "selected": True,
+            }
     return canonical_selected, selected_meta, options
 
 
@@ -1305,7 +1744,7 @@ def message_icon_field_html(current_value=""):
                         <button type="button" class="message-icon-clear" id="messageIconClear" onclick="clearMessageIconSelection()"{" disabled" if not selected_name else ""}>Clear</button>
                     </div>
                 </div>
-                <div id="messageIconTransparencyNote" class="message-icon-note{' open' if note_open else ''}">This icon is not transparent. It is recommended to use transparent icons.</div>
+                <div id="messageIconTransparencyNote" class="message-icon-note{' open' if note_open else ''}">This icon is not tranpsernt. It's recommended to sue transpernt icons.</div>
                 <div id="messageIconPickerBackdrop" class="message-icon-picker-backdrop" onclick="closeMessageIconPicker()"></div>
                 <div id="messageIconPickerModal" class="message-icon-picker-modal" role="dialog" aria-modal="true" aria-labelledby="messageIconPickerTitle">
                     <div class="message-icon-picker-header">
@@ -1322,42 +1761,163 @@ def message_icon_field_html(current_value=""):
 """
 
 
-def audio_item(file_name, selected=False):
-    hidden = f'<input type="hidden" name="audio_files[]" value="{h(file_name)}">' if selected else ""
-    return (
-        f'<div class="tl-item" draggable="true" ondragstart="dragStart(event)" '
-        f'onclick="selectItem(this)" data-value="{h(file_name)}">{h(file_name)}{hidden}</div>'
-    )
+def _audio_tts_voice_map_json(voices):
+    payload = {
+        voice["id"]: {
+            "id": voice.get("id") or "",
+            "engine": voice.get("engine") or "",
+            "engine_label": voice.get("engine_label") or "",
+            "voice": voice.get("voice") or "",
+            "voice_label": voice.get("voice_label") or "",
+            "display_name": voice.get("display_name") or "",
+            "model_path": voice.get("model_path") or "",
+            "config_path": voice.get("config_path") or "",
+            "sample_rate": int(voice.get("sample_rate") or 0),
+        }
+        for voice in voices
+    }
+    return json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
+
+
+def _audio_tts_voice_name(engine, label):
+    engine_name = str(engine or "").strip().lower()
+    voice_label = str(label or "").strip() or "Voice"
+    if engine_name == "google" and not voice_label.lower().startswith("google "):
+        return "Google " + voice_label
+    return voice_label
+
+
+def _audio_tts_voice_options_html(voices):
+    if not voices:
+        return '<option value="">No TTS voices available</option>'
+    options = []
+    for voice in voices:
+        prefix = "Cloud: " if str(voice.get("engine") or "").strip().lower() == "google" else "Local: "
+        label = prefix + _audio_tts_voice_name(
+            voice.get("engine"),
+            voice.get('display_name') or voice.get('voice_label') or voice.get('voice') or '',
+        )
+        options.append(f'<option value="{h(voice.get("id") or "")}">{h(label)}</option>')
+    return "".join(options)
+
+
+def _audio_picker_options():
+    options = []
+    for path in _visible_asset_files():
+        item = dict(message_icon_asset_metadata(path))
+        is_audio = item.get("preview_kind") == "audio"
+        item["supported"] = is_audio
+        item["reason"] = "" if is_audio else "Audio files only"
+        item["status_text"] = "Selectable" if is_audio else "Audio files only"
+        options.append(item)
+    return options
+
+
+def _audio_file_picker_item_html(item):
+    classes = ["message-icon-asset-card"]
+    if not item.get("supported"):
+        classes.append("unsupported")
+    return f"""                    <button type="button" class="{' '.join(classes)}" data-name="{h(item['name'])}" data-supported="{'1' if item.get('supported') else '0'}" onclick="addAudioFileBlockFromPicker(this)">
+                        <div class="message-icon-asset-preview">{_message_icon_preview_html(item)}</div>
+                        <div class="message-icon-asset-info">
+                            <div class="message-icon-asset-name" title="{h(item['name'])}">{h(item['name'])}</div>
+                            <div class="message-icon-asset-meta">{h(item.get('meta_text') or '')}</div>
+                            <div class="message-icon-asset-status">{h(item.get('status_text') or '')}</div>
+                        </div>
+                    </button>"""
+
+
+def _audio_block_item_html(value, tts_voices):
+    payload = decode_tts_token(value)
+    if payload:
+        voice_id = tts_voice_id_for_payload(payload, tts_voices)
+        voice_label = _audio_tts_voice_name(payload.get("engine"), payload.get("voice_label") or payload.get("voice") or "TTS")
+        label = f"TTS - {voice_label}: {tts_preview_text(payload.get('text'), 72)}"
+        edit_disabled = "" if voice_id else " disabled"
+        return f"""                    <div class="audio-block-item" draggable="true" ondragstart="audioBlockDragStart(event)" data-kind="tts" data-value="{h(value)}" data-text="{h(payload.get("text") or "")}" data-engine="{h(payload.get("engine") or "")}" data-voice="{h(payload.get("voice") or "")}" data-voice-label="{h(voice_label)}" data-voice-id="{h(voice_id)}">
+                        <div class="audio-block-grip"><i class="fa-solid fa-grip-lines"></i></div>
+                        <div class="audio-block-content">
+                            <span class="audio-block-label" title="{h(label)}">{h(label)}</span>
+                        </div>
+                        <div class="audio-block-actions">
+                            <button type="button" class="audio-block-row-button" onclick="editAudioTtsBlock(this)" title="Edit TTS"{edit_disabled}><i class="fa-solid fa-pen"></i></button>
+                            <button type="button" class="audio-block-row-button audio-block-delete" onclick="removeAudioBlock(this)" title="Delete"><i class="fa-solid fa-trash"></i></button>
+                        </div>
+                        <input type="hidden" name="audio_files[]" value="{h(value)}">
+                    </div>"""
+    file_name = str(value or "").strip()
+    label = f"Asset - {file_name}"
+    return f"""                    <div class="audio-block-item" draggable="true" ondragstart="audioBlockDragStart(event)" data-kind="file" data-value="{h(file_name)}">
+                        <div class="audio-block-grip"><i class="fa-solid fa-grip-lines"></i></div>
+                        <div class="audio-block-content">
+                            <span class="audio-block-label" title="{h(label)}">{h(label)}</span>
+                        </div>
+                        <div class="audio-block-actions">
+                            <button type="button" class="audio-block-row-button audio-block-delete" onclick="removeAudioBlock(this)" title="Delete"><i class="fa-solid fa-trash"></i></button>
+                        </div>
+                        <input type="hidden" name="audio_files[]" value="{h(file_name)}">
+                    </div>"""
 
 
 def audio_transfer_html(available_files, selected_files=None):
     selected_files = selected_files or []
-    selected_lookup = {str(name) for name in selected_files}
-    available = [name for name in available_files if str(name) not in selected_lookup]
-    available_items = "\n".join(audio_item(name) for name in available)
-    selected_items = "\n".join(audio_item(name, True) for name in selected_files)
+    tts_voices = available_tts_voices()
+    selected_items = "\n".join(_audio_block_item_html(value, tts_voices) for value in selected_files)
+    picker_options = _audio_picker_options()
+    file_items = "\n".join(_audio_file_picker_item_html(item) for item in picker_options)
+    picker_body = (
+        f'<div class="message-icon-picker-grid">{file_items}</div>'
+        if file_items
+        else '<div class="message-icon-picker-empty">No assets are stored on the server yet.</div>'
+    )
     return f"""
-                <div class="transfer-list-container">
-                    <div class="tl-panel">
-                        <div class="tl-header">Available Files</div>
-                        <input type="text" id="audioSearch" class="tl-search" placeholder="Search files..." onkeyup="filterAudio()">
-                        <div class="tl-list" id="availableAudioList" ondrop="dropToAvailable(event)" ondragover="allowDrop(event)">
-                            {available_items}
-                        </div>
+                <div class="tl-panel">
+                    <div class="tl-header audio-block-header">
+                        <span class="audio-block-header-actions">
+                            <button type="button" class="audio-block-header-button" onclick="openAudioFilePicker()" title="Add Audio File" aria-label="Add Audio File"><i class="fa-solid fa-file-audio"></i></button>
+                            <button type="button" class="audio-block-header-button" onclick="openAudioTtsModal()"{"" if tts_voices else " disabled"} title="Add TTS" aria-label="Add TTS"><i class="fa-solid fa-head-side-cough"></i></button>
+                        </span>
                     </div>
-
-                    <div class="tl-controls">
-                        <button type="button" class="btn-primary" onclick="moveRight()" title="Move Selected Right"><i class="fa-solid fa-angle-right"></i></button>
-                        <button type="button" class="btn-primary" onclick="moveLeft()" title="Move Selected Left"><i class="fa-solid fa-angle-left"></i></button>
-                        <button type="button" class="btn-primary" onclick="moveUp()" title="Move Selected Up"><i class="fa-solid fa-angle-up"></i></button>
-                        <button type="button" class="btn-primary" onclick="moveDown()" title="Move Selected Down"><i class="fa-solid fa-angle-down"></i></button>
+                    <div id="audioBlockList" class="tl-list audio-block-list" ondragover="allowAudioBlockDrop(event)" ondrop="dropAudioBlock(event)">
+{selected_items}
+                        <div id="audioBlockEmpty" class="audio-block-empty"></div>
                     </div>
-
-                    <div class="tl-panel">
-                        <div class="tl-header">Selected Files (In Order)</div>
-                        <div class="tl-list" id="selectedAudioList" ondrop="dropToSelected(event)" ondragover="allowDrop(event)">
-                            {selected_items}
+                </div>
+                <script type="application/json" id="audioTtsVoiceMap">{_audio_tts_voice_map_json(tts_voices)}</script>
+                <div id="audioFilePickerBackdrop" class="message-icon-picker-backdrop" onclick="closeAudioFilePicker()"></div>
+                <div id="audioFilePickerModal" class="message-icon-picker-modal" role="dialog" aria-modal="true" aria-labelledby="audioFilePickerTitle">
+                    <div class="message-icon-picker-header">
+                        <h2 id="audioFilePickerTitle">Select Audio File</h2>
+                        <button type="button" class="message-icon-picker-close" onclick="closeAudioFilePicker()" aria-label="Close">&times;</button>
+                    </div>
+                    <div class="message-icon-picker-body">
+                        {picker_body}
+                    </div>
+                </div>
+                <div id="audioTtsBackdrop" class="audio-block-modal-backdrop" onclick="closeAudioTtsModal()"></div>
+                <div id="audioTtsModal" class="audio-block-modal" role="dialog" aria-modal="true" aria-labelledby="audioTtsModalTitle">
+                    <div class="audio-block-modal-header">
+                        <h2 id="audioTtsModalTitle">Add TTS</h2>
+                        <button type="button" class="audio-block-modal-close" onclick="closeAudioTtsModal()" aria-label="Close">&times;</button>
+                    </div>
+                    <div class="audio-block-modal-body">
+                        <div class="form-group" style="margin-bottom:18px; padding-bottom:18px;">
+                            <div class="message-variable-wrap message-variable-wrap-long">
+                                <textarea id="audioTtsText" class="form-control textarea-long" rows="6" wrap="soft" oninput="updateAudioTtsActionState()"></textarea>
+                                <button type="button" class="message-variable-badge" onclick="openVariableGuide('audioTtsText')" title="Insert Variable">&#36;&#123;x&#125;</button>
+                            </div>
                         </div>
+                        <div>
+                            <label class="main-label" for="audioTtsVoice">Voice</label>
+                            <select id="audioTtsVoice" class="form-control" onchange="updateAudioTtsActionState()">{_audio_tts_voice_options_html(tts_voices)}</select>
+                        </div>
+                        <div id="audioTtsStatus" class="audio-block-status"></div>
+                        <audio id="audioTtsPreviewPlayer" class="audio-tts-preview-player" controls preload="none" style="display:none;"></audio>
+                    </div>
+                    <div class="audio-block-modal-actions">
+                        <button type="button" class="audio-block-secondary" onclick="closeAudioTtsModal()">Cancel</button>
+                        <button type="button" class="audio-block-secondary" id="audioTtsTestButton" onclick="testAudioTts()" disabled>Test</button>
+                        <button type="button" class="btn-primary" id="audioTtsSaveButton" onclick="saveAudioTtsBlock()" disabled>Add TTS</button>
                     </div>
                 </div>"""
 

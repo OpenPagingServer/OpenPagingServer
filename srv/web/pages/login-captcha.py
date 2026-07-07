@@ -8,12 +8,6 @@ BASIC_CAPTCHA_SESSION_KEY = "login_basic_captcha_hash"
 BASIC_CAPTCHA_EXPIRES_KEY = "login_basic_captcha_expires"
 BASIC_CAPTCHA_TTL_SECONDS = 300
 CAPTCHA_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-CAPTCHA_PROVIDER_ALIASES = {
-    "cloudflare": "turnstile",
-    "cloudflare-turnstile": "turnstile",
-    "google": "recaptcha",
-    "google-recaptcha": "recaptcha",
-}
 
 
 def _basic_captcha_hash(value):
@@ -77,7 +71,6 @@ def handle_request():
     except Exception:
         data = {}
     provider = str(data.get("login_captcha_provider") or "disabled").strip().lower()
-    provider = CAPTCHA_PROVIDER_ALIASES.get(provider, provider)
     if provider != "basic":
         abort(404)
     code = _captcha_code()

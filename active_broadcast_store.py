@@ -74,6 +74,15 @@ def _connect():
             """
         )
         conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS active_broadcast_controls (
+                id TEXT PRIMARY KEY,
+                stop_requested INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_active_broadcasts_pending "
             "ON active_broadcasts (delivery, issued)"
         )
@@ -152,22 +161,15 @@ def _row_to_record(row):
         data = {}
     if not isinstance(data, dict):
         data = {}
-    if not str(data.get("id") or "").strip():
-        data["id"] = row["id"]
-    if not str(data.get("template_id") or "").strip():
-        data["template_id"] = row["template_id"]
-    if not str(data.get("expires_rule") or "").strip():
-        data["expires_rule"] = row["expires_rule"]
-    if not str(data.get("sender") or "").strip():
-        data["sender"] = row["sender"]
-    if not str(data.get("groups") or "").strip():
-        data["groups"] = row["groups_value"]
-    if not str(data.get("delivery") or "").strip():
-        data["delivery"] = row["delivery"]
-    if not str(data.get("issued") or "").strip():
-        data["issued"] = row["issued"]
-    if not str(data.get("expires") or "").strip():
-        data["expires"] = row["expires"]
+    # Row columns are the live authority for mutable broadcast state.
+    data["id"] = row["id"]
+    data["template_id"] = row["template_id"]
+    data["expires_rule"] = row["expires_rule"]
+    data["sender"] = row["sender"]
+    data["groups"] = row["groups_value"]
+    data["delivery"] = row["delivery"]
+    data["issued"] = row["issued"]
+    data["expires"] = row["expires"]
     return _normalize_record(data)
 
 
@@ -177,6 +179,7 @@ def _delete_ids(conn, broadcast_ids):
         return
     placeholders = ", ".join(["?"] * len(ids))
     conn.execute(f"DELETE FROM active_broadcasts WHERE id IN ({placeholders})", ids)
+    conn.execute(f"DELETE FROM active_broadcast_controls WHERE id IN ({placeholders})", ids)
 
 
 def _prune_expired_records(conn):
@@ -217,6 +220,7 @@ def put_active_broadcast(record):
                 payload,
             ),
         )
+        conn.execute("DELETE FROM active_broadcast_controls WHERE id = ?", (normalized["id"],))
     return normalized["id"]
 
 
@@ -249,12 +253,26 @@ def list_pending_active_broadcast_ids(limit=20, exclude_sender="sendmsgd"):
     with _connect() as conn:
         _prune_expired_records(conn)
         rows = conn.execute(
-            "SELECT id FROM active_broadcasts "
-            "WHERE sender <> ? AND (delivery = '' OR delivery = 'pending') "
-            "ORDER BY issued ASC LIMIT ?",
-            (str(exclude_sender or ""), max(0, int(limit))),
+            "SELECT id, template_id, expires_rule, sender, groups_value, delivery, issued, expires, payload "
+            "FROM active_broadcasts "
+            "WHERE delivery = '' OR delivery = 'pending' "
+            "ORDER BY issued ASC",
         ).fetchall()
-    return [row["id"] for row in rows]
+    pending_ids = []
+    excluded_sender = str(exclude_sender or "").strip()
+    wanted = max(0, int(limit))
+    if wanted == 0:
+        return pending_ids
+    for row in rows:
+        record = _row_to_record(row)
+        if record is None:
+            continue
+        if excluded_sender and str(record.get("sender") or "").strip() == excluded_sender and not bool(record.get("monitor_child")):
+            continue
+        pending_ids.append(record["id"])
+        if wanted and len(pending_ids) >= wanted:
+            break
+    return pending_ids
 
 
 def claim_active_broadcast_delivery(broadcast_id, stream_id):
@@ -279,12 +297,51 @@ def mark_active_broadcast_delivery(broadcast_id, status):
     with _connect() as conn:
         if state in REMOVAL_DELIVERY_STATES:
             cursor = conn.execute("DELETE FROM active_broadcasts WHERE id = ?", (wanted,))
+            conn.execute("DELETE FROM active_broadcast_controls WHERE id = ?", (wanted,))
         else:
             cursor = conn.execute(
                 "UPDATE active_broadcasts SET delivery = ? WHERE id = ?",
                 (state, wanted),
             )
     return cursor.rowcount > 0
+
+
+def request_active_broadcast_stop(broadcast_id):
+    wanted = str(broadcast_id or "").strip()
+    if not wanted:
+        return False
+    now_text = datetime.now().strftime(DATE_FORMAT)
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO active_broadcast_controls (id, stop_requested, updated_at)
+            VALUES (?, 1, ?)
+            ON CONFLICT(id) DO UPDATE SET stop_requested = 1, updated_at = excluded.updated_at
+            """,
+            (wanted, now_text),
+        )
+    return True
+
+
+def clear_active_broadcast_stop_request(broadcast_id):
+    wanted = str(broadcast_id or "").strip()
+    if not wanted:
+        return False
+    with _connect() as conn:
+        cursor = conn.execute("DELETE FROM active_broadcast_controls WHERE id = ?", (wanted,))
+    return cursor.rowcount > 0
+
+
+def active_broadcast_stop_requested(broadcast_id):
+    wanted = str(broadcast_id or "").strip()
+    if not wanted:
+        return False
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT stop_requested FROM active_broadcast_controls WHERE id = ? LIMIT 1",
+            (wanted,),
+        ).fetchone()
+    return bool(row and int(row["stop_requested"] or 0))
 
 
 def expire_active_broadcasts():

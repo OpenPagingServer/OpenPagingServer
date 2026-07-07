@@ -18,6 +18,7 @@ import pymysql
 from dotenv import load_dotenv
 
 from active_broadcast_store import fetch_active_broadcast, list_active_broadcasts
+from tts import decode_tts_token, iter_tts_ffmpeg_chunks, split_audio_entries
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -278,7 +279,24 @@ def cached_group_ids_for_user(user_id, force=False):
     return {str(group.get("id") or "").strip() for group in cached_groups_for_user(user_id, force=force) if str(group.get("id") or "").strip()}
 
 
+def broadcast_explicit_targets(broadcast):
+    explicit = (broadcast or {}).get("explicit_targets")
+    targets = []
+    if isinstance(explicit, (list, tuple, set)):
+        source = explicit
+    else:
+        source = str(explicit or "").replace(",", " ").split()
+    for item in source:
+        token = str(item or "").strip()
+        if token:
+            targets.append(token)
+    return targets
+
+
 def user_in_broadcast(user_id, broadcast):
+    explicit = broadcast_explicit_targets(broadcast)
+    if explicit:
+        return desktop_member_token(user_id) in explicit
     target_groups = [part.strip() for part in str((broadcast or {}).get("groups") or "").split(".") if part.strip()]
     if not target_groups:
         return False
@@ -479,6 +497,10 @@ def connection_in_groups(connection, groups_value):
 
 
 def connection_in_broadcast(connection, broadcast):
+    explicit = broadcast_explicit_targets(broadcast)
+    if explicit:
+        wanted = desktop_member_token(connection.user.get("id"))
+        return wanted in explicit
     target_groups = [part.strip() for part in str((broadcast or {}).get("groups") or "").split(".") if part.strip()]
     if not target_groups:
         return False
@@ -687,8 +709,7 @@ def desktop_audio_frames(audio_files_str, codec=None):
     settings = desktop_stream_settings(codec)
     frame_size = settings["frame_size"]
     stream_codec = settings["codec"]
-    for audio_file in str(audio_files_str or "").split(":"):
-        audio_file = audio_file.strip()
+    for audio_file in split_audio_entries(audio_files_str):
         if not audio_file:
             continue
         if audio_file.startswith("%silence(") and audio_file.endswith(")"):
@@ -704,6 +725,25 @@ def desktop_audio_frames(audio_files_str, codec=None):
                     ["-f", "lavfi", "-i", f"anullsrc=r={settings['sample_rate']}:cl=mono", "-t", str(duration)],
                     stream_codec,
                 )
+            continue
+        tts_payload = decode_tts_token(audio_file)
+        if tts_payload:
+            yield from iter_tts_ffmpeg_chunks(
+                tts_payload,
+                [
+                    "-ar",
+                    str(settings["sample_rate"]),
+                    "-ac",
+                    "1",
+                    "-f",
+                    settings["ffmpeg_format"],
+                    "-flush_packets",
+                    "1",
+                    "pipe:1",
+                ],
+                chunk_size=frame_size,
+                pad_byte=b"\xff" if stream_codec == "mulaw" else b"\x00",
+            )
             continue
         file_path = resolve_audio_file(audio_file)
         if not file_path:
@@ -904,6 +944,8 @@ def broadcast_watcher_loop():
                 _remember_broadcast(broadcast)
                 broadcast_id = str(broadcast.get("id") or "")
                 if not broadcast_id:
+                    continue
+                if str(broadcast.get("runtime_kind") or "").strip().lower() == "livepage":
                     continue
                 issued_at = parse_datetime(broadcast.get("issued"))
                 if issued_at and (datetime.now() - issued_at) > timedelta(days=1):

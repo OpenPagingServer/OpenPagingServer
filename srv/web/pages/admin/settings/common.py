@@ -27,7 +27,6 @@ strong { font-weight:700; }
 #content h1{ font-weight:400; }
 .info-card{ background:#FFF; padding:16px; border:1px solid #EEE; border-radius:8px; box-shadow:0 2px 4px rgba(0,0,0,0.1); margin-bottom:16px; }
 .info-row { display:flex; justify-content:space-between; padding:10px 0; border-bottom:1px solid #f0f0f0; align-items: center; }
-.info-row.stacked { flex-direction:column; align-items:flex-start; gap:8px; }
 .info-row:last-child { border-bottom:none; }
 .info-label { font-weight:500; color:#555; }
 .info-description { display:block; margin-top:4px; color:#777; font-size:0.88em; font-weight:300; line-height:1.35; }
@@ -65,7 +64,6 @@ input:checked + .slider:before { transform: translateX(20px); background-color: 
 .invalid-port { border-color: #F44336 !important; background-color: rgba(244, 67, 54, 0.05) !important; }
 .server-image { width:300px; height:auto; margin:0 auto 24px auto; display:block; border-radius:12px; }
 .save-status { margin-left: 10px; font-size: 0.85em; transition: opacity 0.5s; }
-.settings-actions { margin-top:20px; display:flex; align-items:center; }
 @media(max-width:767px){ .tabs-desktop { display: none; } .tabs-mobile { display: block; } }
 @media(min-width:768px){ #mobile-header{ display:none; } }
 @media(prefers-color-scheme:dark){

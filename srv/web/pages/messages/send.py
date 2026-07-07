@@ -1,4 +1,5 @@
 from srv.web.app import *
+from group_features import fetch_group_rows
 
 SEND_STYLE = r"""
 body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:300; background-color:#FFF; height:100%; }
@@ -89,21 +90,34 @@ def handle_request():
     user = require_non_receiver()
     if not isinstance(user, dict):
         return user
+    if not can_send_messages(user):
+        abort(403)
     ctx = legacy_user_context(user)
     msgid = request.values.get("msgid", "")
     msg = query_one("SELECT name FROM messages WHERE messageid=%s LIMIT 1", (msgid,))
     if not msg:
         return redirect("/messages/")
-    groups = query_all("SELECT id, name, members FROM `groups` ORDER BY name ASC")
+    if not user_can_access_message(user, msgid):
+        abort(403)
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            groups = fetch_group_rows(cur)
+    finally:
+        conn.close()
+    groups = filter_group_rows_for_user(user, groups)
+    allowed_group_ids = {str(group.get("id") or "").strip() for group in groups if str(group.get("id") or "").strip()}
     send_error = ""
     if request.method == "POST":
         if request.form.get("send_all"):
-            targets = "0"
+            targets = all_group_ids_value(user)
         else:
-            selected_groups = [str(int(group_id)) for group_id in request.form.getlist("groups[]")]
+            selected_groups = [str(group_id or "").strip() for group_id in request.form.getlist("groups[]") if str(group_id or "").strip() in allowed_group_ids]
             if not selected_groups:
                 return redirect(f"/messages/send?msgid={h(msgid)}")
             targets = ".".join(selected_groups)
+        if targets in {"", "0"}:
+            return redirect(f"/messages/send?msgid={h(msgid)}")
         try:
             create_broadcast(msgid, targets, user.get("username") or session.get("username") or "User")
             return redirect("/messages/")
@@ -120,7 +134,12 @@ def handle_request():
     if groups:
         group_rows = []
         for group in groups:
-            available = sum(1 for member in group_member_tokens(group.get("members")) if group_member_available(member, endpoint_availability))
+            recipients = list(group_member_tokens(group.get("members")))
+            if "messages" in set(group.get("monitor_categories") or []):
+                for member in group_member_tokens(group.get("monitor_members")):
+                    if member not in recipients:
+                        recipients.append(member)
+            available = sum(1 for member in recipients if group_member_available(member, endpoint_availability))
             has_available = endpoint_error is not None or available > 0
             row_cls = "" if has_available else " unavailable"
             disabled = "" if has_available else " disabled"

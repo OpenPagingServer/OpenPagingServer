@@ -37,6 +37,8 @@ except Exception:
     def load_dotenv(*_args, **_kwargs):
         return False
 from active_broadcast_store import (
+    active_broadcast_stop_requested,
+    clear_active_broadcast_stop_request,
     claim_active_broadcast_delivery,
     expire_active_broadcasts_by_template_ids,
     expire_active_broadcasts_triggered_by_template,
@@ -45,6 +47,8 @@ from active_broadcast_store import (
     mark_active_broadcast_delivery,
     put_active_broadcast,
 )
+from group_features import fetch_group_rows, record_is_bell, record_is_immediate, regular_group_targets
+from tts import decode_tts_token, iter_tts_ffmpeg_chunks, split_audio_entries
 from multicastgatewayd import encode_local_source_packet
 
 try:
@@ -271,6 +275,16 @@ def apply_endpoint_ipc_socket_permissions(sock_path):
         log(f"unable to set endpoint IPC socket permissions: {exc}")
 
 
+def tune_ipc_stream_socket(sock):
+    try:
+        family = getattr(sock, "family", None)
+        if family in (socket.AF_INET, socket.AF_INET6):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    return sock
+
+
 def connect_endpoint_ipc(timeout=2):
     if supports_unix_sockets() and ENDPOINT_IPC_SOCKET_PATH.exists():
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -281,7 +295,7 @@ def connect_endpoint_ipc(timeout=2):
         except Exception:
             sock.close()
             raise
-    return socket.create_connection(("127.0.0.1", 50000), timeout=timeout)
+    return tune_ipc_stream_socket(socket.create_connection(("127.0.0.1", 50000), timeout=timeout))
 
 
 def create_endpoint_ipc_server_socket():
@@ -1161,13 +1175,15 @@ def multicast_rtp_normalize_address(value):
     return str(ip)
 
 
-def multicast_rtp_clean_port(value):
+def multicast_rtp_clean_port(value, require_even=False):
     try:
         port = int(str(value or "").strip())
     except ValueError as exc:
         raise ValueError("Enter a valid UDP port.") from exc
     if port < 1 or port > 65535:
         raise ValueError("Enter a valid UDP port.")
+    if require_even and port % 2 != 0:
+        raise ValueError("Enter an even UDP port.")
     return port
 
 
@@ -1196,7 +1212,7 @@ def multicast_rtp_clean_values(values):
     return {
         "name": name,
         "address": multicast_rtp_normalize_address(values.get("address")),
-        "port": multicast_rtp_clean_port(values.get("port")),
+        "port": multicast_rtp_clean_port(values.get("port"), require_even=True),
         "codec": multicast_rtp_clean_codec(values.get("codec")),
         "packet_ms": multicast_rtp_clean_packet_ms(values.get("packet_ms")),
     }
@@ -3581,7 +3597,7 @@ def multicast_rtp_form_html(values, error, submit_label):
 <div class="notice">{h(MULTICAST_RTP_WARNING)}</div>
 <div class="row"><label>Name</label><input class="control" name="name" value="{h(values.get("name"))}" required></div>
 <div class="row"><label>Multicast Address</label><input class="control" name="address" id="multicastAddress" value="{h(values.get("address"))}" required></div>
-<div class="row"><label>Port</label><input class="control short-control" type="number" name="port" id="multicastPort" value="{h(values.get("port"))}" min="1" max="65535" step="1" required></div>
+<div class="row"><label>Port</label><input class="control short-control" type="number" name="port" id="multicastPort" value="{h(values.get("port"))}" min="2" max="65534" step="2" required></div>
 <div class="row"><label>Codec</label><select class="control short-control" name="codec">{codec_options}</select></div>
 <details class="advanced"><summary>Advanced options</summary><div class="advanced-body"><div class="row"><label>Packet Size (ms)</label><input class="control short-control" type="number" name="packet_ms" id="packetMs" value="{h(values.get("packet_ms") or MULTICAST_RTP_DEFAULT_PACKET_MS)}" min="{MULTICAST_RTP_MIN_PACKET_MS}" max="{MULTICAST_RTP_MAX_PACKET_MS}" step="20" required></div></div></details>
 <div class="error" id="multicastClientError" style="display:none"></div>
@@ -3612,7 +3628,7 @@ function isMulticastAddress(value) {{
 }}
 function isValidPort(value) {{
   const port = Number(value);
-  return Number.isInteger(port) && port >= 1 && port <= 65535;
+  return Number.isInteger(port) && port >= 2 && port <= 65534 && port % 2 === 0;
 }}
 function isValidPacketMs(value) {{
   const ms = Number(value);
@@ -3621,10 +3637,10 @@ function isValidPacketMs(value) {{
 function syncMulticastForm() {{
   const errors = [];
   if (!isMulticastAddress(multicastAddress.value)) errors.push('Enter a multicast address.');
-  if (!isValidPort(multicastPort.value)) errors.push('Enter a valid UDP port.');
+  if (!isValidPort(multicastPort.value)) errors.push('Enter an even UDP port.');
   if (!isValidPacketMs(packetMs.value)) errors.push('Packet size must be a 20 ms increment between 20 and 200 ms.');
   multicastAddress.setCustomValidity(errors.some(error => error.includes('multicast')) ? 'Enter a multicast address.' : '');
-  multicastPort.setCustomValidity(errors.some(error => error.includes('port')) ? 'Enter a valid UDP port.' : '');
+  multicastPort.setCustomValidity(errors.some(error => error.includes('port')) ? 'Enter an even UDP port.' : '');
   packetMs.setCustomValidity(errors.some(error => error.includes('Packet size')) ? 'Packet size must be a 20 ms increment between 20 and 200 ms.' : '');
   multicastClientError.textContent = errors.join(' ');
   multicastClientError.style.display = errors.length ? 'block' : 'none';
@@ -4124,8 +4140,7 @@ def resolve_audio_file(audio_file):
 
 
 def audio_frames(audio_files_str):
-    for audio_file in str(audio_files_str or "").split(":"):
-        audio_file = audio_file.strip()
+    for audio_file in split_audio_entries(audio_files_str):
         if not audio_file:
             continue
         if audio_file.startswith("%silence(") and audio_file.endswith(")"):
@@ -4135,6 +4150,15 @@ def audio_frames(audio_files_str):
                 continue
             for _ in range(int(duration * 8000 / 160)):
                 yield b"\xff" * 160
+            continue
+        tts_payload = decode_tts_token(audio_file)
+        if tts_payload:
+            yield from iter_tts_ffmpeg_chunks(
+                tts_payload,
+                ["-ar", str(8000), "-ac", "1", "-f", "mulaw", "-flush_packets", "1", "pipe:1"],
+                chunk_size=160,
+                pad_byte=b"\xff",
+            )
             continue
         file_path = resolve_audio_file(audio_file)
         if not file_path:
@@ -4178,6 +4202,32 @@ def audio_frames(audio_files_str):
 
 def fetch_broadcast(broadcast_id):
     return fetch_active_broadcast(broadcast_id)
+
+
+def broadcast_target_tokens(record):
+    explicit = (record or {}).get("explicit_targets")
+    exclude = (record or {}).get("exclude_targets")
+    targets = []
+    seen = set()
+    if isinstance(explicit, (list, tuple, set)):
+        source = explicit
+    elif explicit:
+        source = str(explicit).replace(",", " ").split()
+    else:
+        source = resolve_group_targets((record or {}).get("groups"))
+    for item in source:
+        token = str(item or "").strip()
+        if token and token not in seen:
+            seen.add(token)
+            targets.append(token)
+    excluded = set()
+    if isinstance(exclude, (list, tuple, set)):
+        excluded = {str(item or "").strip() for item in exclude if str(item or "").strip()}
+    elif exclude:
+        excluded = {token for token in str(exclude).replace(",", " ").split() if token}
+    if not excluded:
+        return targets
+    return [token for token in targets if token not in excluded]
 
 
 def hydrate_active_record_from_history(record):
@@ -4254,21 +4304,21 @@ def resolve_group_targets(group_id):
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            target_list = set()
-            if str(group_id) == "0":
+            group_ids = []
+            for gid in str(group_id or "").split("."):
+                token = gid.strip()
+                if token and token not in group_ids:
+                    group_ids.append(token)
+            rows = fetch_group_rows(cur, None if "0" in group_ids else group_ids)
+            targets = regular_group_targets(rows)
+            if targets:
+                return targets
+            if "0" in group_ids:
+                target_list = set()
                 for module_name in output_module_names():
                     target_list.add(f"{module_name}/all")
-            else:
-                for gid in str(group_id or "").split("."):
-                    gid = gid.strip()
-                    if not gid:
-                        continue
-                    cur.execute("SELECT members FROM groups WHERE id = %s", (gid,))
-                    group_row = cur.fetchone()
-                    if group_row and group_row[0]:
-                        for member in group_row[0].replace(",", " ").split():
-                            target_list.add(member)
-            return sorted(target_list)
+                return sorted(target_list)
+            return []
     finally:
         conn.close()
 
@@ -4682,12 +4732,20 @@ def ensure_message_vendor_schema():
             message_columns = {row[0] for row in cur.fetchall()}
             if "vendor_specific" not in message_columns:
                 cur.execute("ALTER TABLE messages ADD COLUMN vendor_specific TEXT DEFAULT NULL")
+            cur.execute("SHOW COLUMNS FROM messages LIKE 'audio'")
+            message_audio = cur.fetchone()
+            if message_audio and "text" not in str(message_audio[1] or "").lower():
+                cur.execute("ALTER TABLE messages MODIFY COLUMN audio TEXT DEFAULT NULL")
             cur.execute("SHOW COLUMNS FROM broadcasts")
             broadcast_columns = {row[0] for row in cur.fetchall()}
             if "vendor_specific" not in broadcast_columns:
                 cur.execute("ALTER TABLE broadcasts ADD COLUMN vendor_specific TEXT DEFAULT NULL")
             else:
                 cur.execute("ALTER TABLE broadcasts MODIFY COLUMN vendor_specific TEXT DEFAULT NULL")
+            cur.execute("SHOW COLUMNS FROM broadcasts LIKE 'audio'")
+            broadcast_audio = cur.fetchone()
+            if broadcast_audio and "text" not in str(broadcast_audio[1] or "").lower():
+                cur.execute("ALTER TABLE broadcasts MODIFY COLUMN audio TEXT DEFAULT NULL")
         conn.commit()
         message_vendor_schema_ready = True
     finally:
@@ -4852,8 +4910,8 @@ def input_module_send_message(module_name, message_id, group_id, sender_id=None,
                 sender_value,
                 overrides=overrides or None,
             )
-            expire_message_rule_broadcasts(cur, expires_rule, [broadcast_id])
-            expire_broadcasts_triggered_by_template(cur, message_id, [broadcast_id])
+            expire_message_rule_broadcasts(cur, expires_rule, [broadcast_id], trigger_groups=groups)
+            expire_broadcasts_triggered_by_template(cur, message_id, [broadcast_id], trigger_groups=groups)
         conn.commit()
         return broadcast_id
     finally:
@@ -4884,8 +4942,8 @@ def input_module_send_custom_message(module_name, group_id, values):
             elif "vendor_parameters" in values:
                 values["vendor_specific"] = vendor_specific_for_module(module_name, values.pop("vendor_parameters")) or ""
             broadcast_id, expires_rule = create_custom_broadcast(cur, values, groups=groups, sender=sender_value)
-            expire_message_rule_broadcasts(cur, expires_rule, [broadcast_id])
-            expire_any_message_rule_broadcasts(cur, [broadcast_id])
+            expire_message_rule_broadcasts(cur, expires_rule, [broadcast_id], trigger_groups=groups)
+            expire_any_message_rule_broadcasts(cur, [broadcast_id], trigger_groups=groups)
         conn.commit()
         return broadcast_id
     finally:
@@ -5146,7 +5204,35 @@ def start_ipc_server():
             conn, _ = server_socket.accept()
         except OSError:
             break
+        tune_ipc_stream_socket(conn)
         threading.Thread(target=handle_ipc_client, args=(conn,), daemon=True).start()
+
+
+def pump_ipc_audio_stream(conn, deliver_frame, on_chunk=None, frame_size=SIP_OUTPUT_FRAME_BYTES, pad_final=True):
+    pending = bytearray()
+    chunk_count = 0
+    byte_count = 0
+    frame_count = 0
+    partial_flushed = False
+    while True:
+        chunk = conn.recv(65536)
+        if not chunk:
+            break
+        chunk_count += 1
+        byte_count += len(chunk)
+        if on_chunk is not None:
+            on_chunk(chunk_count, byte_count, len(chunk))
+        pending.extend(chunk)
+        while len(pending) >= frame_size:
+            frame = bytes(pending[:frame_size])
+            del pending[:frame_size]
+            deliver_frame(frame)
+            frame_count += 1
+    if pad_final and pending:
+        deliver_frame(bytes(pending).ljust(frame_size, b"\xff"))
+        frame_count += 1
+        partial_flushed = True
+    return chunk_count, byte_count, frame_count, partial_flushed
 
 
 def handle_prepare(conn, parts):
@@ -5162,19 +5248,29 @@ def handle_prepare(conn, parts):
     ready = state.ready_event.wait(10.0)
     log(f"handle_prepare waited stream={stream_id} ready={ready}")
     conn.sendall(b"OK\n")
-    while True:
-        chunk = conn.recv(65536)
-        if not chunk:
-            break
-        log(f"handle_prepare audio_chunk stream={stream_id} bytes={len(chunk)} modules={list(target_map.keys())}")
+    def deliver_frame(frame):
         for module_name in target_map:
             with loaded_modules_lock:
                 mod = loaded_modules.get(module_name)
             if mod and hasattr(mod, "receive_audio"):
                 try:
-                    mod.receive_audio(chunk, stream_id)
+                    mod.receive_audio(frame, stream_id)
                 except Exception as exc:
                     log(f"receive_audio error in {module_name}: {exc}")
+    def log_chunk(chunk_count, byte_count, last_chunk_size):
+        log(
+            f"handle_prepare audio_chunk stream={stream_id} chunks={chunk_count} "
+            f"bytes={byte_count} last_chunk={last_chunk_size} modules={list(target_map.keys())}"
+        )
+    chunk_count, byte_count, frame_count, partial_flushed = pump_ipc_audio_stream(
+        conn,
+        deliver_frame,
+        on_chunk=log_chunk,
+    )
+    log(
+        f"handle_prepare stream_end stream={stream_id} chunks={chunk_count} bytes={byte_count} "
+        f"frames={frame_count} partial_flushed={partial_flushed}"
+    )
     finish_stream(stream_id)
 
 
@@ -5213,30 +5309,35 @@ def handle_stream_prepare(conn, parts, action_name):
         return
     conn.sendall(b"OK\n")
     page_debug(f"handle_stream_prepare_ok action={action_name} stream={stream_id}")
-    chunk_count = 0
-    byte_count = 0
-    while True:
-        chunk = conn.recv(65536)
-        if not chunk:
-            break
-        chunk_count += 1
-        byte_count += len(chunk)
-        if chunk_count == 1 or chunk_count % 50 == 0:
-            page_debug(
-                f"handle_stream_prepare_audio action={action_name} stream={stream_id} "
-                f"chunks={chunk_count} bytes={byte_count} last_chunk={len(chunk)} modules={list(target_map.keys())}"
-            )
-        log(f"handle_stream_prepare action={action_name} audio_chunk stream={stream_id} bytes={len(chunk)} modules={list(target_map.keys())}")
+    def deliver_frame(frame):
         for module_name in target_map:
             with loaded_modules_lock:
                 mod = loaded_modules.get(module_name)
             if mod and hasattr(mod, "receive_audio"):
                 try:
-                    mod.receive_audio(chunk, stream_id)
+                    mod.receive_audio(frame, stream_id)
                 except Exception as exc:
                     log(f"receive_audio error in {module_name}: {exc}")
                     page_debug(f"receive_audio_error module={module_name} stream={stream_id} error={exc.__class__.__name__}: {exc}")
-    page_debug(f"handle_stream_prepare_end action={action_name} stream={stream_id} chunks={chunk_count} bytes={byte_count}")
+    def log_chunk(chunk_count, byte_count, last_chunk_size):
+        if chunk_count == 1 or chunk_count % 50 == 0:
+            page_debug(
+                f"handle_stream_prepare_audio action={action_name} stream={stream_id} "
+                f"chunks={chunk_count} bytes={byte_count} last_chunk={last_chunk_size} modules={list(target_map.keys())}"
+            )
+        log(
+            f"handle_stream_prepare action={action_name} audio_chunk stream={stream_id} "
+            f"chunks={chunk_count} bytes={byte_count} last_chunk={last_chunk_size} modules={list(target_map.keys())}"
+        )
+    chunk_count, byte_count, frame_count, partial_flushed = pump_ipc_audio_stream(
+        conn,
+        deliver_frame,
+        on_chunk=log_chunk,
+    )
+    page_debug(
+        f"handle_stream_prepare_end action={action_name} stream={stream_id} "
+        f"chunks={chunk_count} bytes={byte_count} frames={frame_count} partial_flushed={partial_flushed}"
+    )
     finish_stream(stream_id)
 
 
@@ -5261,11 +5362,13 @@ def deliver_broadcast(stream_id, broadcast_id):
     broadcast = fetch_broadcast(broadcast_id)
     if not broadcast:
         log(f"handle_broadcast missing broadcast={broadcast_id}")
-        return False
-    targets = resolve_group_targets(broadcast.get("groups"))
+        return "failed"
+    if active_broadcast_stop_requested(broadcast_id):
+        return "stopped"
+    targets = broadcast_target_tokens(broadcast)
     if not targets:
         log(f"handle_broadcast no_targets stream={stream_id} broadcast={broadcast_id} groups={broadcast.get('groups')}")
-        return False
+        return "failed"
     msg_type = broadcast.get("type")
     audio_files = broadcast.get("audio") or ""
     metadata = {
@@ -5298,7 +5401,7 @@ def deliver_broadcast(stream_id, broadcast_id):
             desktop_matched = int(desktop_result.get("matched") or 0)
             if not target_map and desktop_matched <= 0:
                 log(f"handle_broadcast no_target_modules stream={stream_id} broadcast={broadcast_id} targets={targets}")
-                return False
+                return "failed"
             if target_map:
                 state = create_stream_state(stream_id, target_map)
                 dispatch("prepare_audio", stream_id, broadcast_id, targets, metadata)
@@ -5306,7 +5409,11 @@ def deliver_broadcast(stream_id, broadcast_id):
                 log(f"handle_broadcast waited stream={stream_id} ready={ready}")
             frame_duration = 160 / 8000
             next_send_time = time.perf_counter()
+            stopped = False
             for frame in [first_frame]:
+                if active_broadcast_stop_requested(broadcast_id):
+                    stopped = True
+                    break
                 for module_name in target_map:
                     with loaded_modules_lock:
                         mod = loaded_modules.get(module_name)
@@ -5320,26 +5427,30 @@ def deliver_broadcast(stream_id, broadcast_id):
                         send_stream_frame(desktop_sock, frame)
                 except Exception as exc:
                     log(f"desktop broadcast frame error broadcast={broadcast_id}: {exc}")
-            for frame in gen:
-                next_send_time += frame_duration
-                sleep_time = next_send_time - time.perf_counter()
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-                else:
-                    next_send_time = time.perf_counter()
-                for module_name in target_map:
-                    with loaded_modules_lock:
-                        mod = loaded_modules.get(module_name)
-                    if mod and hasattr(mod, "receive_audio"):
-                        try:
-                            mod.receive_audio(frame, stream_id)
-                        except Exception as exc:
-                            log(f"receive_audio error in {module_name}: {exc}")
-                try:
-                    if desktop_sock is not None:
-                        send_stream_frame(desktop_sock, frame)
-                except Exception as exc:
-                    log(f"desktop broadcast frame error broadcast={broadcast_id}: {exc}")
+            if not stopped:
+                for frame in gen:
+                    if active_broadcast_stop_requested(broadcast_id):
+                        stopped = True
+                        break
+                    next_send_time += frame_duration
+                    sleep_time = next_send_time - time.perf_counter()
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+                    else:
+                        next_send_time = time.perf_counter()
+                    for module_name in target_map:
+                        with loaded_modules_lock:
+                            mod = loaded_modules.get(module_name)
+                        if mod and hasattr(mod, "receive_audio"):
+                            try:
+                                mod.receive_audio(frame, stream_id)
+                            except Exception as exc:
+                                log(f"receive_audio error in {module_name}: {exc}")
+                    try:
+                        if desktop_sock is not None:
+                            send_stream_frame(desktop_sock, frame)
+                    except Exception as exc:
+                        log(f"desktop broadcast frame error broadcast={broadcast_id}: {exc}")
             try:
                 if desktop_sock is not None:
                     desktop_sock.close()
@@ -5347,10 +5458,10 @@ def deliver_broadcast(stream_id, broadcast_id):
                 pass
             if target_map:
                 finish_stream(stream_id)
-            return True
+            return "stopped" if stopped else "sent"
         log(f"handle_broadcast audio_type_no_audio broadcast={broadcast_id} audio={audio_files}")
     dispatch("sendmsg", stream_id, broadcast_id, targets, metadata)
-    return True
+    return "stopped" if active_broadcast_stop_requested(broadcast_id) else "sent"
 
 
 def finish_claimed_broadcast_delivery(stream_id, broadcast_id, source):
@@ -5359,10 +5470,18 @@ def finish_claimed_broadcast_delivery(stream_id, broadcast_id, source):
             sync_modules()
         except Exception as exc:
             log(f"{source} sync_modules error broadcast={broadcast_id}: {exc}")
-        if deliver_broadcast(stream_id, broadcast_id):
+        broadcast = fetch_broadcast(broadcast_id)
+        status = deliver_broadcast(stream_id, broadcast_id)
+        clear_active_broadcast_stop_request(broadcast_id)
+        if status == "sent":
             mark_broadcast_history_delivery(broadcast_id, "sent")
             mark_active_broadcast_delivery(broadcast_id, "sent")
             log(f"{source} dispatched broadcast={broadcast_id} stream={stream_id}")
+        elif status == "stopped":
+            persistent = bool(broadcast) and not record_is_bell(broadcast) and not record_is_immediate(broadcast)
+            mark_broadcast_history_delivery(broadcast_id, "stopped" if persistent else "cancelled")
+            mark_active_broadcast_delivery(broadcast_id, "stopped")
+            log(f"{source} stopped broadcast={broadcast_id} stream={stream_id} persistent={persistent}")
         else:
             mark_broadcast_history_delivery(broadcast_id, "failed")
             mark_active_broadcast_delivery(broadcast_id, "failed")
@@ -5855,4 +5974,3 @@ def handle_ipc_client(conn):
         log(f"IPC connection handler error: {exc}")
     finally:
         conn.close()
-

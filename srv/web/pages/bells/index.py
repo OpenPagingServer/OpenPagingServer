@@ -37,13 +37,17 @@ def handle_request():
         ORDER BY s.enabled DESC, s.name ASC
         """
     )
+    schedules = filter_bell_schedule_rows_for_user(user, schedules)
     enabled_count = sum(1 for row in schedules if int(row.get("enabled") or 0) == 1)
     list_row = query_one("SELECT COUNT(*) AS total FROM bell_lists WHERE schedule_id = 0")
     list_count = int((list_row or {}).get("total") or 0)
     exception_row = query_one("SELECT COUNT(DISTINCT bell_date) AS total FROM bell_calendar_lists")
     exception_count = int((exception_row or {}).get("total") or 0)
     demo = demo_mode_enabled()
-    actions = '<a class="btn secondary" href="/bells/bell-lists"><i class="fa-solid fa-list-check"></i> System Lists</a><a class="btn" href="' + ("javascript:openDemoModePopup('bells')" if demo else "/bells/new") + '"><i class="fa-solid fa-plus"></i> New Schedule</a>'
+    new_schedule_action = ""
+    if can_create_bell_schedules(user):
+        new_schedule_action = '<a class="btn" href="' + ("javascript:openDemoModePopup('bells')" if demo else "/bells/new") + '"><i class="fa-solid fa-plus"></i> New Schedule</a>'
+    actions = '<a class="btn secondary" href="/bells/bell-lists"><i class="fa-solid fa-list-check"></i> System Lists</a>' + new_schedule_action
     rows = []
     for schedule in schedules:
         enabled = int(schedule.get("enabled") or 0) == 1

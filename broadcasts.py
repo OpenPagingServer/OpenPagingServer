@@ -15,8 +15,12 @@ from active_broadcast_store import (
     expire_active_broadcasts_any_message,
     expire_active_broadcasts_by_template_ids,
     expire_active_broadcasts_triggered_by_template,
+    list_active_broadcasts,
+    mark_active_broadcast_delivery,
     put_active_broadcast,
 )
+from group_features import build_monitor_message_child_records, selected_group_ids
+from tts import decode_tts_token, encode_tts_token, join_audio_entries, split_audio_entries
 
 
 TYPE_MAP = {
@@ -488,6 +492,24 @@ def expand_broadcast_record_variables(cursor, record, source_values=None):
                 api_cache=api_cache,
                 product_name=product,
             )
+    if "audio" in record:
+        audio_entries = []
+        for entry in split_audio_entries(record.get("audio")):
+            payload = decode_tts_token(entry)
+            if not payload:
+                audio_entries.append(entry)
+                continue
+            payload["text"] = expand_message_variables(
+                payload.get("text"),
+                cursor,
+                sender=sender,
+                sender_context=sender_context,
+                now=issued,
+                api_cache=api_cache,
+                product_name=product,
+            )
+            audio_entries.append(encode_tts_token(payload))
+        record["audio"] = join_audio_entries(audio_entries)
     return record
 
 
@@ -701,6 +723,105 @@ def history_update_delivery(cursor, broadcast_ids, status):
     )
 
 
+def _serialize_group_ids(group_ids):
+    tokens = []
+    seen = set()
+    for group_id in group_ids or []:
+        token = str(group_id or "").strip()
+        if token and token not in seen:
+            seen.add(token)
+            tokens.append(token)
+    return ".".join(tokens)
+
+
+def _history_update_groups(cursor, updates):
+    columns = table_columns(cursor, "broadcasts")
+    if "groups" not in columns:
+        return
+    for broadcast_id, groups_value in updates:
+        token = str(broadcast_id or "").strip()
+        if not token:
+            continue
+        cursor.execute(
+            "UPDATE broadcasts SET `groups` = %s WHERE id = %s",
+            (str(groups_value or "").strip(), token),
+        )
+
+
+def _monitor_child_records_for_parent(parent_id, snapshots):
+    wanted = str(parent_id or "").strip()
+    return [
+        record
+        for record in (snapshots or [])
+        if str(record.get("source_broadcast_id") or "").strip() == wanted
+    ]
+
+
+def _sync_monitor_children_for_parent(cursor, parent_record, snapshots):
+    existing_children = _monitor_child_records_for_parent((parent_record or {}).get("id"), snapshots)
+    _excluded_targets, rebuilt_children = build_monitor_message_child_records(cursor, parent_record)
+    if rebuilt_children:
+        child = dict(rebuilt_children[0])
+        if existing_children:
+            existing = existing_children[0]
+            preserved_id = str(existing.get("id") or "").strip()
+            if preserved_id:
+                child["id"] = preserved_id
+            child["delivery"] = str(existing.get("delivery") or parent_record.get("delivery") or "pending")
+        put_active_broadcast(child)
+        for extra in existing_children[1:]:
+            extra_id = str(extra.get("id") or "").strip()
+            if extra_id:
+                mark_active_broadcast_delivery(extra_id, "expired")
+        return
+    for existing in existing_children:
+        existing_id = str(existing.get("id") or "").strip()
+        if existing_id:
+            mark_active_broadcast_delivery(existing_id, "expired")
+
+
+def _expire_matching_broadcasts_for_groups(cursor, matcher, trigger_groups, exclude_broadcast_ids=None):
+    trigger_value = str(trigger_groups or "").strip()
+    if not trigger_value:
+        return []
+    target_group_ids = selected_group_ids(trigger_value, cursor=cursor)
+    if not target_group_ids:
+        return []
+    target_group_set = set(target_group_ids)
+    excluded = {str(broadcast_id or "").strip() for broadcast_id in (exclude_broadcast_ids or []) if str(broadcast_id or "").strip()}
+    snapshots = list_active_broadcasts(limit=5000)
+    expired_ids = []
+    group_updates = []
+    for record in snapshots:
+        if not record or bool(record.get("monitor_child")):
+            continue
+        record_id = str(record.get("id") or "").strip()
+        if not record_id or record_id in excluded or not matcher(record):
+            continue
+        record_group_ids = selected_group_ids(record.get("groups"), cursor=cursor)
+        if not record_group_ids:
+            continue
+        remaining_group_ids = [group_id for group_id in record_group_ids if group_id not in target_group_set]
+        if len(remaining_group_ids) == len(record_group_ids):
+            continue
+        if not remaining_group_ids:
+            mark_active_broadcast_delivery(record_id, "expired")
+            for child in _monitor_child_records_for_parent(record_id, snapshots):
+                child_id = str(child.get("id") or "").strip()
+                if child_id:
+                    mark_active_broadcast_delivery(child_id, "expired")
+            expired_ids.append(record_id)
+            continue
+        updated_record = dict(record)
+        updated_record["groups"] = _serialize_group_ids(remaining_group_ids)
+        put_active_broadcast(updated_record)
+        _sync_monitor_children_for_parent(cursor, updated_record, snapshots)
+        group_updates.append((record_id, updated_record["groups"]))
+    if group_updates:
+        _history_update_groups(cursor, group_updates)
+    return expired_ids
+
+
 def parse_expires(value, issued=None):
     return parse_message_expiration(value, issued)
 
@@ -775,7 +896,13 @@ def create_broadcast_record(values, groups=None, sender=None):
 def create_custom_broadcast(cursor, values, groups=None, sender=None):
     record = create_broadcast_record(values, groups=groups, sender=sender)
     expand_broadcast_record_variables(cursor, record, source_values=values)
-    return insert_broadcast_record(cursor, record)
+    excluded_targets, monitor_children = build_monitor_message_child_records(cursor, record)
+    if excluded_targets:
+        record["exclude_targets"] = list(excluded_targets)
+    broadcast_id, expires_rule = insert_broadcast_record(cursor, record)
+    for child in monitor_children:
+        put_active_broadcast(child)
+    return broadcast_id, expires_rule
 
 
 def create_broadcast_from_template(cursor, template, groups, sender="", overrides=None):
@@ -799,26 +926,52 @@ def create_broadcast_from_template(cursor, template, groups, sender="", override
     return create_custom_broadcast(cursor, values, groups=groups, sender=sender)
 
 
-def expire_message_rule_broadcasts(cursor, expires_rule, exclude_broadcast_ids=None):
+def expire_message_rule_broadcasts(cursor, expires_rule, exclude_broadcast_ids=None, trigger_groups=None):
     targets = message_expiration_trigger_targets(expires_rule)
     template_ids = targets["message_ids"]
     if not template_ids:
         return
-    expired_ids = expire_active_broadcasts_by_template_ids(
-        template_ids,
-        exclude_broadcast_ids=exclude_broadcast_ids,
-    )
+    if str(trigger_groups or "").strip():
+        wanted_templates = {str(template_id).strip() for template_id in template_ids if str(template_id).strip()}
+        expired_ids = _expire_matching_broadcasts_for_groups(
+            cursor,
+            lambda record: str((record or {}).get("template_id") or "").strip() in wanted_templates,
+            trigger_groups,
+            exclude_broadcast_ids=exclude_broadcast_ids,
+        )
+    else:
+        expired_ids = expire_active_broadcasts_by_template_ids(
+            template_ids,
+            exclude_broadcast_ids=exclude_broadcast_ids,
+        )
     history_update_delivery(cursor, expired_ids, "expired")
 
 
-def expire_broadcasts_triggered_by_template(cursor, template_id, exclude_broadcast_ids=None):
-    expired_ids = expire_active_broadcasts_triggered_by_template(
-        template_id,
-        exclude_broadcast_ids=exclude_broadcast_ids,
-    )
+def expire_broadcasts_triggered_by_template(cursor, template_id, exclude_broadcast_ids=None, trigger_groups=None):
+    token = str(template_id or "").strip()
+    if str(trigger_groups or "").strip():
+        expired_ids = _expire_matching_broadcasts_for_groups(
+            cursor,
+            lambda record: token in message_expiration_trigger_targets((record or {}).get("expires_rule")).get("message_ids", []),
+            trigger_groups,
+            exclude_broadcast_ids=exclude_broadcast_ids,
+        )
+    else:
+        expired_ids = expire_active_broadcasts_triggered_by_template(
+            template_id,
+            exclude_broadcast_ids=exclude_broadcast_ids,
+        )
     history_update_delivery(cursor, expired_ids, "expired")
 
 
-def expire_any_message_rule_broadcasts(cursor, exclude_broadcast_ids=None):
-    expired_ids = expire_active_broadcasts_any_message(exclude_broadcast_ids=exclude_broadcast_ids)
+def expire_any_message_rule_broadcasts(cursor, exclude_broadcast_ids=None, trigger_groups=None):
+    if str(trigger_groups or "").strip():
+        expired_ids = _expire_matching_broadcasts_for_groups(
+            cursor,
+            lambda record: message_expiration_trigger_targets((record or {}).get("expires_rule")).get("any_message"),
+            trigger_groups,
+            exclude_broadcast_ids=exclude_broadcast_ids,
+        )
+    else:
+        expired_ids = expire_active_broadcasts_any_message(exclude_broadcast_ids=exclude_broadcast_ids)
     history_update_delivery(cursor, expired_ids, "expired")

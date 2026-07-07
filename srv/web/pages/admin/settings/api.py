@@ -43,13 +43,13 @@ def handle_request():
                     <span class="info-label">Enable REST API over HTTP</span>
                     <span><label class="switch"><input type="checkbox" name="api_http_enable" id="apiToggle"{checked}><span class="slider"></span></label></span>
                 </div>
-                <div class="info-row stacked" style="margin-bottom:16px;">
+                <div class="info-row" style="flex-direction: column; align-items: flex-start; gap: 8px; margin-bottom:16px;">
                     <span class="info-label">Port</span>
                     <input type="number" name="api_http_port" id="apiPort" min="1" max="65535" value="{h(data.get("api_http_port", "8088") or "8088")}"{disabled}>
                     <span id="apiPortError" class="port-error-text">Please enter a valid port (1-65535).</span>
                 </div>
                 <input type="hidden" name="save_api_settings" value="1">
-                <div class="settings-actions">
+                <div style="margin-top:20px; display:flex; align-items:center;">
                     <button type="button" id="saveApiBtn">Save Settings</button>
                     <span id="api-save-status" class="save-status"></span>
                 </div>

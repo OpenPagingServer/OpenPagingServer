@@ -3,9 +3,11 @@ from srv.web.app import *
 
 
 def handle_request():
-    user = require_admin()
+    user = require_user()
     if not isinstance(user, dict):
         return user
+    if not can_manage_messages(user):
+        abort(403)
     if request.method != "POST":
         abort(405)
     payload = request.get_json(silent=True) or {}
