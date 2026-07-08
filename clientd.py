@@ -29,9 +29,13 @@ DB_USER = os.getenv("DB_USER")
 DB_PASS = os.getenv("DB_PASS")
 DB_NAME = os.getenv("DB_NAME")
 DESKTOP_TOKEN_TTL_SECONDS = int(os.getenv("DESKTOP_TOKEN_TTL_SECONDS", "43200"))
+DESKTOP_REFRESH_TOKEN_TTL_SECONDS = int(os.getenv("DESKTOP_REFRESH_TOKEN_TTL_SECONDS", "2592000"))
 DESKTOP_CLIENT_HEADER = "x-ops-desktop-client"
 DESKTOP_TOKEN_PREFIX = "user/"
-DESKTOP_STREAM_CODEC = str(os.getenv("DESKTOP_STREAM_CODEC", "g722")).strip().lower()
+DESKTOP_REFRESH_TOKEN_PREFIX = "refresh/"
+GUEST_MEMBER_TOKEN = "guest"
+GUEST_TOKEN_TTL_SECONDS = 315360000
+DESKTOP_STREAM_CODEC = str(os.getenv("DESKTOP_STREAM_CODEC", "mulaw")).strip().lower()
 RUNTIME_DIR = Path("/tmp/openpagingserver-runtime") if os.name != "nt" else (BASE_DIR / "runtime")
 RUNTIME_DB_PATH = RUNTIME_DIR / "desktop_runtime.sqlite3"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -95,7 +99,7 @@ def new_connection_id():
 
 def mark_connected(connection_id, user_id):
     cid = str(connection_id or "").strip()
-    uid = str(user_id or "").strip()
+    uid = str(user_id if user_id is not None else "").strip()
     if not cid or not uid:
         return
     with _runtime_connect() as conn:
@@ -127,11 +131,11 @@ def connected_user_ids():
     with _runtime_connect() as conn:
         _prune_runtime(conn)
         rows = conn.execute("SELECT DISTINCT user_id FROM desktop_clients").fetchall()
-    return {str(row["user_id"] or "").strip() for row in rows if str(row["user_id"] or "").strip()}
+    return {str(row["user_id"] if row["user_id"] is not None else "").strip() for row in rows if str(row["user_id"] if row["user_id"] is not None else "").strip()}
 
 
 def user_has_connected_client(user_id):
-    return str(user_id or "").strip() in connected_user_ids()
+    return str(user_id if user_id is not None else "").strip() in connected_user_ids()
 
 
 def db():
@@ -166,6 +170,27 @@ def desktop_member_user_id(value):
     return user_id if user_id.isdigit() else ""
 
 
+def member_token_for_user(user_id):
+    key = str(user_id if user_id is not None else "").strip()
+    if key in {"", GUEST_MEMBER_TOKEN}:
+        return GUEST_MEMBER_TOKEN
+    return desktop_member_token(key)
+
+
+def guest_receiver_active():
+    try:
+        conn = db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM systemsettings WHERE parameter='guest_receiver_enabled' LIMIT 1")
+                row = cur.fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        return False
+    return str((row or {}).get("value") or "0").strip() == "1"
+
+
 def parse_datetime(value):
     if not value:
         return None
@@ -193,10 +218,27 @@ def normalize_color(value):
     return "#" + token.lower()
 
 
-def build_desktop_token(user):
-    expires_at = int(time.time()) + max(60, DESKTOP_TOKEN_TTL_SECONDS)
+def build_desktop_token(user, ttl_seconds=None):
+    ttl = ttl_seconds if ttl_seconds is not None else DESKTOP_TOKEN_TTL_SECONDS
+    expires_at = int(time.time()) + max(60, ttl)
     payload = {
-        "user_id": int(user.get("id") or 0),
+        "user_id": str(user.get("id") if user.get("id") is not None else "").strip(),
+        "username": str(user.get("username") or ""),
+        "role": str(user.get("role") or ""),
+        "exp": expires_at,
+    }
+    payload_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    payload_b64 = base64.urlsafe_b64encode(payload_bytes).decode("ascii").rstrip("=")
+    signature = hmac.new(desktop_secret(), payload_b64.encode("ascii"), hashlib.sha256).hexdigest()
+    return f"{payload_b64}.{signature}", expires_at
+
+
+def build_desktop_refresh_token(user, ttl_seconds=None):
+    ttl = ttl_seconds if ttl_seconds is not None else DESKTOP_REFRESH_TOKEN_TTL_SECONDS
+    expires_at = int(time.time()) + max(3600, ttl)
+    payload = {
+        "kind": DESKTOP_REFRESH_TOKEN_PREFIX.rstrip("/"),
+        "user_id": str(user.get("id") if user.get("id") is not None else "").strip(),
         "username": str(user.get("username") or ""),
         "role": str(user.get("role") or ""),
         "exp": expires_at,
@@ -222,7 +264,11 @@ def verify_desktop_token(token):
         return None
     if int(payload.get("exp") or 0) < int(time.time()):
         return None
-    user_id = str(payload.get("user_id") or "")
+    if str(payload.get("role") or "") == "guest":
+        if not guest_receiver_active():
+            return None
+        return {"id": GUEST_MEMBER_TOKEN, "username": "Guest", "role": "guest"}
+    user_id = str(payload.get("user_id") if payload.get("user_id") is not None else "").strip()
     if not user_id.isdigit():
         return None
     conn = db()
@@ -237,8 +283,62 @@ def verify_desktop_token(token):
         conn.close()
     if not user:
         return None
-    expire_date = user.get("accountexpire")
-    if expire_date and str(expire_date) not in {"0000-00-00", "None"} and str(expire_date) < datetime.now().strftime("%Y-%m-%d"):
+    expire_text = str(user.get("accountexpire") or "").strip()[:10]
+    if (
+        len(expire_text) == 10
+        and expire_text.count("-") == 2
+        and expire_text[:4].isdigit()
+        and expire_text != "0000-00-00"
+        and expire_text < datetime.now().strftime("%Y-%m-%d")
+    ):
+        return None
+    return user
+
+
+def verify_desktop_refresh_token(token):
+    raw = str(token or "").strip()
+    if "." not in raw:
+        return None
+    payload_b64, signature = raw.rsplit(".", 1)
+    expected = hmac.new(desktop_secret(), payload_b64.encode("ascii"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        return None
+    padding = "=" * (-len(payload_b64) % 4)
+    try:
+        payload = json.loads(base64.urlsafe_b64decode((payload_b64 + padding).encode("ascii")).decode("utf-8"))
+    except Exception:
+        return None
+    if str(payload.get("kind") or "") != DESKTOP_REFRESH_TOKEN_PREFIX.rstrip("/"):
+        return None
+    if int(payload.get("exp") or 0) < int(time.time()):
+        return None
+    if str(payload.get("role") or "") == "guest":
+        if not guest_receiver_active():
+            return None
+        return {"id": GUEST_MEMBER_TOKEN, "username": "Guest", "role": "guest"}
+    user_id = str(payload.get("user_id") if payload.get("user_id") is not None else "").strip()
+    if not user_id.isdigit():
+        return None
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, username, role, email, accountexpire, loginsleft FROM users WHERE id=%s LIMIT 1",
+                (user_id,),
+            )
+            user = cur.fetchone()
+    finally:
+        conn.close()
+    if not user:
+        return None
+    expire_text = str(user.get("accountexpire") or "").strip()[:10]
+    if (
+        len(expire_text) == 10
+        and expire_text.count("-") == 2
+        and expire_text[:4].isdigit()
+        and expire_text != "0000-00-00"
+        and expire_text < datetime.now().strftime("%Y-%m-%d")
+    ):
         return None
     return user
 
@@ -251,7 +351,7 @@ def groups_for_user(user_id):
             rows = cur.fetchall()
     finally:
         conn.close()
-    wanted = desktop_member_token(user_id)
+    wanted = member_token_for_user(user_id)
     groups = []
     for row in rows:
         members = str(row.get("members") or "").replace(",", " ").split()
@@ -261,7 +361,7 @@ def groups_for_user(user_id):
 
 
 def cached_groups_for_user(user_id, force=False):
-    user_key = str(user_id or "").strip()
+    user_key = str(user_id if user_id is not None else "").strip()
     if not user_key:
         return []
     now = time.time()
@@ -296,7 +396,7 @@ def broadcast_explicit_targets(broadcast):
 def user_in_broadcast(user_id, broadcast):
     explicit = broadcast_explicit_targets(broadcast)
     if explicit:
-        return desktop_member_token(user_id) in explicit
+        return member_token_for_user(user_id) in explicit
     target_groups = [part.strip() for part in str((broadcast or {}).get("groups") or "").split(".") if part.strip()]
     if not target_groups:
         return False
@@ -334,8 +434,11 @@ def desktop_payload_for_broadcast(user, broadcast, server_origin):
         "message_type": str(broadcast.get("type") or ""),
         "shortmessage": str(broadcast.get("shortmessage") or ""),
         "longmessage": str(broadcast.get("longmessage") or ""),
+        "name": str(broadcast.get("name") or ""),
+        "expires": str(broadcast.get("expires") or ""),
         "priority": str(broadcast.get("priority") or "Normal"),
         "color": color,
+        "icon": str(broadcast.get("icon") or ""),
         "sender": str(broadcast.get("sender") or ""),
         "issued": str(broadcast.get("issued") or ""),
         "product_name": product_name(),
@@ -955,14 +1058,19 @@ def broadcast_watcher_loop():
                         continue
                     if broadcast_id in connection.sent_ids:
                         continue
-                    if issued_at and issued_at < connection.connected_at:
-                        continue
+                    late = bool(issued_at and issued_at < connection.connected_at)
                     if not user_in_broadcast(connection.user.get("id"), broadcast):
                         continue
                     try:
                         payload = desktop_payload_for_broadcast(connection.user, broadcast, connection.server_origin)
                         if payload.get("has_audio"):
-                            continue
+                            if not late:
+                                continue
+                            payload["audio_mode"] = ""
+                            payload["audio_codec"] = ""
+                            payload["audio_sample_rate"] = 0
+                        if late:
+                            payload["late"] = True
                         with connection.send_lock:
                             send_ws_json(connection.sock, payload)
                         connection.sent_ids.add(broadcast_id)
@@ -1017,9 +1125,6 @@ def handle_desktop_websocket_client(conn, addr, request=None):
         path, query, headers = parse_ws_request(request)
         if path != "/desktop/ws":
             conn.sendall(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n")
-            return
-        if DESKTOP_CLIENT_HEADER not in headers:
-            conn.sendall(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nDesktop header required")
             return
         key = headers.get("sec-websocket-key", "")
         auth_value = headers.get("authorization", "")

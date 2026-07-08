@@ -18,7 +18,7 @@ MESSAGE_ICON_MAX_DIMENSION = 1080
 
 
 MESSAGE_FORM_STYLE = r"""
-body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:300; background-color:#FFF; height:100%; }
+body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:300; background-color:#FFF; height:100%; overflow:hidden; }
 #sidebar { width:220px; background-color:#1976D2; color:#FFF; height:100vh; position:fixed; top:0; left:0; display:flex; flex-direction:column; box-shadow:2px 0 8px rgba(0,0,0,0.2); transition:transform 0s; z-index:1200; }
 @media (max-width:767px){ #sidebar{ transform:translateX(-100%); } #sidebar.open{ transform:translateX(0); } }
 #sidebar h2 { text-align:center; padding:20px 0; margin:0; font-weight:500; background-color:#1565C0; font-size:1.2em; color:#FFF; }
@@ -337,22 +337,6 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 
 
 MESSAGE_FORM_SCRIPT = r"""
-function toggleFields() {
-    const typeRadios = document.getElementsByName('type');
-    let selectedType = '';
-    for (let i = 0; i < typeRadios.length; i++) {
-        if (typeRadios[i].checked) {
-            selectedType = typeRadios[i].value;
-            break;
-        }
-    }
-    const visualFields = document.getElementById('visual-fields');
-    const audioFields = document.getElementById('audio-fields');
-    if (visualFields) visualFields.style.display = 'none';
-    if (audioFields) audioFields.style.display = 'none';
-    if (visualFields && (selectedType === 'text' || selectedType === 'text+audio')) visualFields.style.display = 'block';
-    if (audioFields && (selectedType === 'audio' || selectedType === 'text+audio')) audioFields.style.display = 'block';
-}
 const colorPicker = document.getElementById('colorPicker');
 const colorHex = document.getElementById('colorHex');
 if (colorPicker && colorHex) {

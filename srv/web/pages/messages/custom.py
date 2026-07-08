@@ -13,7 +13,6 @@ from srv.web.pages.messages.form_common import (
     MESSAGE_FORM_SCRIPT,
     MESSAGE_FORM_STYLE,
     audio_transfer_html,
-    material_radio_group_html,
     message_expiration_field_html,
     message_expiration_from_form,
     message_icon_field_html,
@@ -112,8 +111,14 @@ def handle_request():
     ensure_message_vendor_schema()
 
     if request.method == "POST":
-        msg_type = request.form.get("type", "text")
-        has_text = msg_type in {"text", "text+audio"}
+        audio_value = ":".join([v.strip() for v in request.form.getlist("audio_files[]") if v.strip()])
+        shortmessage = request.form.get("shortmessage", "")
+        longmessage = message_multiline_text(request.form.get("longmessage", ""))
+        has_audio = bool(audio_value)
+        has_text = bool(shortmessage.strip() or longmessage.strip())
+        if not has_audio and not has_text:
+            return redirect("/messages/custom")
+        msg_type = "text+audio" if (has_audio and has_text) else ("audio" if has_audio else "text")
         if request.form.get("send_all"):
             groups_value = all_group_ids_value(user)
         else:
@@ -130,24 +135,36 @@ def handle_request():
         if groups_value in {"", "0"}:
             return redirect("/messages/custom")
         expires_rule = message_expiration_from_form(request.form)
-        create_custom_broadcast(
-            {
-                "name": "Custom message",
-                "shortmessage": request.form.get("shortmessage", ""),
-                "longmessage": message_multiline_text(request.form.get("longmessage", "")),
-                "icon": resolve_message_icon_value(request.form.get("icon", "")) if has_text else "",
-                "color": request.form.get("color", "").lstrip("#"),
-                "groups": groups_value,
-                "image": request.form.get("image", ""),
-                "audio": ":".join(request.form.getlist("audio_files[]")),
-                "sender": user.get("username") or session.get("username") or "User",
-                "priority": request.form.get("priority", "Normal"),
-                "type": msg_type,
-                "vendor_specific": vendor_specific_from_form(request.form),
-            },
-            expires_rule,
-        )
-        return redirect("/messages/")
+        try:
+            broadcast_id = create_custom_broadcast(
+                {
+                    "name": "Custom message",
+                    "shortmessage": shortmessage if has_text else "",
+                    "longmessage": longmessage if has_text else "",
+                    "icon": resolve_message_icon_value(request.form.get("icon", "")) if has_text else "",
+                    "color": request.form.get("color", "").lstrip("#") if has_text else "",
+                    "groups": groups_value,
+                    "image": request.form.get("image", ""),
+                    "audio": audio_value,
+                    "sender": user.get("username") or session.get("username") or "User",
+                    "priority": request.form.get("priority", "Normal"),
+                    "type": msg_type,
+                    "vendor_specific": vendor_specific_from_form(request.form),
+                },
+                expires_rule,
+            )
+            return redirect(f"/messages/send-status?bid={broadcast_id}")
+        except Exception:
+            fail_key = uuid.uuid4().hex
+            try:
+                from active_broadcast_store import RUNTIME_DIR
+                RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+                with open(RUNTIME_DIR / f"send-debug-{fail_key}.log", "a", encoding="utf-8") as handle:
+                    handle.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] custom send failed groups={groups_value}\n")
+                    handle.write(traceback.format_exc() + "\n")
+            except OSError:
+                pass
+            return redirect(f"/messages/send-status?fail={fail_key}")
 
     conn = db()
     try:
@@ -194,16 +211,6 @@ def handle_request():
         groups_html = '<p class="help-text">No groups are available.</p>'
     transfer = audio_transfer_html(audio_files())
     vendor_specific_html = vendor_specific_editor_html(context={"mode": "message_custom"})
-    type_group = material_radio_group_html(
-        "type",
-        [
-            ("text+audio", "Audio & visual message"),
-            ("audio", "Audio message"),
-            ("text", "Visual message"),
-        ],
-        onchange="toggleFields()",
-        required=True,
-    )
     variable_fields = (
         message_variable_field_html(
             "shortmessage",
@@ -235,12 +242,14 @@ def handle_request():
 {groups_html}
                 </div>
             </div>
-            <div class="form-group">
-                <label class="main-label">Message Type</label>
-                {type_group}
+            <div id="audio-fields" class="form-group">
+                <label class="main-label">Audio</label>
+                <p class="help-text">Optional. If you only add audio, an audio message is sent. If you only enter text, a visual message is sent. Adding both sends an audio &amp; visual message.</p>
+                {transfer}
             </div>
-            <div id="visual-fields" style="display:none;">
+            <div id="visual-fields">
 {variable_fields}
+{message_icon_field_html()}
                 <div class="form-group">
                     <label class="main-label">Color</label>
                 <div class="color-picker-container">
@@ -248,11 +257,6 @@ def handle_request():
                     <input type="text" name="color" id="colorHex" class="form-control" style="width:150px;" placeholder="000000" maxlength="6">
                 </div>
             </div>
-{message_icon_field_html()}
-            </div>
-            <div id="audio-fields" style="display:none;" class="form-group">
-                <label class="main-label">Audio</label>
-                {transfer}
             </div>
             {message_expiration_field_html(expiration_messages)}
             <div class="form-group">

@@ -107,7 +107,6 @@ def handle_request():
         conn.close()
     groups = filter_group_rows_for_user(user, groups)
     allowed_group_ids = {str(group.get("id") or "").strip() for group in groups if str(group.get("id") or "").strip()}
-    send_error = ""
     if request.method == "POST":
         if request.form.get("send_all"):
             targets = all_group_ids_value(user)
@@ -119,10 +118,19 @@ def handle_request():
         if targets in {"", "0"}:
             return redirect(f"/messages/send?msgid={h(msgid)}")
         try:
-            create_broadcast(msgid, targets, user.get("username") or session.get("username") or "User")
-            return redirect("/messages/")
-        except Exception as exc:
-            send_error = "Failed to send message: " + str(exc)
+            broadcast_id = create_broadcast(msgid, targets, user.get("username") or session.get("username") or "User")
+            return redirect(f"/messages/send-status?bid={broadcast_id}")
+        except Exception:
+            fail_key = uuid.uuid4().hex
+            try:
+                from active_broadcast_store import RUNTIME_DIR
+                RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+                with open(RUNTIME_DIR / f"send-debug-{fail_key}.log", "a", encoding="utf-8") as handle:
+                    handle.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] send failed msgid={msgid} targets={targets}\n")
+                    handle.write(traceback.format_exc() + "\n")
+            except OSError:
+                pass
+            return redirect(f"/messages/send-status?fail={fail_key}")
 
     endpoint_data = endpoint_ipc("LIST_ENDPOINTS")
     endpoint_error = None if endpoint_data.get("ok", True) else endpoint_data.get("error") or "Endpoint manager returned an error."
@@ -158,7 +166,7 @@ def handle_request():
         group_html = "\n".join(group_rows)
     else:
         group_html = '                <div class="info-row"><span class="info-label" style="color:#777;">No groups available.</span></div>'
-    error_html = f'<div class="info-card" style="border-color:#C62828;color:#C62828;">{h(send_error)}</div>' if send_error else ""
+    error_html = ""
     content = f"""    <div class="header-actions">
         <h1>Sending {h(msg.get("name"))}</h1>
     </div>

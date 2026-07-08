@@ -4204,6 +4204,39 @@ def fetch_broadcast(broadcast_id):
     return fetch_active_broadcast(broadcast_id)
 
 
+class BroadcastRecordingWriter:
+    def __init__(self, broadcast_id):
+        self.broadcast_id = str(broadcast_id or "").strip() or uuid.uuid4().hex
+        self.runtime_dir = Path(tempfile.gettempdir()) / "openpagingserver-runtime" / "broadcast-recordings"
+        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        self.path = self.runtime_dir / f"broadcast-{self.broadcast_id}.wav"
+        self.wave_file = wave.open(str(self.path), "wb")
+        self.wave_file.setnchannels(1)
+        self.wave_file.setsampwidth(2)
+        self.wave_file.setframerate(8000)
+        self.closed = False
+
+    def write_frame(self, frame):
+        if self.closed:
+            return
+        payload = bytes(frame or b"")
+        if not payload:
+            return
+        pcm = bytearray()
+        for byte in payload:
+            sample = int(ULAW_TO_LINEAR_TABLE[byte])
+            pcm.extend(struct.pack("<h", sample))
+        self.wave_file.writeframesraw(bytes(pcm))
+
+    def close(self):
+        if self.closed:
+            return
+        try:
+            self.wave_file.close()
+        finally:
+            self.closed = True
+
+
 def broadcast_target_tokens(record):
     explicit = (record or {}).get("explicit_targets")
     exclude = (record or {}).get("exclude_targets")
@@ -5392,6 +5425,7 @@ def deliver_broadcast(stream_id, broadcast_id):
         if has_audio:
             target_map = normalize_targets(targets)
             desktop_sock = None
+            recording = None
             try:
                 desktop_sock, desktop_result = start_desktop_broadcast_stream(broadcast_id, codec="mulaw", sample_rate=8000)
             except Exception as exc:
@@ -5402,6 +5436,11 @@ def deliver_broadcast(stream_id, broadcast_id):
             if not target_map and desktop_matched <= 0:
                 log(f"handle_broadcast no_target_modules stream={stream_id} broadcast={broadcast_id} targets={targets}")
                 return "failed"
+            try:
+                recording = BroadcastRecordingWriter(broadcast_id)
+            except Exception as exc:
+                recording = None
+                log(f"broadcast recording start error broadcast={broadcast_id}: {exc}")
             if target_map:
                 state = create_stream_state(stream_id, target_map)
                 dispatch("prepare_audio", stream_id, broadcast_id, targets, metadata)
@@ -5414,6 +5453,16 @@ def deliver_broadcast(stream_id, broadcast_id):
                 if active_broadcast_stop_requested(broadcast_id):
                     stopped = True
                     break
+                if recording is not None:
+                    try:
+                        recording.write_frame(frame)
+                    except Exception as exc:
+                        log(f"broadcast recording write error broadcast={broadcast_id}: {exc}")
+                        try:
+                            recording.close()
+                        except Exception:
+                            pass
+                        recording = None
                 for module_name in target_map:
                     with loaded_modules_lock:
                         mod = loaded_modules.get(module_name)
@@ -5432,6 +5481,16 @@ def deliver_broadcast(stream_id, broadcast_id):
                     if active_broadcast_stop_requested(broadcast_id):
                         stopped = True
                         break
+                    if recording is not None:
+                        try:
+                            recording.write_frame(frame)
+                        except Exception as exc:
+                            log(f"broadcast recording write error broadcast={broadcast_id}: {exc}")
+                            try:
+                                recording.close()
+                            except Exception:
+                                pass
+                            recording = None
                     next_send_time += frame_duration
                     sleep_time = next_send_time - time.perf_counter()
                     if sleep_time > 0:
@@ -5456,6 +5515,22 @@ def deliver_broadcast(stream_id, broadcast_id):
                     desktop_sock.close()
             except Exception:
                 pass
+            recording_path = ""
+            if recording is not None:
+                try:
+                    recording.close()
+                    recording_path = str(recording.path)
+                except Exception as exc:
+                    log(f"broadcast recording close error broadcast={broadcast_id}: {exc}")
+            if recording_path:
+                try:
+                    updated = dict(broadcast or {})
+                    updated["runtime_recording"] = recording_path
+                    updated["runtime_recording_codec"] = "wav"
+                    updated["runtime_recording_sample_rate"] = 8000
+                    put_active_broadcast(updated)
+                except Exception as exc:
+                    log(f"broadcast recording persist error broadcast={broadcast_id}: {exc}")
             if target_map:
                 finish_stream(stream_id)
             return "stopped" if stopped else "sent"

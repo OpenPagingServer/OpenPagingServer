@@ -117,6 +117,7 @@ def _normalize_login_settings(form, existing):
         "login_captcha_secret_key": "",
         "login_captcha_external_only": "1" if form.get("login_captcha_external_only") else "0",
         ACCOUNT_EXPIRATION_NOTIFY_SETTING: "1" if form.get(ACCOUNT_EXPIRATION_NOTIFY_SETTING) else "0",
+        GUEST_RECEIVER_SETTING: "1" if form.get(GUEST_RECEIVER_SETTING) else "0",
         "identity_provider": provider,
         "identity_redirect_auto": "1" if form.get("identity_redirect_auto") else "0",
         "identity_allow_local_login": "1" if form.get("identity_allow_local_login") else "0",
@@ -320,6 +321,7 @@ def handle_request():
         save_setting("login_captcha_secret_key", cleaned["login_captcha_secret_key"], "Login CAPTCHA secret key")
         save_setting("login_captcha_external_only", cleaned["login_captcha_external_only"], "Require login CAPTCHA only for external IP addresses (0/1)")
         save_setting(ACCOUNT_EXPIRATION_NOTIFY_SETTING, cleaned[ACCOUNT_EXPIRATION_NOTIFY_SETTING], "Notify users whose accounts are about to expire (0/1)")
+        save_setting(GUEST_RECEIVER_SETTING, cleaned[GUEST_RECEIVER_SETTING], "Enable guest receiver (0/1)")
         save_setting("identity_provider", cleaned["identity_provider"], "Identity provider")
         save_setting("identity_redirect_auto", cleaned["identity_redirect_auto"], "Redirect login page to provider automatically (0/1)")
         save_setting("identity_allow_local_login", cleaned["identity_allow_local_login"], "Always allow local login (0/1)")
@@ -460,9 +462,10 @@ def handle_request():
             border: 1px solid #E6E6E6;
             border-radius: 8px;
             padding: 0;
-            overflow: hidden;
+            overflow: visible;
         }}
-        .ldap-settings-dropdown summary {{
+        .ldap-settings-dropdown summary,
+        .ldap-settings-header {{
             list-style: none;
             cursor: pointer;
             padding: 14px 16px;
@@ -472,6 +475,9 @@ def handle_request():
             align-items: center;
             justify-content: space-between;
             user-select: none;
+        }}
+        .ldap-settings-header {{
+            cursor: default;
         }}
         .ldap-settings-dropdown summary::-webkit-details-marker {{
             display: none;
@@ -502,7 +508,7 @@ def handle_request():
             padding-bottom: 0;
         }}
         .settings-section-divider {{
-            border-bottom: 1px solid #f0f0f0;
+            border-bottom: 1px solid #333;
             padding-bottom: 16px;
             margin-bottom: 20px;
         }}
@@ -534,11 +540,72 @@ def handle_request():
         .ldap-role-mapping-recipient-list .ldap-role-empty {{
             padding-top: 0;
         }}
+        .ldap-role-mapping-recipient-dropdown {{
+            position: relative;
+        }}
+        .login-settings button.ldap-role-mapping-recipient-trigger {{
+            width: 100%;
+            min-height: 42px;
+            border: 1px solid #CCC;
+            border-radius: 6px;
+            background: #FFF;
+            color: #222;
+            padding: 10px;
+            font-size: 14px;
+            font-weight: 300;
+            text-align: left;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            cursor: pointer;
+        }}
+        .login-settings button.ldap-role-mapping-recipient-trigger:hover {{
+            background: #FFF;
+        }}
+        .ldap-role-mapping-recipient-trigger .summary {{
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }}
+        .ldap-role-mapping-recipient-trigger .caret {{
+            color: #666;
+            font-size: 0.85em;
+        }}
+        .ldap-role-mapping-recipient-dropdown.open .ldap-role-mapping-recipient-trigger .caret {{
+            transform: rotate(180deg);
+        }}
+        .ldap-role-mapping-recipient-menu {{
+            display: none;
+            position: absolute;
+            top: calc(100% + 6px);
+            left: 0;
+            right: 0;
+            z-index: 20;
+            border: 1px solid #DADCE0;
+            border-radius: 10px;
+            background: #FFF;
+            box-shadow: 0 8px 18px rgba(0,0,0,0.15);
+            padding: 10px;
+        }}
+        .ldap-role-mapping-recipient-dropdown.open .ldap-role-mapping-recipient-menu {{
+            display: block;
+        }}
         .ldap-role-mapping-field {{
             display: flex;
             flex-direction: column;
             gap: 8px;
             min-width: 0;
+        }}
+        .ldap-role-mapping-field-fallback {{
+            grid-column: span 2;
+            align-self: stretch;
+            justify-content: center;
+        }}
+        .ldap-role-mapping-fallback-text {{
+            color: #5F6368;
+            font-weight: 500;
         }}
         .ldap-role-mapping-remove {{
             align-self: end;
@@ -551,17 +618,7 @@ def handle_request():
             color: #3C4043;
         }}
         .ldap-role-mapping-add {{
-            margin-top: 12px;
-        }}
-        .ldap-role-mapping-static {{
-            min-height: 42px;
-            display: flex;
-            align-items: center;
-            border: 1px solid #DADCE0;
-            border-radius: 8px;
-            background: #FFF;
-            padding: 10px 12px;
-            color: #5F6368;
+            margin-top: 0;
         }}
         .ldap-role-user-permissions {{
             margin-top: 12px;
@@ -675,6 +732,9 @@ def handle_request():
             .ldap-role-mapping-head {{
                 grid-template-columns: 1fr;
             }}
+            .ldap-role-mapping-field-fallback {{
+                grid-column: auto;
+            }}
             .ldap-role-mapping-remove {{
                 width: 100%;
             }}
@@ -696,16 +756,30 @@ def handle_request():
                 border-color: #333;
                 background: #1B1D20;
             }}
-            .ldap-role-mapping-static {{
-                border-color: #3C4043;
-                background: #202124;
+            .login-settings button.ldap-role-mapping-recipient-trigger {{
+                border-color: #444;
+                background: #1E1E1E;
                 color: #E0E0E0;
+            }}
+            .login-settings button.ldap-role-mapping-recipient-trigger:hover {{
+                background: #1E1E1E;
+            }}
+            .ldap-role-mapping-recipient-trigger .caret {{
+                color: #BBB;
+            }}
+            .ldap-role-mapping-recipient-menu {{
+                border-color: #3C4043;
+                background: #1B1D20;
+                box-shadow: 0 10px 24px rgba(0,0,0,0.45);
+            }}
+            .ldap-role-mapping-fallback-text {{
+                color: #BBB;
             }}
             .ldap-role-user-permissions {{
                 border-color: #333;
                 background: #1B1D20;
             }}
-            .ldap-role-user-permissions summary, .ldap-role-user-permissions summary i, .ldap-role-permission-title {{
+            .ldap-role-user-permissions summary, .ldap-role-user-permissions summary i, .ldap-role-permission-title, .ldap-settings-header {{
                 color: #E0E0E0;
             }}
             .ldap-role-permission-choice, .ldap-role-scope-choice {{
@@ -738,10 +812,10 @@ def handle_request():
                 </div>
                 <div class="settings-section-divider">
                     <div id="localIdentityNotice" style="margin-top:12px; margin-bottom:16px;">
-                        <p>All users are managed and stored on this server. System administrators are responsible for adding and remvoing each individual access when necessary.</p>
+                        <p>All users are managed and stored on this server. System administrators are responsible for adding and removing each individual access when necessary.</p>
                     </div>
                     <div id="ssoIdentityOptions" style="display:none; margin-top:12px; margin-bottom:16px;">
-                        <div class="info-row">
+                        <div class="info-row" style="border-bottom:none;">
                             <span class="info-label">Redirect login page to provider automatically</span>
                             <span><label class="switch"><input type="checkbox" name="identity_redirect_auto" id="identityRedirectAuto"{" checked" if identity_data.get("identity_redirect_auto") == "1" else ""}><span class="slider"></span></label></span>
                         </div>
@@ -751,7 +825,7 @@ def handle_request():
                         </div>
                     </div>
                     <div id="ldapIdentityFields" style="display:none;">
-                        <details class="ldap-settings-dropdown" id="ldapSettingsDropdown" open>
+                        <details class="ldap-settings-dropdown" id="ldapSettingsDropdown">
                             <summary>LDAP Settings</summary>
                             <div class="ldap-settings-panel">
                                 <div class="info-row" style="flex-direction: column; align-items: flex-start; gap: 8px;">
@@ -834,7 +908,7 @@ def handle_request():
                         </details>
                     </div>
                     <div id="oidcIdentityFields" style="display:none;">
-                        <details class="ldap-settings-dropdown" id="oidcSettingsDropdown" open>
+                        <details class="ldap-settings-dropdown" id="oidcSettingsDropdown">
                             <summary>OIDC Settings</summary>
                             <div class="ldap-settings-panel">
                                 <div class="info-row" style="flex-direction: column; align-items: flex-start; gap: 8px;">
@@ -873,8 +947,8 @@ def handle_request():
                                     <span class="info-label">Groups claim</span>
                                     <input type="text" name="oidc_groups_claim" id="oidcGroupsClaim" value="{h(identity_data.get("oidc_groups_claim", OIDC_SETTING_DEFAULTS['oidc_groups_claim']))}">
                                 </div>
-                                <details class="ldap-settings-dropdown nested-identity-settings" id="oidcScimDropdown">
-                                    <summary>SCIM Settings</summary>
+                                <div class="ldap-settings-dropdown nested-identity-settings" id="oidcScimDropdown">
+                                    <div class="ldap-settings-header">SCIM Settings</div>
                                     <div class="ldap-settings-panel scim-settings-fields" id="oidcScimFields">
                                         <div class="info-row">
                                             <span class="info-label">Enable SCIM</span>
@@ -895,7 +969,7 @@ def handle_request():
                                             </div>
                                         </div>
                                     </div>
-                                </details>
+                                </div>
                                 <div class="info-row" style="flex-direction: column; align-items: flex-start; gap: 8px;">
                                     <span class="info-label">Role mapping</span>
                                     <input type="hidden" name="{OIDC_ROLE_MAPPING_SETTING}" id="oidcRoleMappingsJson">
@@ -906,7 +980,7 @@ def handle_request():
                         </details>
                     </div>
                     <div id="samlIdentityFields" style="display:none;">
-                        <details class="ldap-settings-dropdown" id="samlSettingsDropdown" open>
+                        <details class="ldap-settings-dropdown" id="samlSettingsDropdown">
                             <summary>SAML Settings</summary>
                             <div class="ldap-settings-panel">
                                 <div class="info-row" style="flex-direction: column; align-items: flex-start; gap: 8px;">
@@ -941,8 +1015,8 @@ def handle_request():
                                     <span class="info-label">Groups attribute</span>
                                     <input type="text" name="saml_groups_attribute" id="samlGroupsAttribute" value="{h(identity_data.get("saml_groups_attribute", SAML_SETTING_DEFAULTS['saml_groups_attribute']))}">
                                 </div>
-                                <details class="ldap-settings-dropdown nested-identity-settings" id="samlScimDropdown">
-                                    <summary>SCIM Settings</summary>
+                                <div class="ldap-settings-dropdown nested-identity-settings" id="samlScimDropdown">
+                                    <div class="ldap-settings-header">SCIM Settings</div>
                                     <div class="ldap-settings-panel scim-settings-fields" id="samlScimFields">
                                         <div class="info-row">
                                             <span class="info-label">Enable SCIM</span>
@@ -963,7 +1037,7 @@ def handle_request():
                                             </div>
                                         </div>
                                     </div>
-                                </details>
+                                </div>
                                 <div class="info-row" style="flex-direction: column; align-items: flex-start; gap: 8px;">
                                     <span class="info-label">Role mapping</span>
                                     <input type="hidden" name="{SAML_ROLE_MAPPING_SETTING}" id="samlRoleMappingsJson">
@@ -1012,9 +1086,20 @@ def handle_request():
                     </span>
                     <span><label class="switch"><input type="checkbox" name="login_captcha_external_only" id="captchaExternalOnly"{" checked" if data.get("login_captcha_external_only", "1") == "1" else ""}><span class="slider"></span></label></span>
                 </div>
-                <div class="info-row" style="border-bottom: none; margin-top: 20px;">
-                    <span class="info-label">Notifiy users whose accounts are about to expire</span>
-                    <span><label class="switch"><input type="checkbox" name="{ACCOUNT_EXPIRATION_NOTIFY_SETTING}" id="accountExpirationNotifyToggle"{" checked" if data.get(ACCOUNT_EXPIRATION_NOTIFY_SETTING, "1") == "1" else ""}><span class="slider"></span></label></span>
+                <div class="settings-section-divider" style="margin-top: 20px; border-bottom: none; padding-bottom: 0; border-top: 1px solid #333; padding-top: 16px;">
+                    <div class="info-row" style="border-bottom: none;">
+                        <div class="info-label"><h4 style="margin:0;">Notify users whose accounts are about to expire</h4></div>
+                        <span><label class="switch"><input type="checkbox" name="{ACCOUNT_EXPIRATION_NOTIFY_SETTING}" id="accountExpirationNotifyToggle"{" checked" if data.get(ACCOUNT_EXPIRATION_NOTIFY_SETTING, "1") == "1" else ""}><span class="slider"></span></label></span>
+                    </div>
+                </div>
+                <div class="settings-section-divider" style="border-bottom: none; padding-bottom: 0; border-top: 1px solid #333; padding-top: 16px;">
+                    <div class="info-row" style="border-bottom: none;">
+                        <div class="info-label">
+                            <h4 style="margin:0;">Enable guest receiver</h4>
+                            <span class="info-description">When enabled, a new recipient becomes available which allows logged out users to receive messages. Anything sent to this recipient will be able to be seen by anyone able to access the web interface.</span>
+                        </div>
+                        <span><label class="switch"><input type="checkbox" name="{GUEST_RECEIVER_SETTING}" id="guestReceiverToggle"{" checked" if data.get(GUEST_RECEIVER_SETTING, "0") == "1" else ""}><span class="slider"></span></label></span>
+                    </div>
                 </div>
                 <input type="hidden" name="save_login_settings" value="1">
                 <div style="margin-top:20px; display:flex; align-items:center;">
@@ -1197,6 +1282,47 @@ document.addEventListener('DOMContentLoaded', function() {
         }).join('');
     }
 
+    function roleMappingRecipientSummary(values, selectedValues) {
+        const selected = Array.isArray(selectedValues) ? selectedValues : [];
+        if (!values.length) {
+            return 'No groups available';
+        }
+        if (!selected.length) {
+            return 'Add to recipient groups';
+        }
+        const labelsById = {};
+        values.forEach(function(row) {
+            const id = String((row || {}).id || '').trim();
+            if (!id) return;
+            labelsById[id] = String((row || {}).label || id).trim() || id;
+        });
+        const labels = selected
+            .map(function(id) {
+                const key = String(id || '').trim();
+                if (!key) return '';
+                return labelsById[key] || key;
+            })
+            .filter(Boolean);
+        if (!labels.length) {
+            return 'Add to recipient groups';
+        }
+        return labels.join(', ');
+    }
+
+    function roleMappingRecipientDropdown(values, selectedValues) {
+        const summaryText = roleMappingRecipientSummary(values, selectedValues);
+        const recipientChoices = roleMappingScopeChoices(values, selectedValues, 'data-role-mapping-recipient-group-id');
+        return '<div class="ldap-role-mapping-recipient-dropdown" data-role-mapping-recipient-dropdown="1">' +
+            '<button type="button" class="ldap-role-mapping-recipient-trigger" data-role-mapping-recipient-trigger="1">' +
+                '<span class="summary" data-role-mapping-recipient-summary="1">' + escapeHtml(summaryText) + '</span>' +
+                '<i class="fa-solid fa-chevron-down caret"></i>' +
+            '</button>' +
+            '<div class="ldap-role-mapping-recipient-menu" data-role-mapping-recipient-menu="1">' +
+                '<div class="ldap-role-scope-list" style="margin-top:0; max-height:180px;">' + recipientChoices + '</div>' +
+            '</div>' +
+        '</div>';
+    }
+
     function roleMappingUserPanel(mapping) {
         if (mapping.role !== 'user') return '';
         const permissionBlocks = roleMappingPermissionSections.map(function(section) {
@@ -1291,35 +1417,37 @@ document.addEventListener('DOMContentLoaded', function() {
                 ].map(function(option) {
                     return '<option value="' + option[0] + '"' + (mapping.role === option[0] ? ' selected' : '') + '>' + option[1] + '</option>';
                 }).join('');
-                const recipientChoices = roleMappingScopeChoices(roleMappingGroupOptions, mapping.recipient_groups, 'data-role-mapping-recipient-group-id');
-                const groupField = mapping.fallback === '1'
-                    ? '<div class="ldap-role-mapping-static">other</div>'
-                    : '<input type="text" data-role-mapping-group-match value="' + escapeHtml(mapping.group_match) + '" placeholder="any">';
-                const claimField = mapping.fallback === '1'
-                    ? '<div class="ldap-role-mapping-static">any</div>'
-                    : '<textarea data-role-mapping-claim-match rows="2" placeholder="any">' + escapeHtml(mapping.claim_match) + '</textarea>';
+                const recipientDropdown = roleMappingRecipientDropdown(roleMappingGroupOptions, mapping.recipient_groups);
+                const matchFields = mapping.fallback === '1'
+                    ? '<div class="ldap-role-mapping-field ldap-role-mapping-field-fallback">' +
+                        '<div class="ldap-role-mapping-fallback-text">Other/Unmatched</div>' +
+                      '</div>'
+                    : '<div class="ldap-role-mapping-field">' +
+                        '<span class="info-label">Match group</span>' +
+                        '<input type="text" data-role-mapping-group-match value="' + escapeHtml(mapping.group_match) + '" placeholder="any">' +
+                      '</div>' +
+                      '<div class="ldap-role-mapping-field">' +
+                        '<span class="info-label">Match claims</span>' +
+                        '<textarea data-role-mapping-claim-match rows="1" placeholder="any" style="height:42px;min-height:42px;max-height:42px;resize:none;overflow:auto;">' + escapeHtml(mapping.claim_match) + '</textarea>' +
+                      '</div>';
                 const removeAction = mapping.fallback === '1'
                     ? '<div></div>'
-                    : '<button type="button" class="ldap-role-mapping-remove" data-role-mapping-remove="1"><i class="fa-solid fa-trash"></i></button>';
+                    : '<button type="button" class="ldap-role-mapping-remove" data-role-mapping-remove="1" style="background:#C62828;color:#FFF;border:none;padding:10px 14px;border-radius:8px;display:inline-flex;align-items:center;gap:8px;cursor:pointer;"><i class="fa-solid fa-trash"></i><span>Delete</span></button>';
                 return '<div class="ldap-role-mapping-card" data-role-mapping-index="' + index + '">' +
                     '<div class="ldap-role-mapping-head">' +
-                        '<div class="ldap-role-mapping-field">' +
-                            '<span class="info-label">Match group</span>' +
-                            groupField +
-                        '</div>' +
-                        '<div class="ldap-role-mapping-field">' +
-                            '<span class="info-label">Match claims</span>' +
-                            claimField +
-                        '</div>' +
+                        matchFields +
                         '<div class="ldap-role-mapping-field">' +
                             '<span class="info-label">Recipient groups</span>' +
-                            '<div class="ldap-role-mapping-recipient-list">' + recipientChoices + '</div>' +
+                            recipientDropdown +
                         '</div>' +
                         '<div class="ldap-role-mapping-field">' +
                             '<span class="info-label">Role</span>' +
                             '<select data-role-mapping-role>' + roleOptions + '</select>' +
                         '</div>' +
-                        removeAction +
+                        '<div class="ldap-role-mapping-field" style="justify-content:flex-end;">' +
+                            '<span class="info-label">&nbsp;</span>' +
+                            removeAction +
+                        '</div>' +
                     '</div>' +
                     roleMappingUserPanel(mapping) +
                 '</div>';
@@ -1330,6 +1458,12 @@ document.addEventListener('DOMContentLoaded', function() {
 
         function bindEvents() {
             if (!listElement) return;
+            function closeRecipientDropdowns(exceptElement) {
+                Array.from(listElement.querySelectorAll('[data-role-mapping-recipient-dropdown="1"]')).forEach(function(dropdown) {
+                    if (exceptElement && dropdown === exceptElement) return;
+                    dropdown.classList.remove('open');
+                });
+            }
             Array.from(listElement.querySelectorAll('[data-role-mapping-index]')).forEach(function(card) {
                 const index = parseInt(card.getAttribute('data-role-mapping-index') || '-1', 10);
                 if (index < 0 || !mappings[index]) return;
@@ -1337,6 +1471,8 @@ document.addEventListener('DOMContentLoaded', function() {
                 const claimInput = card.querySelector('[data-role-mapping-claim-match]');
                 const roleSelect = card.querySelector('[data-role-mapping-role]');
                 const removeButton = card.querySelector('[data-role-mapping-remove]');
+                const recipientDropdown = card.querySelector('[data-role-mapping-recipient-dropdown="1"]');
+                const recipientTrigger = card.querySelector('[data-role-mapping-recipient-trigger="1"]');
                 const restrictGroupsToggle = card.querySelector('[data-role-mapping-restrict-groups]');
                 const restrictMessagesToggle = card.querySelector('[data-role-mapping-restrict-messages]');
                 const restrictBellSchedulesToggle = card.querySelector('[data-role-mapping-restrict-bell-schedules]');
@@ -1379,9 +1515,21 @@ document.addEventListener('DOMContentLoaded', function() {
                         render();
                     });
                 }
+                if (recipientTrigger && recipientDropdown) {
+                    recipientTrigger.addEventListener('click', function(event) {
+                        event.preventDefault();
+                        const willOpen = !recipientDropdown.classList.contains('open');
+                        closeRecipientDropdowns(recipientDropdown);
+                        if (willOpen) recipientDropdown.classList.add('open');
+                    });
+                }
                 Array.from(card.querySelectorAll('[data-role-mapping-recipient-group-id]')).forEach(function(input) {
                     input.addEventListener('change', function() {
                         mappings[index].recipient_groups = collectCheckedValues(card, '[data-role-mapping-recipient-group-id]', 'data-role-mapping-recipient-group-id');
+                        const summary = card.querySelector('[data-role-mapping-recipient-summary]');
+                        if (summary) {
+                            summary.innerText = roleMappingRecipientSummary(roleMappingGroupOptions, mappings[index].recipient_groups);
+                        }
                         syncInput();
                     });
                 });
@@ -1431,6 +1579,15 @@ document.addEventListener('DOMContentLoaded', function() {
                     });
                 });
             });
+            if (!window.__opsRoleMappingRecipientDropdownBound) {
+                document.addEventListener('click', function(event) {
+                    if (event.target && event.target.closest && event.target.closest('[data-role-mapping-recipient-dropdown="1"]')) return;
+                    Array.from(document.querySelectorAll('[data-role-mapping-recipient-dropdown="1"]')).forEach(function(dropdown) {
+                        dropdown.classList.remove('open');
+                    });
+                });
+                window.__opsRoleMappingRecipientDropdownBound = true;
+            }
         }
 
         if (addButton) {
@@ -1473,7 +1630,7 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     }
 
-    function syncIdentityProvider() {
+    function syncIdentityProvider(userChanged) {
         const value = identityProvider ? identityProvider.value : 'local';
         const isLdap = value === 'ldap';
         const isOidc = value === 'oidc';
@@ -1485,15 +1642,16 @@ document.addEventListener('DOMContentLoaded', function() {
         if (ldapIdentityFields) ldapIdentityFields.style.display = isLdap ? 'block' : 'none';
         if (oidcIdentityFields) oidcIdentityFields.style.display = isOidc ? 'block' : 'none';
         if (samlIdentityFields) samlIdentityFields.style.display = isSaml ? 'block' : 'none';
-        if (ldapSettingsDropdown) ldapSettingsDropdown.open = isLdap;
-        if (oidcSettingsDropdown) oidcSettingsDropdown.open = isOidc;
-        if (samlSettingsDropdown) samlSettingsDropdown.open = isSaml;
+        if (userChanged) {
+            if (ldapSettingsDropdown) ldapSettingsDropdown.open = isLdap;
+            if (oidcSettingsDropdown) oidcSettingsDropdown.open = isOidc;
+            if (samlSettingsDropdown) samlSettingsDropdown.open = isSaml;
+        }
     }
 
-    function syncScimSection(toggle, rows, dropdown) {
+    function syncScimSection(toggle, rows) {
         if (!toggle || !rows) return;
         rows.style.display = toggle.checked ? 'block' : 'none';
-        if (dropdown) dropdown.open = toggle.checked;
     }
 
     function currentTemplate() {
@@ -1525,20 +1683,20 @@ document.addEventListener('DOMContentLoaded', function() {
         syncCaptchaFields();
     }
     if (identityProvider) {
-        identityProvider.addEventListener('change', syncIdentityProvider);
-        syncIdentityProvider();
+        identityProvider.addEventListener('change', function() { syncIdentityProvider(true); });
+        syncIdentityProvider(false);
     }
     if (oidcScimEnabled) {
         oidcScimEnabled.addEventListener('change', function() {
-            syncScimSection(oidcScimEnabled, oidcScimConfigRows, oidcScimDropdown);
+            syncScimSection(oidcScimEnabled, oidcScimConfigRows);
         });
-        syncScimSection(oidcScimEnabled, oidcScimConfigRows, oidcScimDropdown);
+        syncScimSection(oidcScimEnabled, oidcScimConfigRows);
     }
     if (samlScimEnabled) {
         samlScimEnabled.addEventListener('change', function() {
-            syncScimSection(samlScimEnabled, samlScimConfigRows, samlScimDropdown);
+            syncScimSection(samlScimEnabled, samlScimConfigRows);
         });
-        syncScimSection(samlScimEnabled, samlScimConfigRows, samlScimDropdown);
+        syncScimSection(samlScimEnabled, samlScimConfigRows);
     }
     if (ldapTemplatePicker) {
         ldapTemplatePicker.addEventListener('change', function() {

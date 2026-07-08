@@ -35,8 +35,9 @@ def handle_request():
         abort(403)
     columns = table_columns("messages")
     message_type = str(row.get("type") or "")
-    show_visual = message_type in {"text", "text+audio", "liveaudio+text"}
-    show_audio = message_type in {"audio", "text+audio"}
+    unified = message_type in {"text", "audio", "text+audio", ""}
+    show_visual = unified or message_type in {"liveaudio+text"}
+    show_audio = unified
     error = ""
 
     if request.method == "POST":
@@ -47,11 +48,18 @@ def handle_request():
                 raise RuntimeError("Name is required.")
             if "name" in columns:
                 updates["name"] = name
+            audio_value = ":".join([v.strip() for v in request.form.getlist("audio_files[]") if v.strip()]) if show_audio else str(row.get("audio") or "")
+            shortmessage = request.form.get("shortmessage", "") if show_visual else str(row.get("shortmessage") or "")
+            longmessage = message_multiline_text(request.form.get("longmessage", "")) if show_visual else str(row.get("longmessage") or "")
+            has_audio = bool(audio_value)
+            has_text = bool(shortmessage.strip() or longmessage.strip())
+            if unified and not has_audio and not has_text:
+                raise RuntimeError("Enter a message, add audio, or both.")
             if show_visual:
                 if "shortmessage" in columns:
-                    updates["shortmessage"] = request.form.get("shortmessage", "")
+                    updates["shortmessage"] = shortmessage
                 if "longmessage" in columns:
-                    updates["longmessage"] = message_multiline_text(request.form.get("longmessage", ""))
+                    updates["longmessage"] = longmessage
                 if "color" in columns:
                     color = request.form.get("color", "").strip().lstrip("#").upper()
                     if color and not re.fullmatch(r"[A-F0-9]{6}", color):
@@ -60,7 +68,9 @@ def handle_request():
                 if "icon" in columns:
                     updates["icon"] = resolve_message_icon_value(request.form.get("icon", ""), row.get("icon", ""))
             if show_audio and "audio" in columns:
-                updates["audio"] = ":".join([v.strip() for v in request.form.getlist("audio_files[]") if v.strip()])
+                updates["audio"] = audio_value
+            if unified and "type" in columns:
+                updates["type"] = "text+audio" if (has_audio and has_text) else ("audio" if has_audio else "text")
             if "expires" in columns:
                 updates["expires"] = message_expiration_from_form(request.form)
             if "priority" in columns:
@@ -88,6 +98,15 @@ def handle_request():
     color_value = str(row.get("color") or "").strip().lstrip("#").upper()
     color_picker = "#" + color_value if re.fullmatch(r"[A-Fa-f0-9]{6}", color_value) else "#000000"
     error_html = f'<div class="error">{h(error)}</div>' if error else ""
+    audio_html = ""
+    if show_audio:
+        audio_help = '<p class="help-text">Optional. If you only add audio, this is saved as an audio message. If you only enter text, it is saved as a visual message. Adding both saves an audio &amp; visual message.</p>' if unified else ""
+        audio_html = f"""
+            <div id="audio-fields" class="form-group">
+                <label class="main-label">Audio</label>
+                {audio_help}
+                {audio_transfer_html(audio_files(), selected_audio)}
+            </div>"""
     visual_html = ""
     if show_visual:
         visual_html = f"""
@@ -104,6 +123,7 @@ def handle_request():
     f'<textarea name="longmessage" id="longmessage" class="form-control textarea-long" rows="7" wrap="soft">{h(row.get("longmessage"))}</textarea>',
     'Enter the long text message. Usually shown on apps, and in a "more details" section. This should contain as much information as a user would need to know about the situation or incident associated with the message.',
 )}
+{message_icon_field_html(row.get("icon") or "")}
                 <div class="form-group">
                     <label class="main-label">Color</label>
                     <p class="help-text">Certain endpoints can show a color-coded message.</p>
@@ -112,14 +132,6 @@ def handle_request():
                         <input type="text" name="color" id="colorHex" class="form-control" style="width: 150px;" placeholder="000000" maxlength="6" value="{h(color_value)}">
                     </div>
                 </div>
-{message_icon_field_html(row.get("icon") or "")}
-            </div>"""
-    audio_html = ""
-    if show_audio:
-        audio_html = f"""
-            <div id="audio-fields" class="form-group">
-                <label class="main-label">Audio</label>
-                {audio_transfer_html(audio_files(), selected_audio)}
             </div>"""
     vendor_specific_html = vendor_specific_editor_html(
         row.get("vendor_specific") or "",
@@ -141,8 +153,8 @@ def handle_request():
                 <input type="text" name="name" id="name" class="form-control" value="{h(row.get("name"))}" required>
             </div>
 
-            {visual_html}
             {audio_html}
+            {visual_html}
 
             {message_expiration_field_html(expiration_messages, row.get("expires") or "manual")}
 

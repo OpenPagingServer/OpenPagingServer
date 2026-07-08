@@ -647,7 +647,7 @@ class GatewayRuntime:
             self.peer_address_cache[cache_key] = (now_value, targets)
         return targets
 
-    def _note_peer_presence(self, public_key, source_ip):
+    def _note_peer_presence(self, public_key, source_ip, source_port=None):
         key_value = str(public_key or "").strip()
         ip_value = str(source_ip or "").split("%", 1)[0].strip()
         if not key_value or not ip_value:
@@ -655,11 +655,11 @@ class GatewayRuntime:
         now_value = monotonic_now()
         with self.presence_cache_lock:
             cached = self.presence_cache.get(key_value)
-            if cached is not None and cached[0] == ip_value and (now_value - cached[1]) < PRESENCE_UPDATE_INTERVAL_SECONDS:
+            if cached is not None and cached[0] == ip_value and (len(cached) > 2 and cached[2] == source_port) and (now_value - cached[1]) < PRESENCE_UPDATE_INTERVAL_SECONDS:
                 return
-            self.presence_cache[key_value] = (ip_value, now_value)
+            self.presence_cache[key_value] = (ip_value, now_value, source_port)
         try:
-            self.peer_store.update_presence(key_value, ip_value)
+            self.peer_store.update_presence(key_value, ip_value, source_port)
         except Exception:
             pass
 
@@ -721,7 +721,8 @@ class GatewayRuntime:
         except Exception:
             return
         source_ip = str(source_addr[0] or "").split("%", 1)[0].strip()
-        self._note_peer_presence(sender_public_key, source_ip)
+        source_port = int(source_addr[1])
+        self._note_peer_presence(sender_public_key, source_ip, source_port)
         if code == CODE_HELLO:
             try:
                 decode_hello_body(body)
@@ -932,6 +933,10 @@ def ensure_peer_table():
                 )
                 """
             )
+            try:
+                cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN last_port INT NULL DEFAULT NULL")
+            except Exception:
+                pass
     finally:
         conn.close()
 
@@ -974,15 +979,26 @@ def upsert_ops_peer(execute_fn, label, host, port, public_key, peer_type="gatewa
     )
 
 
-def update_ops_peer_presence(execute_fn, public_key, last_ip, last_seen=None):
-    execute_fn(
-        f"UPDATE {TABLE_NAME} SET last_seen=%s, last_ip=%s, updated_at=NOW() WHERE public_key=%s",
-        (
-            float(last_seen if last_seen is not None else time.time()),
-            normalize_host(last_ip),
-            normalize_public_key(public_key),
-        ),
-    )
+def update_ops_peer_presence(execute_fn, public_key, last_ip, last_seen=None, last_port=None):
+    try:
+        execute_fn(
+            f"UPDATE {TABLE_NAME} SET last_seen=%s, last_ip=%s, last_port=%s, updated_at=NOW() WHERE public_key=%s",
+            (
+                float(last_seen if last_seen is not None else time.time()),
+                normalize_host(last_ip),
+                last_port,
+                normalize_public_key(public_key),
+            ),
+        )
+    except Exception:
+        execute_fn(
+            f"UPDATE {TABLE_NAME} SET last_seen=%s, last_ip=%s, updated_at=NOW() WHERE public_key=%s",
+            (
+                float(last_seen if last_seen is not None else time.time()),
+                normalize_host(last_ip),
+                normalize_public_key(public_key),
+            ),
+        )
 
 
 def delete_ops_peer(execute_fn, peer_id):
@@ -1022,6 +1038,12 @@ def provision_gateway_peer(query_one_fn, execute_fn, payload, remote_addr, reque
     product = system_product_name(query_one_fn)
     gateway_label = str(payload.get("gateway_label") or "").strip()
     remote_ip = str(remote_addr or "").split("%", 1)[0].strip()
+    
+    # In demo mode, ignore the provided value for the name to belong on ops, and instead store the client IP address.
+    demo_mode = str(os.getenv("DEMO_MODE", "")).strip().lower() in {"1", "true", "yes", "on"}
+    if demo_mode:
+        gateway_label = remote_ip
+
     upsert_ops_peer(execute_fn, gateway_label or remote_ip, "", DEFAULT_PORT, payload.get("public_key"), peer_type="gateway", enabled=1)
     if remote_ip:
         update_ops_peer_presence(execute_fn, payload.get("public_key"), remote_ip, last_seen=time.time())
@@ -1042,7 +1064,7 @@ class OpsPeerStore:
             with conn.cursor(pymysql.cursors.DictCursor) as cur:
                 cur.execute(
                     f"""
-                    SELECT id, label, host, port, public_key, peer_type, enabled, last_seen, last_ip
+                    SELECT id, label, host, port, public_key, peer_type, enabled, last_seen, last_ip, last_port
                     FROM {TABLE_NAME}
                     WHERE enabled = 1
                     ORDER BY label ASC, id ASC
@@ -1057,19 +1079,27 @@ class OpsPeerStore:
             if not key:
                 continue
             row["host"] = str(row.get("host") or "").strip() or str(row.get("last_ip") or "").strip()
-            row["port"] = int(row.get("port") or DEFAULT_PORT)
+            # If no static host was specified, default port to last_port (the NAT-traversed UDP port)
+            is_dynamic = not str(row.get("host") or "").strip()
+            row["port"] = int((row.get("last_port") if is_dynamic else None) or row.get("port") or DEFAULT_PORT)
             mapping[key] = row
         return mapping
 
-    def update_presence(self, public_key, last_ip):
+    def update_presence(self, public_key, last_ip, last_port=None):
         ensure_peer_table()
         conn = db_connection()
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    f"UPDATE {TABLE_NAME} SET last_seen=%s, last_ip=%s WHERE public_key=%s",
-                    (float(datetime.now().timestamp()), str(last_ip or "").strip(), str(public_key or "").strip()),
-                )
+                try:
+                    cur.execute(
+                        f"UPDATE {TABLE_NAME} SET last_seen=%s, last_ip=%s, last_port=%s WHERE public_key=%s",
+                        (float(datetime.now().timestamp()), str(last_ip or "").strip(), last_port, str(public_key or "").strip()),
+                    )
+                except Exception:
+                    cur.execute(
+                        f"UPDATE {TABLE_NAME} SET last_seen=%s, last_ip=%s WHERE public_key=%s",
+                        (float(datetime.now().timestamp()), str(last_ip or "").strip(), str(public_key or "").strip()),
+                    )
         finally:
             conn.close()
 

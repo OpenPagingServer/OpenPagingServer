@@ -59,6 +59,9 @@ except ImportError:
 import endpoints
 from clientd import (
     DESKTOP_CLIENT_HEADER,
+    GUEST_MEMBER_TOKEN,
+    GUEST_TOKEN_TTL_SECONDS,
+    build_desktop_refresh_token,
     desktop_member_user_id,
     build_desktop_token,
     desktop_member_token,
@@ -70,6 +73,7 @@ from clientd import (
     product_name as desktop_product_name,
     user_has_connected_client,
     user_in_broadcast,
+    verify_desktop_refresh_token,
     verify_desktop_token,
 )
 from dotenv import load_dotenv
@@ -144,8 +148,6 @@ def derive_app_secret_key():
         return explicit_secret
     if DB_PASS not in (None, ""):
         return hashlib.sha256(DB_PASS.encode()).hexdigest()
-    # When no configured secret source exists, use a boot-random fallback so
-    # signed sessions cannot be replayed across restarts.
     return hashlib.sha256(generate_runtime_fallback_secret_seed(256).encode()).hexdigest()
 
 
@@ -174,6 +176,7 @@ IDENTITY_PROVIDER_VALUES = {"local", "ldap", "oidc", "saml"}
 REDIRECT_IDENTITY_PROVIDER_VALUES = {"oidc", "saml"}
 IDENTITY_FAILURE_BEHAVIORS = {"deny", "fallback"}
 ACCOUNT_EXPIRATION_NOTIFY_SETTING = "notify_users_about_account_expiration"
+GUEST_RECEIVER_SETTING = "guest_receiver_enabled"
 ACCOUNT_EXPIRATION_WARNING_WINDOW_DAYS = 14
 LDAP_ROLE_MAPPING_SETTING = "ldap_role_mappings"
 OIDC_ROLE_MAPPING_SETTING = "oidc_role_mappings"
@@ -274,7 +277,13 @@ SAML_SETTING_DEFAULTS = {
 }
 LOGIN_SETTING_DEFAULTS = {
     ACCOUNT_EXPIRATION_NOTIFY_SETTING: "1",
+    GUEST_RECEIVER_SETTING: "0",
 }
+
+
+def guest_receiver_enabled(data=None):
+    config = data if isinstance(data, dict) else settings()
+    return str(config.get(GUEST_RECEIVER_SETTING) or "0").strip() == "1"
 
 
 def normalize_ldap_default_role(value):
@@ -470,6 +479,15 @@ def check_rate_limit(scope, key, limit, window_seconds):
 
 
 @app.before_request
+def detect_desktop_client_context():
+    # If the request comes with desktop_client parameter or Header, persist it in the session
+    desktop_param = request.args.get("desktop_client")
+    if desktop_param is not None and str(desktop_param).strip().lower() in {"1", "true", "yes", "on"}:
+        session["desktop_client"] = True
+    elif request.headers.get("X-Desktop-Client") == "1":
+        session["desktop_client"] = True
+
+@app.before_request
 def enforce_web_rate_limits():
     if str(os.getenv("WEB_RATE_LIMIT_ENABLE", "1")).strip().lower() in {"0", "false", "no", "off"}:
         return None
@@ -538,7 +556,7 @@ def enforce_web_page_permissions():
         return None
     if path.startswith("/api/") or path.startswith("/bundled-assets/") or path.startswith("/demo-mode"):
         return None
-    if path in {"/", "/index", "/logout", "/login/basic-captcha.svg", "/favicon.ico"}:
+    if path in {"/", "/index", "/login", "/logout", "/login/basic-captcha.svg", "/favicon.ico"}:
         return None
     if path in {"/assets/", "/assets/index"} and request.args.get("raw"):
         return None
@@ -987,7 +1005,10 @@ def ensure_identity_access_schema():
     user_columns = table_columns("users")
     group_columns = table_columns("groups")
     message_columns = table_columns("messages")
+    session_columns = table_columns("user_sessions")
     statements = []
+    if "last_full_activity" not in session_columns:
+        statements.append(("ALTER TABLE user_sessions ADD COLUMN last_full_activity DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP AFTER last_seen_at", ()))
     if "auth_provider" not in user_columns:
         statements.append(("ALTER TABLE users ADD COLUMN auth_provider VARCHAR(32) NOT NULL DEFAULT 'local' AFTER role", ()))
     else:
@@ -1090,6 +1111,49 @@ def touch_user_session_record(session_id):
     execute("UPDATE user_sessions SET last_seen_at=NOW() WHERE session_id=%s", (wanted,))
 
 
+SOFT_LOGOUT_AFTER_SECONDS_WEB = 10 * 60
+SOFT_LOGOUT_AFTER_SECONDS_DESKTOP = 72 * 3600
+SOFT_ACCESS_PATH_PREFIXES = ("/dashboard", "/login", "/logout", "/assets", "/bundled-assets", "/favicon.ico", "/desktop/", "/api/", "/demo-mode")
+
+
+def soft_access_path(path):
+    token = str(path or "")
+    for prefix in SOFT_ACCESS_PATH_PREFIXES:
+        if token == prefix or token.startswith(prefix.rstrip("/") + "/") or token == prefix.rstrip("/"):
+            return True
+    return False
+
+
+def _session_datetime(value):
+    if isinstance(value, datetime):
+        return value
+    token = str(value or "").strip()
+    if not token:
+        return None
+    try:
+        return datetime.strptime(token[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def session_soft_logged_out(record):
+    if not record:
+        return False
+    session_type = str(record.get("session_type") or "web").strip().lower()
+    limit = SOFT_LOGOUT_AFTER_SECONDS_DESKTOP if session_type == "desktop" else SOFT_LOGOUT_AFTER_SECONDS_WEB
+    reference = _session_datetime(record.get("last_full_activity")) or _session_datetime(record.get("created_at"))
+    if reference is None:
+        return False
+    return (datetime.now() - reference).total_seconds() >= limit
+
+
+def touch_full_activity(session_id):
+    wanted = str(session_id or "").strip()
+    if not wanted:
+        return
+    execute("UPDATE user_sessions SET last_full_activity=NOW() WHERE session_id=%s", (wanted,))
+
+
 def active_user_session_record(session_id, user_id=None):
     ensure_identity_access_schema()
     wanted = str(session_id or "").strip()
@@ -1099,7 +1163,7 @@ def active_user_session_record(session_id, user_id=None):
     query = """
         SELECT
             session_id, user_id, session_type, auth_provider, username, ip, user_agent,
-            created_at, last_seen_at, expires_at, revoked_at
+            created_at, last_seen_at, last_full_activity, expires_at, revoked_at
         FROM user_sessions
         WHERE session_id=%s
           AND revoked_at IS NULL
@@ -1705,8 +1769,6 @@ def group_member_token_list(value):
 
 
 def serialize_group_member_tokens(values):
-    # Keep identity-sync writes in the same comma-separated format used by the
-    # group management UI so sync updates do not rewrite membership syntax.
     return ",".join(group_member_token_list(values))
 
 
@@ -1937,7 +1999,10 @@ def scim_identity_with_resource(provider, config, source, resource):
         return identity
     merged_groups = normalize_identity_group_values(identity.get("groups") or [])
     if (config or {}).get(f"{provider}_scim_sync_groups") == "1":
-        merged_groups = normalize_identity_group_values(merged_groups + scim_extract_group_values(resource))
+        if "groups" in resource:
+            merged_groups = normalize_identity_group_values(merged_groups + scim_extract_group_values(resource))
+        else:
+            identity["scim_sync_incomplete"] = True
     elif not merged_groups:
         merged_groups = scim_extract_group_values(resource)
     identity["groups"] = merged_groups
@@ -2012,6 +2077,8 @@ def scim_identity_result(provider, config, source):
     if status == "missing":
         raise IdentityAccessDenied(identity_access_denied_message(config))
     if status != "found" or not isinstance(resource, dict):
+        if status == "error":
+            identity["scim_sync_incomplete"] = True
         return identity
     return scim_identity_with_resource(provider, config, identity, resource)
 
@@ -2045,6 +2112,9 @@ def sync_redirect_identity_user(user_id, provider, config, identity_result):
     if scim_provider_enabled(provider, config) and not isinstance(source.get("scim_resource"), dict):
         source = scim_identity_result(provider, config, source)
     groups = normalize_identity_group_values(source.get("groups") or [])
+    if source.get("scim_sync_incomplete") and not groups:
+        stored = query_one("SELECT ldap_groups FROM users WHERE id=%s LIMIT 1", (user_id,)) or {}
+        groups = normalize_identity_group_values(str(stored.get("ldap_groups") or "").splitlines())
     groups_text = identity_groups_text(groups)
     external_id = str(source.get("external_id") or source.get("sub") or source.get("name_id") or "").strip()
     username = str(source.get("username") or "").strip() or external_id or "external-user"
@@ -2141,7 +2211,7 @@ def apply_identity_access_profile_to_user(user_id, provider, username, email, di
 
 
 def delete_provider_managed_user(user_id):
-    target_id = str(user_id or "").strip()
+    target_id = str(user_id if user_id is not None else "").strip()
     if not target_id:
         return
     revoke_all_user_session_records(target_id)
@@ -2198,7 +2268,7 @@ def fetch_user_bell_schedule_access_ids(user_id):
 
 def set_user_group_access_ids(user_id, group_ids):
     ensure_identity_access_schema()
-    user_id = str(user_id or "").strip()
+    user_id = str(user_id if user_id is not None else "").strip()
     if not user_id:
         return
     wanted = []
@@ -2224,7 +2294,7 @@ def set_user_group_access_ids(user_id, group_ids):
 
 def set_user_message_access_ids(user_id, message_ids):
     ensure_identity_access_schema()
-    user_id = str(user_id or "").strip()
+    user_id = str(user_id if user_id is not None else "").strip()
     if not user_id:
         return
     wanted = []
@@ -2250,7 +2320,7 @@ def set_user_message_access_ids(user_id, message_ids):
 
 def set_user_bell_schedule_access_ids(user_id, schedule_ids):
     ensure_identity_access_schema()
-    user_id = str(user_id or "").strip()
+    user_id = str(user_id if user_id is not None else "").strip()
     if not user_id:
         return
     wanted = []
@@ -2381,7 +2451,7 @@ def delete_message_access_records(message_id):
 
 
 def _temporary_asset_user_key(user):
-    token = str((user or {}).get("id") or "").strip()
+    token = str((user or {}).get("id") if (user or {}).get("id") is not None else "").strip()
     return token
 
 
@@ -2476,7 +2546,7 @@ def resource_asset_names_for_user(user):
         cache = {}
         g._resource_asset_names_for_user = cache
     cache_key = (
-        str((user or {}).get("id") or ""),
+        str((user or {}).get("id") if (user or {}).get("id") is not None else ""),
         str((user or {}).get("role") or ""),
         str((user or {}).get("userperm") or ""),
         str((user or {}).get("restrict_groups") or ""),
@@ -2733,6 +2803,8 @@ def current_user():
         )
         session["web_session_touched_at"] = str(time.time())
     else:
+        soft = session_soft_logged_out(session_record)
+        g.ops_soft_logout = soft
         try:
             last_touched = float(session.get("web_session_touched_at", "0") or 0)
         except (TypeError, ValueError):
@@ -2741,6 +2813,14 @@ def current_user():
         if now_value - last_touched >= USER_SESSION_TOUCH_INTERVAL_SECONDS:
             touch_user_session_record(session_id)
             session["web_session_touched_at"] = str(now_value)
+        if not soft and not soft_access_path(request.path or ""):
+            try:
+                last_full_touched = float(session.get("full_activity_touched_at", "0") or 0)
+            except (TypeError, ValueError):
+                last_full_touched = 0
+            if now_value - last_full_touched >= USER_SESSION_TOUCH_INTERVAL_SECONDS:
+                touch_full_activity(session_id)
+                session["full_activity_touched_at"] = str(now_value)
     return user
 
 
@@ -3113,14 +3193,16 @@ def sync_external_user_record(provider, config, identity_result):
     if scim_provider_enabled(provider, config):
         source = scim_identity_result(provider, config, source)
     groups = normalize_identity_group_values(source.get("groups") or [])
-    groups_text = identity_groups_text(groups)
     external_id = str(source.get("external_id") or source.get("sub") or source.get("name_id") or "").strip()
     username = str(source.get("username") or "").strip() or external_id or "external-user"
     email = str(source.get("email") or "").strip()
     display_name = str(source.get("display_name") or "").strip() or username or email
+    matched_user = fetch_synced_identity_user(provider, external_id, username, email)
+    if source.get("scim_sync_incomplete") and not groups and matched_user:
+        groups = normalize_identity_group_values(str(matched_user.get("ldap_groups") or "").splitlines())
+    groups_text = identity_groups_text(groups)
     claims_source = external_identity_claim_source(source)
     access_profile = identity_access_profile(provider, config, groups, claims_source)
-    matched_user = fetch_synced_identity_user(provider, external_id, username, email)
     role_value = normalize_identity_mapping_role(access_profile.get("role") or "receiver")
     if role_value == "none":
         if matched_user:
@@ -3461,7 +3543,9 @@ def authenticate_user_credentials(username, password, data=None):
 def require_user():
     user = current_user()
     if not user:
-        return redirect("/")
+        return redirect("/login")
+    if getattr(g, "ops_soft_logout", False) and not soft_access_path(request.path or ""):
+        return redirect("/login?reauth=1")
     if user_requires_password_change(user) and request.path.rstrip("/") != "/user/settings":
         return redirect(password_change_redirect_target())
     return user
@@ -3565,6 +3649,28 @@ def legacy_user_context(user=None):
     }
 
 
+def legacy_guest_context():
+    data = settings()
+    product_name = data.get("product_name") or "Open Paging Server"
+    return {
+        "user": {},
+        "role": "guest",
+        "username": "Guest",
+        "is_admin": False,
+        "is_receiver": True,
+        "is_guest": True,
+        "can_manage_messages": False,
+        "can_manage_broadcasts": False,
+        "can_manage_groups": False,
+        "can_edit_assets": False,
+        "settings": data,
+        "product_name": product_name,
+        "favicon": data.get("favicon") or "",
+        "show_online_docs": data.get("show_online_docs", "1"),
+        "brand_html": ops_sidebar_brand_html(data, product_name),
+    }
+
+
 def request_is_insecure():
     insecure = request.scheme != "https"
     forwarded = str(
@@ -3582,6 +3688,17 @@ def request_is_insecure():
 def system_banner_records(ctx):
     banners = []
     now = datetime.now()
+    if getattr(g, "ops_soft_logout", False):
+        banners.append(
+            {
+                "key": "",
+                "level": "info",
+                "icon": "fa-solid fa-circle-info",
+                "message": "Login again to access all features",
+                "action_html": '<a class="system-banner-action" href="/login?reauth=1">Login</a>',
+                "no_dismiss": True,
+            }
+        )
     if request_is_insecure():
         banners.append(
             {
@@ -3660,13 +3777,20 @@ def render_system_banners(ctx):
         dismiss_seconds = int(banner.get("dismiss_seconds") or 0)
         key_attr = f' data-banner-key="{h(key)}"' if key else ""
         dismiss_attr = f' data-dismiss-seconds="{dismiss_seconds}"' if dismiss_seconds > 0 else ""
+        action_html = str(banner.get("action_html") or "")
+        close_html = (
+            ""
+            if banner.get("no_dismiss")
+            else '<button type="button" class="system-banner-close" onclick="dismissSystemBanner(this)" aria-label="Dismiss banner"><i class="fa-solid fa-xmark"></i></button>'
+        )
         items.append(
             f"""<div class="system-banner system-banner-{h(banner.get('level') or 'warning')}"{key_attr}{dismiss_attr}>
     <div class="system-banner-main">
         <span class="system-banner-icon"><i class="{h(banner.get('icon') or 'fa-solid fa-circle-info')}"></i></span>
         <span class="system-banner-text">{h(banner.get('message') or '')}</span>
+        {action_html}
     </div>
-    <button type="button" class="system-banner-close" onclick="dismissSystemBanner(this)" aria-label="Dismiss banner"><i class="fa-solid fa-xmark"></i></button>
+    {close_html}
 </div>"""
         )
     return '<div id="ops-system-banners" class="system-banners">' + "".join(items) + "</div>"
@@ -3674,6 +3798,26 @@ def render_system_banners(ctx):
 
 def legacy_sidebar_html(ctx, active):
     user = ctx.get("user") or {}
+    if ctx.get("is_guest"):
+        cls = ' class="active"' if active == "dashboard" else ""
+        nav_links = [
+            f'<a href="/dashboard"{cls}><span class="nav-icon"><i class="fa-solid fa-house"></i></span><span class="nav-label">Dashboard</span></a>'
+        ]
+        if ctx.get("show_online_docs") == "1":
+            nav_links.append(
+                '<a href="https://docs.openpagingserver.org"><span class="nav-icon"><i class="fa-solid fa-book"></i></span><span class="nav-label">Online Documentation</span></a>'
+            )
+        rendered = [
+            ctx["brand_html"],
+            '<div class="sidebar-nav">',
+            *nav_links,
+            "</div>",
+            '<div class="sidebar-account">',
+            '<a class="login-btn" href="/login"><span class="nav-icon"><i class="fa-solid fa-sign-in-alt"></i></span><span class="nav-label">Login</span></a>',
+            '<div class="mobile-nav-divider"></div>',
+            "</div>",
+        ]
+        return "\n    ".join(rendered)
     user_settings_class = ' class="active user-settings-link"' if active == "user-settings" else ' class="user-settings-link"'
     user_settings_link = f'<a href="/user/settings"{user_settings_class}><span class="nav-icon"><i class="fa-solid fa-user"></i></span><span class="nav-label">{h(ctx.get("username") or "User")}</span></a>'
     logout_button = '<button class="logout-btn" onclick="logout()"><span class="nav-icon"><i class="fa-solid fa-sign-out-alt"></i></span><span class="nav-label">Logout</span></button>'
@@ -3763,6 +3907,9 @@ def legacy_page(title, ctx, active, style, content, extra_script="", extra_after
 #ops-page-banners .system-banner-close{border:none;background:transparent;color:inherit;padding:2px 4px;cursor:pointer;border-radius:999px;flex:0 0 auto}
 #ops-page-banners .system-banner-close:hover{background:rgba(0,0,0,.08)}
 #ops-page-banners .system-banner-danger{background:#FDECEA;border-color:#F4B1AB;color:#A50E0E}
+#ops-page-banners .system-banner-info{background:#E3F2FD;border-color:#90CAF9;color:#0D47A1}
+#ops-page-banners .system-banner-action{display:inline-block;flex:0 0 auto;background:#1565C0;color:#FFF;padding:3px 14px;border-radius:999px;text-decoration:none;font-size:0.9em;align-self:center}
+#ops-page-banners .system-banner-action:hover{background:#0D47A1}
 #ops-page-banners .system-banner-warning{background:#FFF8E1;border-color:#F2C94C;color:#8A5A00}
 #ops-page-banners .system-banner-warning-expiration{background:#FFF3E0;border-color:#FB8C00;color:#B85C00}
 body.has-system-banners #sidebar{top:var(--ops-banner-offset, 0px)!important;height:calc(100vh - var(--ops-banner-offset, 0px))!important}
@@ -3800,6 +3947,12 @@ document.addEventListener('keydown', function(event) {
   if (event.key === 'Escape') closeDemoModePopup();
 });
 """
+    desktop_mode = (
+        str(request.args.get("desktop_client") or "").strip().lower() in {"1", "true", "yes", "on"}
+        or bool(session.get("desktop_client"))
+    )
+    desktop_inject = '<script>window.__OPS_DESKTOP_CLIENT__ = true;</script>' if desktop_mode else ''
+
     html_doc = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3809,13 +3962,15 @@ document.addEventListener('keydown', function(event) {
 {favicon_html}
 <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet" />
 <link href="/assets/sidebar-brand.css" rel="stylesheet" />
+{desktop_inject}
+<script defer src="/assets/broadcast-sync.js"></script>
 <style>
 {LEGACY_GENERIC_STYLE}
 {style}
 {common_sidebar_style}
 </style>
 </head>
-<body class="{'has-system-banners' if banner_markup else ''}">
+<body class="{'has-system-banners' if banner_markup else ''}" data-page="{h(active)}">
 {f'<div id="ops-page-banners">{banner_markup}</div>' if banner_markup else ''}
 <script>
 function bannerDismissStorageKey(key) {{
@@ -4003,6 +4158,9 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 #sidebar .nav-label,.logout-btn .nav-label,.logout-btn-mobile .nav-label,.admin-only .nav-label { min-width:0; }
 #sidebar a:hover,#sidebar a.active{ background-color:#1565C0; }
 .logout-btn{ background-color:#C62828; border:none; cursor:pointer; margin-top:auto; transition:background-color 0.3s; }
+.login-btn{ background-color:#2E7D32; border:none; cursor:pointer; margin-top:auto; transition:background-color 0.3s; color:#FFF; padding:12px 20px; display:flex; align-items:center; gap:10px; border-bottom:1px solid rgba(255,255,255,0.1); text-decoration:none; font-size:0.9em; text-align:left; box-sizing:border-box; width:100%; }
+.login-btn:hover{ background-color:#1B5E20; text-decoration:none; }
+.login-btn .nav-icon{ width:20px; display:inline-flex; justify-content:center; flex:0 0 20px; }
 .logout-btn-mobile{ background-color:#C62828; border:none; cursor:pointer; transition:background-color 0.3s; display:none; }
 .logout-btn:hover,.logout-btn-mobile:hover{ background-color:#B71C1C; }
 @media(max-width:767px){ .logout-btn{ display:none; } .logout-btn-mobile{ display:flex; } }
@@ -4188,7 +4346,7 @@ def desktop_eligible_users():
 
 def desktop_user_choices():
     rows = desktop_eligible_users()
-    return [
+    choices = [
         {
             "value": desktop_member_token(row.get("id")),
             "label": str(row.get("username") or ""),
@@ -4196,14 +4354,19 @@ def desktop_user_choices():
         for row in rows
         if str(row.get("id") if row.get("id") is not None else "").strip()
     ]
+    if guest_receiver_enabled():
+        choices.append({"value": GUEST_MEMBER_TOKEN, "label": "Guest (logged-out)"})
+    return choices
 
 
 def group_member_available(member, endpoint_availability):
     token = str(member or "").strip()
     if not token:
         return False
+    if token == GUEST_MEMBER_TOKEN:
+        return guest_receiver_enabled()
     if is_desktop_member_token(token):
-        return user_has_connected_client(desktop_member_user_id(token))
+        return True
     if token in endpoint_availability:
         return bool(endpoint_availability.get(token))
     lowered = token.lower()
@@ -4213,11 +4376,11 @@ def group_member_available(member, endpoint_availability):
 
 
 def any_desktop_recipient_available():
-    return any(user_has_connected_client(row.get("id")) for row in desktop_eligible_users())
+    return bool(desktop_eligible_users())
 
 
 def any_recipient_available(endpoint_availability):
-    return any(bool(value) for value in (endpoint_availability or {}).values()) or any_desktop_recipient_available()
+    return any(bool(value) for value in (endpoint_availability or {}).values()) or any_desktop_recipient_available() or guest_receiver_enabled()
 
 
 def endpoint_availability_map(endpoint_payload):
@@ -4454,6 +4617,15 @@ def bundled_asset(filename):
 
 @app.route("/", methods=["GET", "POST"])
 @alias("/index", methods=["GET", "POST"])
+def index_root():
+    if session.get("user_id") not in (None, ""):
+        return redirect("/dashboard")
+    if guest_receiver_enabled():
+        return redirect("/dashboard")
+    return redirect("/login")
+
+
+@alias("/login", methods=["GET", "POST"])
 def login():
     return dispatch_web_page("index")
 
@@ -4473,7 +4645,7 @@ def login_sso_start():
     config = identity_provider_settings()
     provider = configured_identity_provider(config)
     if provider not in REDIRECT_IDENTITY_PROVIDER_VALUES:
-        return redirect("/")
+        return redirect("/login")
     try:
         if provider == "oidc":
             client = build_oidc_client(config)
@@ -4484,22 +4656,22 @@ def login_sso_start():
     except Exception as exc:
         set_sso_error_detail(exc)
         increment_sso_failure_count()
-        return redirect("/?sso_error=failed")
+        return redirect("/login?sso_error=failed")
 
 
 @alias("/login/oidc/callback")
 def login_oidc_callback():
     config = identity_provider_settings()
     if configured_identity_provider(config) != "oidc":
-        return redirect("/")
+        return redirect("/login")
     if request.args.get("error"):
         error_code = str(request.args.get("error") or "").strip()
         error_description = str(request.args.get("error_description") or "").strip()
         set_sso_error_detail(error_description or error_code)
         if error_code == "access_denied":
-            return redirect("/?sso_error=cancelled")
+            return redirect("/login?sso_error=cancelled")
         increment_sso_failure_count()
-        return redirect("/?sso_error=failed")
+        return redirect("/login?sso_error=failed")
     try:
         client = build_oidc_client(config)
         token = client.authorize_access_token()
@@ -4512,26 +4684,26 @@ def login_oidc_callback():
         return redirect(post_login_redirect_target(user, "oidc"))
     except IdentityAccessDenied as exc:
         set_sso_error_detail(exc)
-        return redirect("/?sso_error=denied")
+        return redirect("/login?sso_error=denied")
     except Exception as exc:
         set_sso_error_detail(exc)
         increment_sso_failure_count()
-        return redirect("/?sso_error=failed")
+        return redirect("/login?sso_error=failed")
 
 
 @alias("/login/saml/callback", methods=["GET", "POST"])
 def login_saml_callback():
     config = identity_provider_settings()
     if configured_identity_provider(config) != "saml":
-        return redirect("/")
+        return redirect("/login")
     if request.values.get("error"):
         error_code = str(request.values.get("error") or "").strip()
         error_description = str(request.values.get("error_description") or "").strip()
         set_sso_error_detail(error_description or error_code)
         if error_code == "access_denied":
-            return redirect("/?sso_error=cancelled")
+            return redirect("/login?sso_error=cancelled")
         increment_sso_failure_count()
-        return redirect("/?sso_error=failed")
+        return redirect("/login?sso_error=failed")
     try:
         auth = build_saml_auth(config)
         auth.process_response()
@@ -4546,11 +4718,11 @@ def login_saml_callback():
         return redirect(post_login_redirect_target(user, "saml"))
     except IdentityAccessDenied as exc:
         set_sso_error_detail(exc)
-        return redirect("/?sso_error=denied")
+        return redirect("/login?sso_error=denied")
     except Exception as exc:
         set_sso_error_detail(exc)
         increment_sso_failure_count()
-        return redirect("/?sso_error=failed")
+        return redirect("/login?sso_error=failed")
 
 
 @alias("/login/saml/metadata")
@@ -4606,14 +4778,138 @@ def desktop_session_login():
     if user_requires_password_change(user, result.get("provider")):
         return jsonify(error="Password change required through the web interface."), 403
     token, expires_at = build_desktop_token(user)
+    refresh_token, refresh_expires_at = build_desktop_refresh_token(user)
     return jsonify(
         token=token,
         expires_at=expires_at,
+        refresh_token=refresh_token,
+        refresh_expires_at=refresh_expires_at,
         websocket_path="/desktop/ws",
         keepalive_path="/desktop/session/ping",
         product_name=desktop_product_name(),
         user={"id": user.get("id"), "username": user.get("username"), "role": user.get("role")},
         groups=desktop_groups_for_user(user.get("id")),
+    )
+
+
+@alias("/desktop/session/guest", methods=["POST"])
+def desktop_session_guest():
+    if not str(request.headers.get(DESKTOP_CLIENT_HEADER) or "").strip():
+        return jsonify(error="Desktop client header required"), 400
+    if not guest_receiver_enabled():
+        return jsonify(error="Guest receiver is not enabled."), 403
+    guest = {"id": GUEST_MEMBER_TOKEN, "username": "Guest", "role": "guest"}
+    token, expires_at = build_desktop_token(guest, ttl_seconds=GUEST_TOKEN_TTL_SECONDS)
+    refresh_token, refresh_expires_at = build_desktop_refresh_token(guest, ttl_seconds=GUEST_TOKEN_TTL_SECONDS)
+    return jsonify(
+        token=token,
+        expires_at=expires_at,
+        refresh_token=refresh_token,
+        refresh_expires_at=refresh_expires_at,
+        websocket_path="/desktop/ws",
+        keepalive_path="/desktop/session/ping",
+        product_name=desktop_product_name(),
+        user=guest,
+        groups=desktop_groups_for_user(GUEST_MEMBER_TOKEN),
+    )
+
+
+@alias("/desktop/session/token", methods=["GET", "POST"])
+def desktop_session_token():
+    user = current_user()
+    if not isinstance(user, dict) or not user:
+        return jsonify(error="Not logged in"), 401
+    web_session_id = str(session.get("web_session_id") or "").strip()
+    if web_session_id:
+        client_os = str(request.headers.get("X-OPS-Client-OS") or "").strip()
+        agent = f"OpenPagingServer Desktop Client/1.0 ({client_os})" if client_os else "OpenPagingServer Desktop Client/1.0"
+        execute(
+            "UPDATE user_sessions SET session_type='desktop', user_agent=%s WHERE session_id=%s",
+            (agent, web_session_id),
+        )
+    token, expires_at = build_desktop_token(user)
+    refresh_token, refresh_expires_at = build_desktop_refresh_token(user)
+    return jsonify(
+        token=token,
+        expires_at=expires_at,
+        refresh_token=refresh_token,
+        refresh_expires_at=refresh_expires_at,
+        websocket_path="/desktop/ws",
+        keepalive_path="/desktop/session/ping",
+        product_name=desktop_product_name(),
+        user={"id": user.get("id"), "username": user.get("username"), "role": user.get("role")},
+        groups=desktop_groups_for_user(user.get("id")),
+    )
+
+
+@alias("/desktop/session/web-login", methods=["POST"])
+def desktop_session_web_login():
+    if not str(request.headers.get(DESKTOP_CLIENT_HEADER) or "").strip():
+        return jsonify(error="Desktop client header required"), 400
+    user = desktop_authorized_user()
+    if not isinstance(user, dict) or not user:
+        return jsonify(error="Unauthorized"), 401
+    role = str(user.get("role") or "").strip().lower()
+    if role == "guest":
+        session.clear()
+        session["desktop_client"] = True
+        return jsonify(ok=True, guest=True, user={"id": GUEST_MEMBER_TOKEN, "username": "Guest", "role": "guest"})
+    user_id = user.get("id")
+    full_user = query_one(
+        "SELECT id, username, auth_provider FROM users WHERE id=%s LIMIT 1",
+        (user_id,),
+    )
+    if not full_user:
+        session.clear()
+        return jsonify(error="Unauthorized"), 401
+    begin_web_login_session(
+        full_user,
+        auth_provider=str(full_user.get("auth_provider") or "local"),
+    )
+    session["desktop_client"] = True
+    return jsonify(
+        ok=True,
+        guest=False,
+        user={"id": full_user.get("id"), "username": full_user.get("username"), "role": user.get("role")},
+    )
+
+
+@alias("/desktop/session/refresh", methods=["POST"])
+def desktop_session_refresh():
+    if not str(request.headers.get(DESKTOP_CLIENT_HEADER) or "").strip():
+        return jsonify(error="Desktop client header required"), 400
+    payload = request.get_json(silent=True) or request.form.to_dict()
+    refresh_token = str(payload.get("refresh_token") or "").strip()
+    user = verify_desktop_refresh_token(refresh_token)
+    if not isinstance(user, dict) or not user:
+        return jsonify(error="Unauthorized"), 401
+    token, expires_at = build_desktop_token(user)
+    next_refresh_token, refresh_expires_at = build_desktop_refresh_token(user)
+    return jsonify(
+        token=token,
+        expires_at=expires_at,
+        refresh_token=next_refresh_token,
+        refresh_expires_at=refresh_expires_at,
+        websocket_path="/desktop/ws",
+        keepalive_path="/desktop/session/ping",
+        product_name=desktop_product_name(),
+        user={"id": user.get("id"), "username": user.get("username"), "role": user.get("role")},
+        groups=desktop_groups_for_user(user.get("id")),
+    )
+
+
+@alias("/desktop/server-info", methods=["GET"])
+def desktop_server_info():
+    config = identity_provider_settings()
+    provider = configured_identity_provider(config)
+    if provider not in REDIRECT_IDENTITY_PROVIDER_VALUES:
+        provider = ""
+    return jsonify(
+        product_name=desktop_product_name(),
+        guest_receiver_enabled=guest_receiver_enabled(),
+        sso_provider=provider or "",
+        sso_start_path="/login/sso/start" if provider else "",
+        sso_auto_redirect=bool(provider and identity_redirect_auto_enabled(config)),
     )
 
 
@@ -4643,15 +4939,99 @@ def desktop_broadcast_audio(broadcast_id):
         abort(404)
     if not user_in_broadcast(user.get("id"), broadcast):
         abort(403)
+    recording_path = str(broadcast.get("runtime_recording") or "").strip()
+    if recording_path:
+        recording_file = Path(recording_path)
+        if recording_file.is_file():
+            return send_file(recording_file, as_attachment=False, conditional=True)
     audio_name = first_audio_name(broadcast)
     if not audio_name:
         abort(404)
     return send_file(asset_path(audio_name), as_attachment=False, conditional=True)
 
 
+@alias("/desktop/broadcasts/<broadcast_id>/icon")
+def desktop_broadcast_icon(broadcast_id):
+    user = require_desktop_client()
+    if not isinstance(user, dict):
+        return user
+    broadcast = fetch_active_broadcast(broadcast_id)
+    if not broadcast:
+        abort(404)
+    if not user_in_broadcast(user.get("id"), broadcast):
+        abort(403)
+    icon_name = str(broadcast.get("icon") or "").strip()
+    if not icon_name:
+        abort(404)
+    return send_file(asset_path(icon_name), as_attachment=False, conditional=True)
+
+
 @alias("/dashboard")
 def dashboard():
     return dispatch_web_page("dashboard")
+
+
+def dashboard_authorized_user_id():
+    user = current_user()
+    if isinstance(user, dict) and user:
+        return user.get("id"), user
+    if guest_receiver_enabled():
+        return GUEST_MEMBER_TOKEN, {"id": GUEST_MEMBER_TOKEN, "username": "Guest", "role": "guest"}
+    return None, None
+
+
+@alias("/dashboard/ws-session", methods=["GET"])
+def dashboard_ws_session():
+    user_id, user = dashboard_authorized_user_id()
+    if user_id is None:
+        abort(403)
+    ttl = GUEST_TOKEN_TTL_SECONDS if str(user.get("role") or "") == "guest" else None
+    token, expires_at = build_desktop_token(user, ttl_seconds=ttl)
+    return jsonify(
+        token=token,
+        expires_at=expires_at,
+        websocket_path="/desktop/ws",
+        product_name=desktop_product_name(),
+        user={"id": user.get("id"), "username": user.get("username"), "role": user.get("role")},
+        groups=desktop_groups_for_user(user.get("id")),
+    )
+
+
+@alias("/dashboard/broadcast-icon")
+def dashboard_broadcast_icon():
+    user_id, _user = dashboard_authorized_user_id()
+    if user_id is None:
+        abort(403)
+    broadcast = fetch_active_broadcast(request.args.get("bid") or "")
+    if not broadcast:
+        abort(404)
+    if not user_in_broadcast(user_id, broadcast):
+        abort(403)
+    icon_name = str(broadcast.get("icon") or "").strip()
+    if not icon_name:
+        abort(404)
+    return send_file(asset_path(icon_name), as_attachment=False, conditional=True)
+
+
+@alias("/dashboard/broadcast-audio")
+def dashboard_broadcast_audio():
+    user_id, _user = dashboard_authorized_user_id()
+    if user_id is None:
+        abort(403)
+    broadcast = fetch_active_broadcast(request.args.get("bid") or "")
+    if not broadcast:
+        abort(404)
+    if not user_in_broadcast(user_id, broadcast):
+        abort(403)
+    recording_path = str(broadcast.get("runtime_recording") or "").strip()
+    if recording_path:
+        recording_file = Path(recording_path)
+        if recording_file.is_file():
+            return send_file(recording_file, as_attachment=False, conditional=True)
+    audio_name = first_audio_name(broadcast)
+    if not audio_name:
+        abort(404)
+    return send_file(asset_path(audio_name), as_attachment=False, conditional=True)
 
 
 @app.route("/oobe/", methods=["GET", "POST"])
@@ -4735,11 +5115,17 @@ def create_broadcast(message_id, groups, sender, overrides=None):
         conn.commit()
     finally:
         conn.close()
+    return broadcast_id
 
 
 @alias("/messages/send", methods=["GET", "POST"])
 def messages_send():
     return dispatch_web_page("messages/send")
+
+
+@alias("/messages/send-status", methods=["GET"])
+def messages_send_status():
+    return dispatch_web_page("messages/send-status")
 
 
 @alias("/messages/custom", methods=["GET", "POST"])

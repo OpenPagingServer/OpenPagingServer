@@ -264,7 +264,9 @@ def handle_request():
     maintenance_state = demo_mode_maintenance_state(data) if maintenance_popup_open else None
 
     if session.get("user_id") is not None and session.get("user_id") != "" and not maintenance_popup_open:
-        return redirect("/dashboard")
+        user_check = current_user()
+        if isinstance(user_check, dict) and user_check and not getattr(g, "ops_soft_logout", False):
+            return redirect("/dashboard")
 
     if request.method == "POST":
         ip = request.remote_addr or ""
@@ -624,11 +626,11 @@ def handle_request():
       }}
 
       function showLocalLogin() {{
-        window.location.href = '/?local=1';
+        window.location.href = '/login?local=1';
       }}
 
       function showSsoOptions() {{
-        window.location.href = '/';
+        window.location.href = '/login';
       }}
 
       function maintenanceElements() {{
@@ -739,7 +741,7 @@ def handle_request():
         btn.innerHTML = '<div class="loading-circle"></div>';
 
         try {{
-          const res1 = await fetch('/', {{
+          const res1 = await fetch('/login', {{
             method: 'POST',
             headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
             body: new URLSearchParams({{ get_challenge: 1, username: username, login_mode: localLoginMode ? 'local' : '' }})
@@ -759,7 +761,7 @@ def handle_request():
           }}
           Object.entries(captchaFields).forEach(([key, value]) => proofPayload.append(key, value));
 
-          const res2 = await fetch('/', {{
+          const res2 = await fetch('/login', {{
             method: 'POST',
             headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
             body: proofPayload

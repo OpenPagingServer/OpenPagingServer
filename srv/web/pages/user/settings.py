@@ -1,6 +1,23 @@
 from srv.web.app import *
 
 
+def session_agent_label(row):
+    session_type = str((row or {}).get("session_type") or "web").strip().lower()
+    agent = str((row or {}).get("user_agent") or "").strip()
+    if session_type != "desktop":
+        return agent or "Unknown"
+    lowered = agent.lower()
+    if "windows" in lowered:
+        os_name = "Windows"
+    elif "mac os" in lowered or "macos" in lowered or "macintosh" in lowered or "darwin" in lowered:
+        os_name = "macOS"
+    elif "linux" in lowered:
+        os_name = "Linux"
+    else:
+        os_name = "Unknown OS"
+    return f"Desktop Client - {os_name}"
+
+
 USER_SETTINGS_STYLE = r"""
 body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:300; background-color:#FFF; height:100%; }
 #sidebar { width:220px; background-color:#1976D2; color:#FFF; height:100vh; position:fixed; top:0; left:0; display:flex; flex-direction:column; box-shadow:2px 0 8px rgba(0,0,0,0.2); transition:transform 0.3s ease; z-index:1200; }
@@ -254,9 +271,9 @@ def handle_request():
                 flash = '<div class="flash success">Session ended.</div>'
 
     tabs = ['<a class="subtab-link' + (" active" if active_tab == "general" else "") + '" href="/user/settings?tab=general">General</a>']
+    tabs.append('<a class="subtab-link' + (" active" if active_tab == "sessions" else "") + '" href="/user/settings?tab=sessions">Sessions</a>')
     if api_enabled:
         tabs.append('<a class="subtab-link' + (" active" if active_tab == "api-keys" else "") + '" href="/user/settings?tab=api-keys">API Keys</a>')
-    tabs.append('<a class="subtab-link' + (" active" if active_tab == "sessions" else "") + '" href="/user/settings?tab=sessions">Sessions</a>')
     tabs_html = '<div class="subtabs">' + "".join(tabs) + "</div>"
     demo_form_attr = ' onsubmit="openDemoModePopup(\'user-settings\'); return false;"' if demo_mode_enabled() else ""
 
@@ -386,6 +403,81 @@ def handle_request():
     current_session_id = str(session.get("web_session_id") or "").strip()
     history_rows = fetch_login_history_rows(user.get("id"), history_limit)
     history_total = login_history_total(user.get("id"))
+    demo_sessions_banner = ""
+    if demo_mode_enabled():
+        now = datetime.now()
+        current_rows = [row for row in active_sessions if str(row.get("session_id") or "").strip() == current_session_id]
+        mock_active = [
+            {
+                "session_id": "demo-session-chrome-windows",
+                "session_type": "web",
+                "auth_provider": "local",
+                "ip": "203.0.113.42",
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                "created_at": now - timedelta(hours=3, minutes=12),
+            },
+            {
+                "session_id": "demo-session-safari-iphone",
+                "session_type": "web",
+                "auth_provider": "local",
+                "ip": "198.51.100.17",
+                "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+                "created_at": now - timedelta(days=1, hours=2),
+            },
+            {
+                "session_id": "demo-session-desktop-client",
+                "session_type": "desktop",
+                "auth_provider": "local",
+                "ip": "192.0.2.88",
+                "user_agent": "OpenPagingServer Desktop Client/1.0 (Windows NT 10.0; Win64; x64)",
+                "created_at": now - timedelta(days=2, hours=6),
+            },
+        ]
+        active_sessions = current_rows + mock_active
+        history_rows = [
+            {
+                "auth_provider": "local",
+                "session_type": "web",
+                "login_time": now - timedelta(hours=3, minutes=12),
+                "ip": "203.0.113.42",
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                "session_id": "demo-session-chrome-windows",
+            },
+            {
+                "auth_provider": "local",
+                "session_type": "web",
+                "login_time": now - timedelta(days=1, hours=2),
+                "ip": "198.51.100.17",
+                "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+                "session_id": "demo-session-safari-iphone",
+            },
+            {
+                "auth_provider": "local",
+                "session_type": "desktop",
+                "login_time": now - timedelta(days=2, hours=6),
+                "ip": "192.0.2.88",
+                "user_agent": "OpenPagingServer Desktop Client/1.0 (Windows NT 10.0; Win64; x64)",
+                "session_id": "demo-session-desktop-client",
+            },
+            {
+                "auth_provider": "local",
+                "session_type": "web",
+                "login_time": now - timedelta(days=4, hours=9),
+                "ip": "203.0.113.105",
+                "user_agent": "Mozilla/5.0 (X11; Linux x86_64; rv:127.0) Gecko/20100101 Firefox/127.0",
+                "session_id": "demo-session-firefox-linux",
+            },
+            {
+                "auth_provider": "local",
+                "session_type": "web",
+                "login_time": now - timedelta(days=6, hours=1),
+                "ip": "198.51.100.203",
+                "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
+                "session_id": "demo-session-edge-mac",
+            },
+        ]
+        history_total = len(history_rows)
+        demo_sessions_banner = '<div style="background:#1976D2;color:#FFF;padding:12px 16px;border-radius:8px;margin-bottom:16px;font-size:0.95em;"><i class="fa-solid fa-circle-info" style="margin-right:8px;"></i>Fictional content is shown here because demo mode is active</div>'
     history_shown = len(history_rows)
     active_session_rows = ""
     if active_sessions:
@@ -404,7 +496,7 @@ def handle_request():
                     </div>
                     <div class="session-cell" data-label="Logged In">{h(format_datetime(row.get("created_at")))}</div>
                     <div class="session-cell" data-label="IP Address">{h(row.get("ip") or "Unknown")}</div>
-                    <div class="session-cell" data-label="User Agent">{h(row.get("user_agent") or "Unknown")}</div>
+                    <div class="session-cell" data-label="Client">{h(session_agent_label(row))}</div>
                     <div class="session-actions" data-label="Actions">
                         <form method="POST" action="/user/settings">
                             <input type="hidden" name="action" value="{action_name}">
@@ -421,7 +513,7 @@ def handle_request():
                 <div>Status</div>
                 <div>Logged In</div>
                 <div>IP Address</div>
-                <div>User Agent</div>
+                <div>Client</div>
                 <div>Actions</div>
             </div>
             {''.join(rendered_rows)}
@@ -441,7 +533,7 @@ def handle_request():
                     </div>
                     <div class="session-cell" data-label="Logged In">{h(format_datetime(row.get("login_time")))}</div>
                     <div class="session-cell" data-label="IP Address">{h(row.get("ip") or "Unknown")}</div>
-                    <div class="session-cell" data-label="User Agent">{h(row.get("user_agent") or "Unknown")}</div>
+                    <div class="session-cell" data-label="Client">{h(session_agent_label(row))}</div>
                     <div class="session-cell muted" data-label="Session">{h(str(row.get("session_id") or "")[:18] + ('...' if len(str(row.get('session_id') or '')) > 18 else '')) or 'N/A'}</div>
                 </div>"""
             )
@@ -450,7 +542,7 @@ def handle_request():
                 <div>Provider</div>
                 <div>Logged In</div>
                 <div>IP Address</div>
-                <div>User Agent</div>
+                <div>Client</div>
                 <div>Session</div>
             </div>
             {''.join(rendered_rows)}
@@ -463,6 +555,7 @@ def handle_request():
         for value, label in (("50", "50"), ("100", "100"), ("250", "250"), ("500", "500"), ("all", "All"))
     )
     sessions_panel = f"""
+    {demo_sessions_banner}
     <div class="card">
         <h2>Current Sessions</h2>
         {active_session_rows}

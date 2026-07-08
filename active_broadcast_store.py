@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sqlite3
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -177,6 +178,28 @@ def _delete_ids(conn, broadcast_ids):
     ids = [str(item).strip() for item in (broadcast_ids or []) if str(item).strip()]
     if not ids:
         return
+    placeholders = ", ".join(["?"] * len(ids))
+    rows = conn.execute(
+        f"SELECT payload FROM active_broadcasts WHERE id IN ({placeholders})",
+        ids,
+    ).fetchall()
+    runtime_root = Path(tempfile.gettempdir()) / "openpagingserver-runtime"
+    for row in rows:
+        payload = row["payload"] if isinstance(row, sqlite3.Row) else (row[0] if row else "")
+        try:
+            data = json.loads(payload or "{}")
+        except (TypeError, ValueError):
+            data = {}
+        recording_raw = str((data or {}).get("runtime_recording") or "").strip()
+        if not recording_raw:
+            continue
+        try:
+            recording_path = Path(recording_raw).resolve()
+            runtime_root_resolved = runtime_root.resolve()
+            if recording_path.is_file() and (recording_path == runtime_root_resolved or runtime_root_resolved in recording_path.parents):
+                recording_path.unlink()
+        except OSError:
+            pass
     placeholders = ", ".join(["?"] * len(ids))
     conn.execute(f"DELETE FROM active_broadcasts WHERE id IN ({placeholders})", ids)
     conn.execute(f"DELETE FROM active_broadcast_controls WHERE id IN ({placeholders})", ids)
