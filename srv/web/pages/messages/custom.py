@@ -53,6 +53,19 @@ function toggleRecipients(){
 """
 
 
+def custom_form_state():
+    return {
+        "shortmessage": request.form.get("shortmessage", ""),
+        "longmessage": message_multiline_text(request.form.get("longmessage", "")),
+        "audio": [v.strip() for v in request.form.getlist("audio_files[]") if v.strip()],
+        "groups": [str(group_id or "").strip() for group_id in request.form.getlist("groups[]") if str(group_id or "").strip()],
+        "send_all": bool(request.form.get("send_all")),
+        "color": str(request.form.get("color", "") or "").strip().lstrip("#").upper(),
+        "icon": request.form.get("icon", ""),
+        "priority": request.form.get("priority", "Normal"),
+    }
+
+
 def create_custom_broadcast(values, expires_rule):
     issued = datetime.now()
     expires_at, normalized_rule = parse_expires(expires_rule, issued)
@@ -109,19 +122,21 @@ def handle_request():
     if demo_mode_enabled():
         return demo_mode_iframe_html("messages")
     ensure_message_vendor_schema()
+    error = ""
+    form_state = custom_form_state()
 
     if request.method == "POST":
-        audio_value = ":".join([v.strip() for v in request.form.getlist("audio_files[]") if v.strip()])
-        shortmessage = request.form.get("shortmessage", "")
-        longmessage = message_multiline_text(request.form.get("longmessage", ""))
+        audio_value = ":".join(form_state["audio"])
+        shortmessage = form_state["shortmessage"]
+        longmessage = form_state["longmessage"]
         has_audio = bool(audio_value)
         has_text = bool(shortmessage.strip() or longmessage.strip())
         if not has_audio and not has_text:
-            return redirect("/messages/custom")
+            error = "Enter a message, add audio, or both."
         msg_type = "text+audio" if (has_audio and has_text) else ("audio" if has_audio else "text")
-        if request.form.get("send_all"):
+        if not error and form_state["send_all"]:
             groups_value = all_group_ids_value(user)
-        else:
+        elif not error:
             allowed_group_ids = {
                 str(group.get("id") or "").strip()
                 for group in filter_group_rows_for_user(
@@ -130,41 +145,44 @@ def handle_request():
                 )
                 if str(group.get("id") or "").strip()
             }
-            selected = [str(group_id or "").strip() for group_id in request.form.getlist("groups[]") if str(group_id or "").strip() in allowed_group_ids]
+            selected = [group_id for group_id in form_state["groups"] if group_id in allowed_group_ids]
             groups_value = ".".join(selected)
-        if groups_value in {"", "0"}:
-            return redirect("/messages/custom")
-        expires_rule = message_expiration_from_form(request.form)
-        try:
-            broadcast_id = create_custom_broadcast(
-                {
-                    "name": "Custom message",
-                    "shortmessage": shortmessage if has_text else "",
-                    "longmessage": longmessage if has_text else "",
-                    "icon": resolve_message_icon_value(request.form.get("icon", "")) if has_text else "",
-                    "color": request.form.get("color", "").lstrip("#") if has_text else "",
-                    "groups": groups_value,
-                    "image": request.form.get("image", ""),
-                    "audio": audio_value,
-                    "sender": user.get("username") or session.get("username") or "User",
-                    "priority": request.form.get("priority", "Normal"),
-                    "type": msg_type,
-                    "vendor_specific": vendor_specific_from_form(request.form),
-                },
-                expires_rule,
-            )
-            return redirect(f"/messages/send-status?bid={broadcast_id}")
-        except Exception:
-            fail_key = uuid.uuid4().hex
+        else:
+            groups_value = ""
+        if not error and groups_value in {"", "0"}:
+            error = "Select at least one group, or choose All Recipients."
+        if not error:
+            expires_rule = message_expiration_from_form(request.form)
             try:
-                from active_broadcast_store import RUNTIME_DIR
-                RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-                with open(RUNTIME_DIR / f"send-debug-{fail_key}.log", "a", encoding="utf-8") as handle:
-                    handle.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] custom send failed groups={groups_value}\n")
-                    handle.write(traceback.format_exc() + "\n")
-            except OSError:
-                pass
-            return redirect(f"/messages/send-status?fail={fail_key}")
+                broadcast_id = create_custom_broadcast(
+                    {
+                        "name": "Custom message",
+                        "shortmessage": shortmessage if has_text else "",
+                        "longmessage": longmessage if has_text else "",
+                        "icon": resolve_message_icon_value(form_state["icon"]) if has_text else "",
+                        "color": form_state["color"] if has_text else "",
+                        "groups": groups_value,
+                        "image": request.form.get("image", ""),
+                        "audio": audio_value,
+                        "sender": user.get("username") or session.get("username") or "User",
+                        "priority": form_state["priority"],
+                        "type": msg_type,
+                        "vendor_specific": vendor_specific_from_form(request.form),
+                    },
+                    expires_rule,
+                )
+                return redirect(f"/messages/send-status?bid={broadcast_id}")
+            except Exception:
+                fail_key = uuid.uuid4().hex
+                try:
+                    from active_broadcast_store import RUNTIME_DIR
+                    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+                    with open(RUNTIME_DIR / f"send-debug-{fail_key}.log", "a", encoding="utf-8") as handle:
+                        handle.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] custom send failed groups={groups_value}\n")
+                        handle.write(traceback.format_exc() + "\n")
+                except OSError:
+                    pass
+                return redirect(f"/messages/send-status?fail={fail_key}")
 
     conn = db()
     try:
@@ -184,6 +202,7 @@ def handle_request():
     all_disabled = " disabled" if all_unavailable else ""
     all_row_cls = " recipient-row unavailable" if all_unavailable else ""
     all_note = '<span class="recipient-note">No available recipients</span>' if all_unavailable else ""
+    selected_groups = set(form_state["groups"])
     if groups:
         group_rows = []
         for group in groups:
@@ -200,7 +219,7 @@ def handle_request():
             note = "" if has_available else '<span class="recipient-note">No available recipients</span>'
             group_rows.append(
                 f"""                    <label class="md-checkbox-container recipient-row{row_cls}">
-                        <input type="checkbox" name="groups[]" value="{h(group.get("id"))}" class="group-checkbox" data-unavailable="{unavailable_data}"{disabled}>
+                        <input type="checkbox" name="groups[]" value="{h(group.get("id"))}" class="group-checkbox" data-unavailable="{unavailable_data}"{disabled}{' checked' if str(group.get("id") or '').strip() in selected_groups else ''}>
                         <span class="md-checkmark"></span>
                         <span class="text">{h(group.get("name"))}</span>
                         {note}
@@ -209,19 +228,20 @@ def handle_request():
         groups_html = "\n".join(group_rows)
     else:
         groups_html = '<p class="help-text">No groups are available.</p>'
-    transfer = audio_transfer_html(audio_files())
+    transfer = audio_transfer_html(audio_files(), form_state["audio"])
     vendor_specific_html = vendor_specific_editor_html(context={"mode": "message_custom"})
+    error_html = f'<div class="error">{h(error)}</div>' if error else ""
     variable_fields = (
         message_variable_field_html(
             "shortmessage",
             "Short Message",
-            '<input type="text" name="shortmessage" id="shortmessage" class="form-control">',
+            f'<input type="text" name="shortmessage" id="shortmessage" class="form-control" value="{h(form_state["shortmessage"])}">',
             "You can use variables here and they will resolve when the custom message is sent.",
         )
         + message_variable_field_html(
             "longmessage",
             "Long Message",
-            '<textarea name="longmessage" id="longmessage" class="form-control textarea-long" rows="7" wrap="soft"></textarea>',
+            f'<textarea name="longmessage" id="longmessage" class="form-control textarea-long" rows="7" wrap="soft">{h(form_state["longmessage"])}</textarea>',
             "Use variables for timestamps, sender details, live API text, or the product name.",
         )
     )
@@ -229,12 +249,13 @@ def handle_request():
         <h1>Send Custom Message</h1>
     </div>
     <div class="info-card">
+        {error_html}
         <form method="POST">
             <div class="form-group">
                 <label class="main-label">Recipients</label>
                 <div class="checkbox-row">
                     <label class="md-checkbox-container">
-                        <input type="checkbox" name="send_all" id="send_all" value="1" onchange="toggleRecipients()"{all_disabled}>
+                        <input type="checkbox" name="send_all" id="send_all" value="1" onchange="toggleRecipients()"{all_disabled}{' checked' if form_state["send_all"] else ''}>
                         <span class="md-checkmark"></span>
                         <span class="text" style="font-weight:bold;color:#1976D2;">All Recipients</span>
                         {all_note}
@@ -249,12 +270,12 @@ def handle_request():
             </div>
             <div id="visual-fields">
 {variable_fields}
-{message_icon_field_html()}
+{message_icon_field_html(form_state["icon"])}
                 <div class="form-group">
                     <label class="main-label">Color</label>
                 <div class="color-picker-container">
-                    <input type="color" id="colorPicker" value="#000000" class="color-picker-input">
-                    <input type="text" name="color" id="colorHex" class="form-control" style="width:150px;" placeholder="000000" maxlength="6">
+                    <input type="color" id="colorPicker" value="{h('#' + form_state["color"] if re.fullmatch(r'[A-F0-9]{6}', form_state['color']) else '#000000')}" class="color-picker-input">
+                    <input type="text" name="color" id="colorHex" class="form-control" style="width:150px;" placeholder="000000" maxlength="6" value="{h(form_state["color"])}">
                 </div>
             </div>
             </div>
@@ -262,10 +283,10 @@ def handle_request():
             <div class="form-group">
                 <label class="main-label" for="priority">Priority</label>
                 <select name="priority" id="priority" class="form-control">
-                    <option value="Low">Low</option>
-                    <option value="Normal" selected>Normal</option>
-                    <option value="High">High</option>
-                    <option value="Emergency">Emergency</option>
+                    <option value="Low"{' selected' if form_state["priority"] == 'Low' else ''}>Low</option>
+                    <option value="Normal"{' selected' if form_state["priority"] == 'Normal' else ''}>Normal</option>
+                    <option value="High"{' selected' if form_state["priority"] == 'High' else ''}>High</option>
+                    <option value="Emergency"{' selected' if form_state["priority"] == 'Emergency' else ''}>Emergency</option>
                 </select>
             </div>
             {vendor_specific_html}

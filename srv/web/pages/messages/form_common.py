@@ -1153,7 +1153,30 @@ document.addEventListener('DOMContentLoaded', function() {
     syncMessageExpiration();
 });
 document.addEventListener('submit', function(event) {
-    if (!event.target || !event.target.querySelector || !event.target.querySelector('#expires')) return;
+    if (!event.target || !event.target.querySelector) return;
+    const hasMessageFields = !!(
+        event.target.querySelector('input[name="audio_files[]"]') ||
+        event.target.querySelector('#shortmessage') ||
+        event.target.querySelector('#longmessage')
+    );
+    if (hasMessageFields) {
+        const shortField = event.target.querySelector('#shortmessage');
+        const longField = event.target.querySelector('#longmessage');
+        const audioFields = Array.from(event.target.querySelectorAll('input[name="audio_files[]"]'));
+        const hasText = !!(
+            (shortField && String(shortField.value || '').trim()) ||
+            (longField && String(longField.value || '').trim())
+        );
+        const hasAudio = audioFields.some(function(field) {
+            return !!String(field.value || '').trim();
+        });
+        if (!hasText && !hasAudio) {
+            alert('Enter a message, add audio, or both.');
+            event.preventDefault();
+            return;
+        }
+    }
+    if (!event.target.querySelector('#expires')) return;
     syncMessageExpiration();
     if (!validateMessageExpiration()) event.preventDefault();
 });

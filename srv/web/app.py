@@ -34,10 +34,10 @@ except ImportError:
     PasswordHasher = None
     InvalidHashError = VerificationError = Exception
 try:
-    from ldap3 import ALL, SIMPLE, SUBTREE, Connection, Server, Tls
+    from ldap3 import ALL, BASE, SIMPLE, SUBTREE, Connection, Server, Tls
     from ldap3.utils.conv import escape_filter_chars
 except ImportError:
-    ALL = SIMPLE = SUBTREE = Connection = Server = Tls = None
+    ALL = BASE = SIMPLE = SUBTREE = Connection = Server = Tls = None
 
     def escape_filter_chars(value):
         text = str(value or "")
@@ -122,8 +122,16 @@ WEB_RATE_LIMIT_EXEMPT_PREFIXES = ("/bundled-assets/", "/assets/file/", "/favicon
 TEMP_ASSET_ACCESS_SECONDS = 48 * 60 * 60
 TEMP_ASSET_ACCESS = {}
 TEMP_ASSET_ACCESS_LOCK = threading.Lock()
-USER_SESSION_TOUCH_INTERVAL_SECONDS = 60
-SCIM_RECONCILE_INTERVAL_SECONDS = max(120, int(os.getenv("OPS_SCIM_RECONCILE_INTERVAL_SECONDS", "300")))
+def _positive_int_env(name, default):
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+USER_SESSION_TOUCH_INTERVAL_SECONDS = _positive_int_env("OPS_USER_SESSION_TOUCH_INTERVAL_SECONDS", 60)
+EXTERNAL_IDENTITY_CHECK_INTERVAL_SECONDS = _positive_int_env("OPS_EXTERNAL_IDENTITY_CHECK_INTERVAL_SECONDS", 3600)
+SCIM_RECONCILE_INTERVAL_SECONDS = max(120, _positive_int_env("OPS_SCIM_RECONCILE_INTERVAL_SECONDS", 300))
 SCIM_RECONCILE_THREAD = None
 SCIM_RECONCILE_LOCK = threading.Lock()
 
@@ -480,11 +488,9 @@ def check_rate_limit(scope, key, limit, window_seconds):
 
 @app.before_request
 def detect_desktop_client_context():
-    # If the request comes with desktop_client parameter or Header, persist it in the session
     desktop_param = request.args.get("desktop_client")
-    if desktop_param is not None and str(desktop_param).strip().lower() in {"1", "true", "yes", "on"}:
-        session["desktop_client"] = True
-    elif request.headers.get("X-Desktop-Client") == "1":
+    desktop_header = str(request.headers.get(DESKTOP_CLIENT_HEADER) or request.headers.get("X-Desktop-Client") or "").strip().lower()
+    if (desktop_param is not None and str(desktop_param).strip().lower() in {"1", "true", "yes", "on"}) or desktop_header in {"1", "true", "yes", "on"}:
         session["desktop_client"] = True
 
 @app.before_request
@@ -1111,8 +1117,8 @@ def touch_user_session_record(session_id):
     execute("UPDATE user_sessions SET last_seen_at=NOW() WHERE session_id=%s", (wanted,))
 
 
-SOFT_LOGOUT_AFTER_SECONDS_WEB = 10 * 60
-SOFT_LOGOUT_AFTER_SECONDS_DESKTOP = 72 * 3600
+SOFT_LOGOUT_AFTER_SECONDS_WEB = _positive_int_env("OPS_WEB_SESSION_REAUTH_SECONDS", 12 * 3600)
+SOFT_LOGOUT_AFTER_SECONDS_DESKTOP = _positive_int_env("OPS_DESKTOP_SESSION_REAUTH_SECONDS", 30 * 24 * 3600)
 SOFT_ACCESS_PATH_PREFIXES = ("/dashboard", "/login", "/logout", "/assets", "/bundled-assets", "/favicon.ico", "/desktop/", "/api/", "/demo-mode")
 
 
@@ -2785,12 +2791,11 @@ def current_user():
         except (TypeError, ValueError):
             last_identity_check = 0
         now_value = time.time()
-        if now_value - last_identity_check >= USER_SESSION_TOUCH_INTERVAL_SECONDS:
+        if now_value - last_identity_check >= EXTERNAL_IDENTITY_CHECK_INTERVAL_SECONDS:
             refreshed_user = refresh_synced_identity_user(user)
             if not refreshed_user:
                 if session_id:
                     revoke_user_session_record(session_id, user_id)
-                delete_provider_managed_user(user.get("id"))
                 session.clear()
                 return None
             user = refreshed_user
@@ -3274,6 +3279,20 @@ def ldap_identity_exists_for_user(user, config):
             bind_kwargs["user"] = bind_username
             bind_kwargs["password"] = bind_password
         connection = Connection(**bind_kwargs)
+        if external_id and BASE is not None:
+            try:
+                if connection.search(
+                    search_base=external_id,
+                    search_filter="(objectClass=*)",
+                    search_scope=BASE,
+                    attributes=["memberOf"],
+                    size_limit=1,
+                ) and connection.entries:
+                    return True
+            except Exception:
+                pass
+        if not username:
+            return False
         search_ok = connection.search(
             search_base=str(config.get("ldap_base_dn") or "").strip(),
             search_filter=ldap_search_filter(config, username),
@@ -3490,7 +3509,11 @@ def saml_identity_result(config, auth):
 def begin_web_login_session(user, auth_provider="local"):
     user_agent = request.headers.get("User-Agent", "unknown")
     ip_address = client_ip()
+    was_desktop_client = bool(session.get("desktop_client"))
+    now_value = time.time()
     session.clear()
+    if was_desktop_client:
+        session["desktop_client"] = True
     session["user_id"] = user["id"]
     session["username"] = user["username"]
     session["auth_provider"] = str(auth_provider or "local")
@@ -3501,8 +3524,9 @@ def begin_web_login_session(user, auth_provider="local"):
         ip_address=ip_address,
         user_agent=user_agent,
     )
-    session["web_session_touched_at"] = str(time.time())
-    session["external_identity_checked_at"] = "0"
+    session["web_session_touched_at"] = str(now_value)
+    session["external_identity_checked_at"] = str(now_value)
+    session["full_activity_touched_at"] = str(now_value)
 
 
 def post_login_redirect_target(user, auth_provider="local"):
@@ -4824,9 +4848,13 @@ def desktop_session_token():
         client_os = str(request.headers.get("X-OPS-Client-OS") or "").strip()
         agent = f"OpenPagingServer Desktop Client/1.0 ({client_os})" if client_os else "OpenPagingServer Desktop Client/1.0"
         execute(
-            "UPDATE user_sessions SET session_type='desktop', user_agent=%s WHERE session_id=%s",
+            "UPDATE user_sessions SET session_type='desktop', user_agent=%s, last_seen_at=NOW(), last_full_activity=NOW() WHERE session_id=%s",
             (agent, web_session_id),
         )
+        now_value = str(time.time())
+        session["desktop_client"] = True
+        session["web_session_touched_at"] = now_value
+        session["full_activity_touched_at"] = now_value
     token, expires_at = build_desktop_token(user)
     refresh_token, refresh_expires_at = build_desktop_refresh_token(user)
     return jsonify(
@@ -4907,6 +4935,8 @@ def desktop_server_info():
     return jsonify(
         product_name=desktop_product_name(),
         guest_receiver_enabled=guest_receiver_enabled(),
+        websocket_path="/desktop/ws",
+        keepalive_path="/desktop/session/ping",
         sso_provider=provider or "",
         sso_start_path="/login/sso/start" if provider else "",
         sso_auto_redirect=bool(provider and identity_redirect_auto_enabled(config)),
