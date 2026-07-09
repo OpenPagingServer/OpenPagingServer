@@ -35,6 +35,7 @@ DEBUG = os.getenv("DEBUG", "").strip().lower() == "true"
 POLL_INTERVAL = max(0.2, float(os.getenv("BELL_POLL_INTERVAL", "0.5")))
 BELL_OVERLAP_BRIDGE_SECONDS = max(0.0, float(os.getenv("BELL_OVERLAP_BRIDGE_SECONDS", "15")))
 BELL_STARTUP_GRACE_SECONDS = max(1.0, float(os.getenv("BELL_STARTUP_GRACE_SECONDS", "90")))
+BELL_PREBUILD_LEAD_SECONDS = max(5.0, float(os.getenv("BELL_PREBUILD_LEAD_SECONDS", "30")))
 BELL_FRAME_RATE = 8000
 BELL_FRAME_BYTES = 160
 BELL_FRAME_SECONDS = BELL_FRAME_BYTES / BELL_FRAME_RATE
@@ -453,6 +454,13 @@ def write_cluster_audio_file(cluster):
         f"{cluster['start_at'].strftime('%Y%m%d-%H%M%S')}-"
         f"{first_event_id}-{last_event_id}.wav"
     )
+    # The filename is deterministic — reuse a cluster file that was pre-built
+    # ahead of the fire time so dispatch is instant.
+    try:
+        if path.is_file() and path.stat().st_size > 44:
+            return str(path)
+    except OSError:
+        pass
     frames_by_index = defaultdict(list)
     max_frame_index = 0
     for event in cluster["events"]:
@@ -472,14 +480,42 @@ def write_cluster_audio_file(cluster):
         max_frame_index,
         bell_offset_frames((cluster["end_at"] - cluster["start_at"]).total_seconds()),
     )
-    with wave.open(str(path), "wb") as handle:
+    temp_path = path.with_name(path.name + ".building")
+    with wave.open(str(temp_path), "wb") as handle:
         handle.setnchannels(1)
         handle.setsampwidth(2)
         handle.setframerate(BELL_FRAME_RATE)
         for frame_index in range(total_frames):
             mixed = mix_ulaw_frames(frames_by_index.get(frame_index, []))
             handle.writeframesraw(struct.pack("<160h", *[ULAW_TO_LINEAR_TABLE[byte] for byte in mixed[:BELL_FRAME_BYTES]]))
+    os.replace(str(temp_path), str(path))
+    log(f"cluster_audio_built path={path} frames={total_frames}")
     return str(path)
+
+
+def prepare_upcoming_clusters(schedule, now):
+    """Pre-build cluster audio files ahead of their fire time so dispatch at
+    the scheduled moment is instant. Returns the next upcoming cluster start
+    time (or None)."""
+    day_value = now.date()
+    events = fetch_schedule_events_after(schedule, day_value, now, now.strftime("%w"))
+    lead_deadline = now + timedelta(seconds=BELL_PREBUILD_LEAD_SECONDS)
+    next_start = None
+    index = 0
+    while index < len(events):
+        event_start = bell_event_start(day_value, events[index])
+        if next_start is None or event_start < next_start:
+            next_start = event_start
+        if event_start > lead_deadline:
+            break
+        cluster, consumed = build_bell_cluster(schedule, events, index, day_value)
+        if len(cluster["events"]) > 1:
+            try:
+                write_cluster_audio_file(cluster)
+            except Exception as exc:
+                log(f"prebuild_error schedule={cluster['schedule_id']} error={exc}")
+        index += max(1, consumed)
+    return next_start
 
 
 def insert_broadcast(record):
@@ -699,6 +735,7 @@ def main():
         f"startup_grace_seconds={BELL_STARTUP_GRACE_SECONDS}"
     )
     while True:
+        sleep_for = POLL_INTERVAL
         try:
             for schedule in fetch_enabled_schedules():
                 try:
@@ -732,11 +769,24 @@ def main():
                             fire_event_cluster(cluster)
                             index += consumed
                     last_seen_by_schedule[schedule_id] = max(last_seen, advance_to)
+                    # Pre-build upcoming cluster audio and wake precisely for
+                    # the next scheduled bell instead of a fixed poll delay.
+                    try:
+                        next_start = prepare_upcoming_clusters(schedule, now)
+                    except Exception as exc:
+                        next_start = None
+                        log(f"prepare_error schedule_id={schedule_id} error={exc}")
+                    if next_start is not None:
+                        until_next = (next_start - datetime.now(timezone).replace(tzinfo=None)).total_seconds()
+                        if until_next > 0:
+                            sleep_for = min(sleep_for, until_next)
+                        else:
+                            sleep_for = min(sleep_for, 0.05)
                 except Exception as exc:
                     log(f"schedule_error schedule_id={schedule.get('id')} error={exc}")
         except Exception as exc:
             log(f"loop_error={exc}")
-        time.sleep(POLL_INTERVAL)
+        time.sleep(max(0.05, min(POLL_INTERVAL, sleep_for)))
 
 
 if __name__ == "__main__":

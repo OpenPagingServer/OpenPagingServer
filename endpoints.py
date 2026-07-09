@@ -950,6 +950,10 @@ def _build_linear_to_ulaw_table():
 
 LINEAR_TO_ULAW_TABLE = _build_linear_to_ulaw_table()
 
+ULAW_TO_PCM16LE_TABLE = tuple(
+    struct.pack("<h", int(sample)) for sample in ULAW_TO_LINEAR_TABLE
+)
+
 
 def mix_ulaw_frames(frames):
     if not frames:
@@ -962,7 +966,13 @@ def mix_ulaw_frames(frames):
         total = 0
         for frame in frames:
             total += ULAW_TO_LINEAR_TABLE[frame[index]]
-        mixed[index] = LINEAR_TO_ULAW_TABLE[int(total) & 0xFFFF]
+        # Sum then clip to 16-bit range; wrapping overflow causes severe
+        # distortion when simultaneous sources (e.g. bell clusters) overlap.
+        if total > 32767:
+            total = 32767
+        elif total < -32768:
+            total = -32768
+        mixed[index] = LINEAR_TO_ULAW_TABLE[total & 0xFFFF]
     return bytes(mixed)
 
 
@@ -4236,11 +4246,9 @@ class BroadcastRecordingWriter:
         payload = bytes(frame or b"")
         if not payload:
             return
-        pcm = bytearray()
-        for byte in payload:
-            sample = int(ULAW_TO_LINEAR_TABLE[byte])
-            pcm.extend(struct.pack("<h", sample))
-        self.wave_file.writeframesraw(bytes(pcm))
+        self.wave_file.writeframesraw(
+            b"".join(map(ULAW_TO_PCM16LE_TABLE.__getitem__, payload))
+        )
 
     def close(self):
         if self.closed:
@@ -5241,9 +5249,19 @@ def finish_stream(stream_id):
 
 
 def recv_line(conn, limit=65536):
+    # Never consume bytes past the newline: audio data can follow the
+    # command line on the same socket (PREPARE/PREPARELIVE streams).
     data = bytearray()
     while len(data) < limit:
-        chunk = conn.recv(4096)
+        try:
+            peeked = conn.recv(4096, socket.MSG_PEEK)
+        except OSError:
+            break
+        if not peeked:
+            break
+        newline_index = peeked.find(b"\n")
+        take = newline_index + 1 if newline_index != -1 else len(peeked)
+        chunk = conn.recv(take)
         if not chunk:
             break
         data.extend(chunk)
@@ -5500,11 +5518,24 @@ def deliver_broadcast(stream_id, broadcast_id):
             except Exception as exc:
                 log(f"broadcast recording start error broadcast={broadcast_id}: {exc}")
             # Unified paced frame loop — desktop gets audio immediately;
-            # endpoint modules receive frames once they signal ready (or after
-            # the 10-second deadline passes to avoid starving them entirely).
+            # endpoint modules receive frames once they signal ready. Frames
+            # produced before readiness are buffered and flushed so multicast
+            # endpoints receive the full audio from the first frame.
             frame_duration = 160 / 8000
             next_send_time = time.perf_counter()
             stopped = False
+
+            def deliver_endpoint_frame(endpoint_frame):
+                for module_name in target_map:
+                    with loaded_modules_lock:
+                        mod = loaded_modules.get(module_name)
+                    if mod and hasattr(mod, "receive_audio"):
+                        try:
+                            mod.receive_audio(endpoint_frame, stream_id)
+                        except Exception as exc:
+                            log(f"receive_audio error in {module_name}: {exc}")
+
+            pending_endpoint_frames = []
             for frame in itertools.chain([first_frame], gen):
                 if active_broadcast_stop_requested(broadcast_id):
                     stopped = True
@@ -5526,21 +5557,20 @@ def deliver_broadcast(stream_id, broadcast_id):
                     except Exception as exc:
                         log(f"desktop broadcast frame error broadcast={broadcast_id}: {exc}")
                         desktop_sock = None
-                # Endpoint modules: gate on readiness, then deliver
+                # Endpoint modules: buffer until ready, then flush + deliver
                 if target_map:
                     if not endpoints_ready:
                         if endpoint_state.ready_event.is_set() or time.perf_counter() >= endpoint_wait_deadline:
                             endpoints_ready = True
                             log(f"handle_broadcast endpoints_ready stream={stream_id} ready={endpoint_state.ready_event.is_set()}")
                     if endpoints_ready:
-                        for module_name in target_map:
-                            with loaded_modules_lock:
-                                mod = loaded_modules.get(module_name)
-                            if mod and hasattr(mod, "receive_audio"):
-                                try:
-                                    mod.receive_audio(frame, stream_id)
-                                except Exception as exc:
-                                    log(f"receive_audio error in {module_name}: {exc}")
+                        if pending_endpoint_frames:
+                            for queued_frame in pending_endpoint_frames:
+                                deliver_endpoint_frame(queued_frame)
+                            pending_endpoint_frames = []
+                        deliver_endpoint_frame(frame)
+                    else:
+                        pending_endpoint_frames.append(frame)
                 next_send_time += frame_duration
                 sleep_time = next_send_time - time.perf_counter()
                 if sleep_time > 0:
@@ -5552,6 +5582,16 @@ def deliver_broadcast(stream_id, broadcast_id):
                     desktop_sock.close()
             except Exception:
                 pass
+            # Short clips can finish before modules signal ready — wait for
+            # readiness (bounded) and flush the buffered frames so nothing is lost.
+            if target_map and pending_endpoint_frames and not stopped:
+                if not endpoints_ready:
+                    remaining = endpoint_wait_deadline - time.perf_counter()
+                    if remaining > 0:
+                        endpoint_state.ready_event.wait(remaining)
+                for queued_frame in pending_endpoint_frames:
+                    deliver_endpoint_frame(queued_frame)
+                pending_endpoint_frames = []
             recording_path = ""
             if recording is not None:
                 try:
