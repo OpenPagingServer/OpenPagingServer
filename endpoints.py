@@ -855,6 +855,9 @@ MULTICAST_RTP_FRAME_MS = 20
 MULTICAST_RTP_FRAME_SIZE = 160
 MULTICAST_RTP_READY_SILENCE_FRAMES = 3
 MULTICAST_RTP_IDLE_SECONDS = 1.0
+# How far ahead of real time deliver_broadcast feeds endpoint modules; this
+# jitter cushion keeps the self-pacing RTP senders from underrunning.
+MULTICAST_DELIVERY_LEAD_SECONDS = max(0.0, float(os.getenv("MULTICAST_DELIVERY_LEAD_SECONDS", "0.3")))
 MULTICAST_GATEWAY_HOST = os.getenv("OPS_MULTICAST_GATEWAY_HOST", "127.0.0.1")
 MULTICAST_GATEWAY_PORT = int(os.getenv("OPS_MULTICAST_GATEWAY_PORT", "8710"))
 
@@ -1120,6 +1123,27 @@ def install_multicast_gateway_sendto_patch():
         return
     original_sendto = socket.socket.sendto
 
+    # Forward packets to the gateway from a background worker so the RTP
+    # sender threads never block on locks, DNS lookups, or gateway sends.
+    forward_queue = deque(maxlen=512)
+    forward_wakeup = threading.Event()
+
+    def forward_worker():
+        while True:
+            forward_wakeup.wait()
+            forward_wakeup.clear()
+            while True:
+                try:
+                    data, host, port, family, ttl = forward_queue.popleft()
+                except IndexError:
+                    break
+                try:
+                    forward_multicast_packet(data, host, port, family=family, ttl=ttl)
+                except Exception:
+                    pass
+
+    threading.Thread(target=forward_worker, daemon=True).start()
+
     def patched_sendto(sock, data, *args):
         address = None
         if len(args) == 1:
@@ -1131,7 +1155,8 @@ def install_multicast_gateway_sendto_patch():
             host, port = destination
             ttl = socket_multicast_ttl(sock)
             try:
-                forward_multicast_packet(data, host, port, family=sock.family, ttl=ttl)
+                forward_queue.append((bytes(data), host, port, sock.family, ttl))
+                forward_wakeup.set()
             except Exception:
                 pass
         return original_sendto(sock, data, *args)
@@ -3874,6 +3899,7 @@ class MulticastRTPEndpointChannel:
         self.sources = {}
         self.stop_event = threading.Event()
         self.idle_since = None
+        self.closing = False
         self.on_idle = on_idle
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
@@ -3881,6 +3907,8 @@ class MulticastRTPEndpointChannel:
     def attach_source(self, stream_id, priority="Normal"):
         source = MulticastRTPSource(priority=priority)
         with self.lock:
+            if self.closing:
+                return None
             previous = self.sources.pop(stream_id, None)
             self.sources[stream_id] = source
             self.idle_since = None
@@ -3897,6 +3925,7 @@ class MulticastRTPEndpointChannel:
     def stop(self):
         self.stop_event.set()
         with self.lock:
+            self.closing = True
             sources = list(self.sources.values())
         for source in sources:
             source.close()
@@ -3918,7 +3947,13 @@ class MulticastRTPEndpointChannel:
                             if self.idle_since is None:
                                 self.idle_since = now
                     elif now - idle_since >= MULTICAST_RTP_IDLE_SECONDS:
-                        break
+                        # Refuse new attachments before exiting so a broadcast
+                        # can never latch onto a dead sender thread.
+                        with self.lock:
+                            if not self.sources:
+                                self.closing = True
+                        if self.closing:
+                            break
                     mixed_frame = MULTICAST_RTP_SILENCE_FRAME
                 else:
                     with self.lock:
@@ -3934,7 +3969,12 @@ class MulticastRTPEndpointChannel:
                         if finished:
                             finished_stream_ids.append(stream_id)
                     mixed_frame = mix_ulaw_frames(frames)
-                self.sender.send_frame(mixed_frame)
+                try:
+                    self.sender.send_frame(mixed_frame)
+                except OSError as exc:
+                    # Transient network errors must not kill the channel
+                    # thread mid-broadcast; skip the frame and keep pacing.
+                    log(f"multicast rtp send error channel={self.key}: {exc}")
                 for stream_id in ready_sources:
                     self.on_idle("ready", self.key, stream_id, self)
                 if finished_stream_ids:
@@ -4017,7 +4057,7 @@ class BuiltinMulticastRTPModule:
         channel_key = str(row.get("id") or "")
         with self.lock:
             channel = self.channels.get(channel_key)
-            if channel is None:
+            if channel is None or channel.closing:
                 channel = MulticastRTPEndpointChannel(row, self.handle_channel_event)
                 self.channels[channel_key] = channel
             return channel
@@ -4029,8 +4069,21 @@ class BuiltinMulticastRTPModule:
         state = MulticastRTPStreamState(stream_id)
         priority = multicast_priority_value(metadata)
         for row in rows:
-            channel = self.ensure_channel(row)
-            state.add_source(channel.key, channel.attach_source(stream_id, priority=priority))
+            source = None
+            for _attempt in range(3):
+                channel = self.ensure_channel(row)
+                source = channel.attach_source(stream_id, priority=priority)
+                if source is not None:
+                    break
+                # Channel was shutting down between lookup and attach — drop
+                # it so ensure_channel builds a fresh one.
+                with self.lock:
+                    if self.channels.get(channel.key) is channel:
+                        self.channels.pop(channel.key, None)
+            if source is None:
+                log(f"multicast rtp attach failed stream={stream_id} channel={row.get('id')}")
+                continue
+            state.add_source(channel.key, source)
         with self.lock:
             previous = self.streams.pop(stream_id, None)
             self.streams[stream_id] = state
@@ -5502,6 +5555,9 @@ def deliver_broadcast(stream_id, broadcast_id):
                     sample_rate=8000,
                     broadcast=broadcast,
                 )
+                if desktop_sock is not None:
+                    # Never let a stalled desktop pipe starve endpoint audio.
+                    desktop_sock.settimeout(1.0)
             except Exception as exc:
                 desktop_sock = None
                 desktop_result = {}
@@ -5521,8 +5577,14 @@ def deliver_broadcast(stream_id, broadcast_id):
             # endpoint modules receive frames once they signal ready. Frames
             # produced before readiness are buffered and flushed so multicast
             # endpoints receive the full audio from the first frame.
+            # The loop runs slightly ahead of real time (delivery_lead) so the
+            # self-pacing endpoint senders always have a jitter cushion and
+            # never underrun into audible dropouts.
             frame_duration = 160 / 8000
-            next_send_time = time.perf_counter()
+            delivery_lead = MULTICAST_DELIVERY_LEAD_SECONDS
+            next_send_time = time.perf_counter() - delivery_lead
+            stop_check_interval = max(1, int(0.25 / frame_duration))
+            frames_since_stop_check = 0
             stopped = False
 
             def deliver_endpoint_frame(endpoint_frame):
@@ -5537,9 +5599,12 @@ def deliver_broadcast(stream_id, broadcast_id):
 
             pending_endpoint_frames = []
             for frame in itertools.chain([first_frame], gen):
-                if active_broadcast_stop_requested(broadcast_id):
-                    stopped = True
-                    break
+                if frames_since_stop_check <= 0:
+                    frames_since_stop_check = stop_check_interval
+                    if active_broadcast_stop_requested(broadcast_id):
+                        stopped = True
+                        break
+                frames_since_stop_check -= 1
                 if recording is not None:
                     try:
                         recording.write_frame(frame)
@@ -5575,8 +5640,9 @@ def deliver_broadcast(stream_id, broadcast_id):
                 sleep_time = next_send_time - time.perf_counter()
                 if sleep_time > 0:
                     time.sleep(sleep_time)
-                else:
-                    next_send_time = time.perf_counter()
+                elif sleep_time < -2.0:
+                    # Massive stall: resync rather than bursting the backlog.
+                    next_send_time = time.perf_counter() - delivery_lead
             try:
                 if desktop_sock is not None:
                     desktop_sock.close()
