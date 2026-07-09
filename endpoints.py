@@ -920,23 +920,35 @@ ULAW_TO_LINEAR_TABLE = build_ulaw_to_linear_table()
 
 
 def linear_to_ulaw(sample):
-    bias = 0x84
-    clip = 32635
-    sign = 0
-    sample = int(sample)
-    if sample < 0:
-        sample = -sample
-        sign = 0x80
-    if sample > clip:
-        sample = clip
-    sample += bias
-    exponent = 7
-    exp_mask = 0x4000
-    while exponent > 0 and not (sample & exp_mask):
-        exponent -= 1
-        exp_mask >>= 1
-    mantissa = (sample >> (exponent + 3)) & 0x0F
-    return (~(sign | (exponent << 4) | mantissa)) & 0xFF
+    return LINEAR_TO_ULAW_TABLE[int(sample) & 0xFFFF]
+
+
+def _build_linear_to_ulaw_table():
+    values = []
+    for index in range(65536):
+        sample = index
+        if sample > 32767:
+            sample -= 65536
+        bias = 0x84
+        clip = 32635
+        sign = 0
+        if sample < 0:
+            sample = -sample
+            sign = 0x80
+        if sample > clip:
+            sample = clip
+        sample += bias
+        exponent = 7
+        exp_mask = 0x4000
+        while exponent > 0 and not (sample & exp_mask):
+            exponent -= 1
+            exp_mask >>= 1
+        mantissa = (sample >> (exponent + 3)) & 0x0F
+        values.append((~(sign | (exponent << 4) | mantissa)) & 0xFF)
+    return tuple(values)
+
+
+LINEAR_TO_ULAW_TABLE = _build_linear_to_ulaw_table()
 
 
 def mix_ulaw_frames(frames):
@@ -950,7 +962,7 @@ def mix_ulaw_frames(frames):
         total = 0
         for frame in frames:
             total += ULAW_TO_LINEAR_TABLE[frame[index]]
-        mixed[index] = linear_to_ulaw(total / frame_count)
+        mixed[index] = LINEAR_TO_ULAW_TABLE[int(total) & 0xFFFF]
     return bytes(mixed)
 
 
