@@ -211,12 +211,20 @@ def request_client_ip(remote_addr, headers, allowlist):
 
 
 class ReverseProxyTrustMiddleware:
-    def __init__(self, app, allowlist, denied_html):
+    def __init__(self, app, allowlist, denied_html, default_scheme="http"):
         self.app = app
         self.allowlist = allowlist
         self.denied_html = denied_html
+        self.default_scheme = str(default_scheme or "http").lower()
 
     def __call__(self, environ, start_response):
+        # Each internal server is dedicated to a single front-facing scheme, so
+        # apply that scheme as the authoritative default. This keeps every request
+        # correct even on keep-alive connections, where the front proxy only
+        # injects the X-Ops-Forwarded-Proto header on the first request.
+        if self.default_scheme in {"http", "https"}:
+            environ["wsgi.url_scheme"] = self.default_scheme
+            environ["HTTPS"] = "on" if self.default_scheme == "https" else "off"
         ops_forwarded_proto = str(environ.get("HTTP_X_OPS_FORWARDED_PROTO") or "").split(",", 1)[0].strip().lower()
         ops_forwarded_port = str(environ.get("HTTP_X_OPS_FORWARDED_PORT") or "").split(",", 1)[0].strip()
         if ops_forwarded_proto in {"http", "https"}:
@@ -312,10 +320,10 @@ def load_reverse_proxy_denied_html():
     return b"<html><body><h1>403 Forbidden</h1><p>This request came through an untrusted reverse proxy.</p></body></html>"
 
 
-def create_waitress_server(app, port, trusted_proxy_allowlist=(), denied_html=None, hsts_enabled=False):
+def create_waitress_server(app, port, trusted_proxy_allowlist=(), denied_html=None, hsts_enabled=False, default_scheme="http"):
     denied_html = denied_html if denied_html is not None else load_reverse_proxy_denied_html()
     wrapped = HSTSMiddleware(app, hsts_enabled)
-    wrapped = ReverseProxyTrustMiddleware(wrapped, trusted_proxy_allowlist, denied_html)
+    wrapped = ReverseProxyTrustMiddleware(wrapped, trusted_proxy_allowlist, denied_html, default_scheme)
     wrapped = StripServerHeaderMiddleware(wrapped)
     return create_server(wrapped, host="127.0.0.1", port=port, ident="")
 
@@ -562,14 +570,14 @@ class FrontServer:
     def __init__(self, app, port, scheme="http", ssl_context=None, redirect_https_port=None, hsts_enabled=False):
         self.allowlist = parse_proxy_allowlist(os.getenv("WEB_REVERSE_PROXY_ALLOWED"))
         self.denied_html = load_reverse_proxy_denied_html()
-        self.internal_server = create_waitress_server(app, 0, self.allowlist, self.denied_html, hsts_enabled=hsts_enabled)
+        self.scheme = str(scheme or "http").lower()
+        self.internal_server = create_waitress_server(app, 0, self.allowlist, self.denied_html, hsts_enabled=hsts_enabled, default_scheme=self.scheme)
         self.internal_port = self.internal_server.effective_port
         self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.listener.bind(("0.0.0.0", port))
         self.listener.listen(100)
         self.effective_port = self.listener.getsockname()[1]
-        self.scheme = str(scheme or "http").lower()
         self.ssl_context = ssl_context
         self.redirect_https_port = int(redirect_https_port) if redirect_https_port else None
         self._closed = threading.Event()

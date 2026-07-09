@@ -4,7 +4,6 @@ import json
 import os
 import re
 import sqlite3
-import tempfile
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -183,7 +182,7 @@ def _delete_ids(conn, broadcast_ids):
         f"SELECT payload FROM active_broadcasts WHERE id IN ({placeholders})",
         ids,
     ).fetchall()
-    runtime_root = Path(tempfile.gettempdir()) / "openpagingserver-runtime"
+    runtime_root = RUNTIME_DIR.resolve()
     for row in rows:
         payload = row["payload"] if isinstance(row, sqlite3.Row) else (row[0] if row else "")
         try:
@@ -195,8 +194,7 @@ def _delete_ids(conn, broadcast_ids):
             continue
         try:
             recording_path = Path(recording_raw).resolve()
-            runtime_root_resolved = runtime_root.resolve()
-            if recording_path.is_file() and (recording_path == runtime_root_resolved or runtime_root_resolved in recording_path.parents):
+            if recording_path.is_file() and (recording_path == runtime_root or runtime_root in recording_path.parents):
                 recording_path.unlink()
         except OSError:
             pass

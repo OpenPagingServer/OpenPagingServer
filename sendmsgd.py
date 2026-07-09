@@ -343,8 +343,20 @@ def main():
                 print(f"Message '{message_id}' was not found", file=sys.stderr)
                 sys.exit(1)
             broadcast_id, expires_rule = create_broadcast_from_template(cur, template, group_id, sender="sendmsgd")
-            expire_message_rule_broadcasts(cur, expires_rule, exclude_broadcast_ids=[broadcast_id], trigger_groups=group_id)
-            expire_broadcasts_triggered_by_template(cur, message_id, exclude_broadcast_ids=[broadcast_id], trigger_groups=group_id)
+            trigger_priority = template.get("priority")
+            if str(trigger_priority or "").strip().lower() != "emergency":
+                expire_message_rule_broadcasts(
+                    cur,
+                    expires_rule,
+                    exclude_broadcast_ids=[broadcast_id],
+                    trigger_groups=group_id,
+                )
+                expire_broadcasts_triggered_by_template(
+                    cur,
+                    message_id,
+                    exclude_broadcast_ids=[broadcast_id],
+                    trigger_groups=group_id,
+                )
         conn.commit()
     finally:
         conn.close()

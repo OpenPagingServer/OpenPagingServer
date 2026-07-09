@@ -1,9 +1,12 @@
 from srv.web.app import *
 import base64
 import hashlib
+import json
 import mimetypes
+import re
 
 PRIORITY_ORDER = {"emergency": 0, "high": 1, "normal": 2, "low": 3}
+ICON_DATA_URI_CACHE = {}
 
 
 def _icon_data_uri(icon_name):
@@ -14,11 +17,20 @@ def _icon_data_uri(icon_name):
     try:
         if not path.is_file():
             return ""
+        stat = path.stat()
+        cache_key = (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+        cached = ICON_DATA_URI_CACHE.get(name)
+        if cached and cached.get("key") == cache_key:
+            return cached.get("data") or ""
         raw = path.read_bytes()
     except Exception:
         return ""
     mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
-    return f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
+    data_uri = f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
+    ICON_DATA_URI_CACHE[name] = {"key": cache_key, "data": data_uri}
+    if len(ICON_DATA_URI_CACHE) > 256:
+        ICON_DATA_URI_CACHE.pop(next(iter(ICON_DATA_URI_CACHE)), None)
+    return data_uri
 
 
 def _text_color_for(background):
@@ -70,15 +82,22 @@ def _resolved_name(record):
     return str(record.get("name") or "").strip()
 
 
+def _compact_message_text(value):
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return ""
+    return re.sub(r"\n{3,}", "\n\n", text)
+
+
 def _message_card(record):
     color_raw = str(record.get("color") or "").strip()
     color = normalize_color(color_raw) if color_raw else ""
     text_color = _text_color_for(color) if color else ""
     icon_uri = _icon_data_uri(record.get("icon"))
     icon_html = f'<img class="msg-icon" src="{h(icon_uri)}" alt="">' if icon_uri else ""
-    longmessage = str(record.get("longmessage") or "").strip()
-    shortmessage = str(record.get("shortmessage") or "").strip()
-    name = _resolved_name(record)
+    longmessage = _compact_message_text(record.get("longmessage"))
+    shortmessage = _compact_message_text(record.get("shortmessage"))
+    name = _compact_message_text(_resolved_name(record))
     body = ""
     if name:
         body += f'<div class="msg-name">{h(name)}</div>'
@@ -119,6 +138,32 @@ def _cards_html(records):
     return "\n".join(_message_card(record) for record in records)
 
 
+def _records_digest(records):
+    normalized = []
+    for record in records or []:
+        normalized.append(
+            {
+                "id": str(record.get("id") or ""),
+                "issued": str(record.get("issued") or ""),
+                "expires": str(record.get("expires") or ""),
+                "delivery": str(record.get("delivery") or ""),
+                "name": str(record.get("name") or ""),
+                "shortmessage": str(record.get("shortmessage") or ""),
+                "longmessage": str(record.get("longmessage") or ""),
+                "priority": str(record.get("priority") or ""),
+                "sender": str(record.get("sender") or ""),
+                "color": str(record.get("color") or ""),
+                "icon": str(record.get("icon") or ""),
+                "audio": str(record.get("audio") or ""),
+                "runtime_recording": str(record.get("runtime_recording") or ""),
+                "runtime_kind": str(record.get("runtime_kind") or ""),
+                "type": str(record.get("type") or ""),
+            }
+        )
+    payload = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
 DASHBOARD_STYLE = (
     ".msg-card{position:relative;border-radius:10px;padding:18px 88px 16px 18px;margin:0 0 16px;"
     "box-shadow:0 1px 4px rgba(0,0,0,0.18);}"
@@ -126,18 +171,18 @@ DASHBOARD_STYLE = (
     "@media (prefers-color-scheme: dark){.msg-card-default{background:#3A3A3A;color:#F5F5F5;}}"
     ".msg-icon{position:absolute;top:16px;right:16px;width:48px;height:48px;object-fit:contain;}"
     ".msg-name{font-family:'Roboto',Arial,sans-serif;font-size:0.95em;opacity:0.9;margin-bottom:8px;"
-    "white-space:pre-wrap;overflow-wrap:anywhere;}"
+    "white-space:pre-line;overflow-wrap:anywhere;word-break:break-word;}"
     ".msg-short{font-family:'Roboto',Arial,sans-serif;font-size:1.55em;line-height:1.3;font-weight:500;"
-    "white-space:pre-wrap;overflow-wrap:anywhere;}"
+    "white-space:pre-line;overflow-wrap:anywhere;word-break:break-word;}"
     ".msg-long{font-family:'Roboto',Arial,sans-serif;font-size:1em;line-height:1.45;margin-top:6px;opacity:0.95;"
-    "white-space:pre-wrap;overflow-wrap:anywhere;}"
-    ".msg-footer{position:relative;margin-top:12px;min-height:40px;}"
-    ".msg-audio{position:absolute;right:0;bottom:0;display:flex;align-items:center;justify-content:center;min-width:40px;}"
+    "white-space:pre-line;overflow-wrap:anywhere;word-break:break-word;}"
+    ".msg-footer{display:flex;align-items:flex-end;justify-content:space-between;gap:10px;margin-top:12px;}"
+    ".msg-audio{position:static;display:flex;align-items:center;justify-content:center;min-width:40px;flex:0 0 auto;order:2;margin-left:auto;}"
     ".msg-audio-btn{width:40px;height:40px;border:none;border-radius:999px;background:transparent;color:inherit;"
     "display:inline-flex;align-items:center;justify-content:center;cursor:pointer;padding:0;transition:background 120ms ease;}"
     ".msg-audio-btn:hover{background:rgba(127,127,127,0.35);}"
     ".msg-audio-btn svg{width:28px;height:28px;fill:currentColor;}"
-    ".msg-meta{position:absolute;left:0;bottom:0;font-size:0.82em;opacity:0.85;text-align:left;padding-right:56px;}"
+    ".msg-meta{position:static;font-size:0.82em;opacity:0.85;text-align:left;padding-right:0;flex:1 1 auto;min-width:0;order:1;}"
     ".msg-dot{margin:0 4px;}"
     ".no-messages{color:#666;font-size:1.05em;margin-top:8px;}"
 )
@@ -170,6 +215,7 @@ var dashWsPingTimer = null;
 var dashBroadcastMeta = {};
 var dashNotificationEnabled = false;
 var dashLastPollAt = 0;
+var dashPollInFlight = false;
 var dashAutoAudioUnlocked = false;
 var dashAutoPlayAttempted = {};
 var dashLiveManuallyPaused = {};
@@ -296,7 +342,7 @@ function desktopApi() {
 }
 function isLiveAudioMode(mode) {
   var token = String(mode || '').trim().toLowerCase();
-  return token === 'live' || token === 'websocket' || token === 'mulaw' || token === 'ulaw';
+  return token === 'live' || token === 'websocket' || token === 'mulaw' || token === 'ulaw' || token === 'rtp';
 }
 function updateAllDashButtons() {
   if (isDesktopBridge()) return;
@@ -377,7 +423,10 @@ function scheduleDashboardPoll() {
   pollDashboard();
 }
 function pollDashboard() {
-  fetch('/dashboard?poll=1', {credentials: 'same-origin'})
+  if (dashPollInFlight) return;
+  dashPollInFlight = true;
+  var url = '/dashboard?poll=1&hash=' + encodeURIComponent(String(dashHash || ''));
+  fetch(url, {credentials: 'same-origin'})
     .then(function(resp) { return resp.json(); })
     .then(function(data) {
       if (data && data.hash && data.hash !== dashHash) {
@@ -388,7 +437,10 @@ function pollDashboard() {
         updateAllDashButtons();
       }
     })
-    .catch(function() {});
+    .catch(function() {})
+    .then(function() {
+      dashPollInFlight = false;
+    });
 }
 function notificationBody(payload) {
   var shortmessage = String(payload.shortmessage || '').trim();
@@ -446,6 +498,32 @@ function onBroadcastMeta(payload) {
   notifyBroadcast(payload);
   scheduleDashboardPoll();
   maybeAutoPlayIncoming(payload);
+}
+function onRtpStreamControl(message) {
+  if (!message) return;
+  var bid = String(message.broadcast_id || '').trim();
+  if (!bid) return;
+  var command = String(message.command || '').trim().toLowerCase();
+  dashBroadcastMeta[bid] = dashBroadcastMeta[bid] || {};
+  if (command === 'start') {
+    dashBroadcastMeta[bid].live = true;
+    if (!dashLiveBid || dashLiveBid === bid) {
+      dashLiveBid = bid;
+      dashLivePaused = false;
+    }
+    tryUnlockAudio('rtp-start');
+    updateAllDashButtons();
+    return;
+  }
+  if (command === 'end') {
+    dashBroadcastMeta[bid].live = false;
+    delete dashLiveManuallyPaused[bid];
+    if (dashLiveBid === bid) {
+      dashLiveQueue = [];
+      dashLivePaused = true;
+    }
+    updateAllDashButtons();
+  }
 }
 function onBroadcastFrame(decoded) {
   if (!decoded || !decoded.bid) return;
@@ -506,6 +584,7 @@ function connectDashboardWebSocket() {
           try {
             var message = JSON.parse(event.data);
             if (message && message.type === 'broadcast') onBroadcastMeta(message);
+            if (message && message.type === 'rtp_stream') onRtpStreamControl(message);
           } catch (_e) {}
           return;
         }
@@ -539,7 +618,8 @@ function setupNotifications() {
 formatDashTimestamps(document);
 updateAllDashButtons();
 if (isDesktopBridge()) {
-  setInterval(pollDashboard, 1200);
+  scheduleDashboardPoll();
+  setInterval(scheduleDashboardPoll, 2000);
 } else {
   setupNotifications();
   installAudioUnlockHooks();
@@ -565,10 +645,12 @@ def handle_request():
         user_id = GUEST_MEMBER_TOKEN
         heading = "Welcome"
     records = _active_records_for(user_id)
-    cards = _cards_html(records)
-    digest = hashlib.sha1(cards.encode("utf-8")).hexdigest()
+    digest = _records_digest(records)
     if request.args.get("poll") == "1":
-        return jsonify(hash=digest, html=cards)
+        if str(request.args.get("hash") or "").strip() == digest:
+            return jsonify(hash=digest)
+        return jsonify(hash=digest, html=_cards_html(records))
+    cards = _cards_html(records)
     content = f'<h1>{heading}</h1>\n<div id="dash-messages">{cards}</div>'
     desktop_mode = (
         str(request.args.get("desktop_client") or "").strip().lower() in {"1", "true", "yes", "on"}

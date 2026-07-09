@@ -297,8 +297,19 @@ def create_api_custom_broadcast(values, groups, sender):
     try:
         with conn.cursor() as cur:
             broadcast_id, expires_rule = create_custom_broadcast(cur, values, groups=groups, sender=sender)
-            expire_message_rule_broadcasts(cur, expires_rule, [broadcast_id], trigger_groups=groups)
-            expire_any_message_rule_broadcasts(cur, [broadcast_id], trigger_groups=groups)
+            trigger_priority = values.get("priority")
+            if str(trigger_priority or "").strip().lower() != "emergency":
+                expire_message_rule_broadcasts(
+                    cur,
+                    expires_rule,
+                    [broadcast_id],
+                    trigger_groups=groups,
+                )
+                expire_any_message_rule_broadcasts(
+                    cur,
+                    [broadcast_id],
+                    trigger_groups=groups,
+                )
         conn.commit()
         return broadcast_id
     finally:

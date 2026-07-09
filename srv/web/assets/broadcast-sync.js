@@ -142,7 +142,7 @@
     var bid = String(payload.broadcast_id || "").trim();
     if (!bid) return;
     var mode = String(payload.audio_mode || "").toLowerCase();
-    if (mode === "live" || mode === "websocket" || mode === "mulaw" || mode === "ulaw") {
+    if (mode === "live" || mode === "websocket" || mode === "mulaw" || mode === "ulaw" || mode === "rtp") {
       sync.liveBid = bid;
       sync.livePaused = false;
       tryUnlockAudio();
@@ -164,6 +164,23 @@
   function onBroadcastMeta(payload) {
     maybeNotify(payload);
     maybeAutoPlayIncoming(payload);
+  }
+
+  function onRtpStreamControl(message) {
+    if (!message) return;
+    var bid = String(message.broadcast_id || "").trim();
+    if (!bid) return;
+    var command = String(message.command || "").trim().toLowerCase();
+    if (command === "start") {
+      sync.liveBid = bid;
+      sync.livePaused = false;
+      tryUnlockAudio();
+      return;
+    }
+    if (command === "end" && sync.liveBid === bid) {
+      sync.liveQueue = [];
+      sync.livePaused = true;
+    }
   }
 
   function onBroadcastFrame(decoded) {
@@ -231,6 +248,7 @@
             try {
               var message = JSON.parse(event.data);
               if (message && message.type === "broadcast") onBroadcastMeta(message);
+              if (message && message.type === "rtp_stream") onRtpStreamControl(message);
             } catch (_e) {}
             return;
           }

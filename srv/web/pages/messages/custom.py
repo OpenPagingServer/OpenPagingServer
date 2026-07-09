@@ -105,8 +105,19 @@ def create_custom_broadcast(values, expires_rule):
             put_active_broadcast(record)
             for child in monitor_children:
                 put_active_broadcast(child)
-            expire_message_rule_broadcasts(cur, normalized_rule, [broadcast_id], trigger_groups=record.get("groups"))
-            expire_any_message_rule_broadcasts(cur, [broadcast_id], trigger_groups=record.get("groups"))
+            trigger_priority = record.get("priority")
+            if str(trigger_priority or "").strip().lower() != "emergency":
+                expire_message_rule_broadcasts(
+                    cur,
+                    normalized_rule,
+                    [broadcast_id],
+                    trigger_groups=record.get("groups"),
+                )
+                expire_any_message_rule_broadcasts(
+                    cur,
+                    [broadcast_id],
+                    trigger_groups=record.get("groups"),
+                )
         conn.commit()
     finally:
         conn.close()

@@ -43,6 +43,8 @@ DESKTOP_CLIENT_STALE_SECONDS = int(os.getenv("DESKTOP_CLIENT_STALE_SECONDS", "45
 CLIENTD_IPC_PORT = int(os.getenv("CLIENTD_IPC_PORT", "50011"))
 DESKTOP_GROUP_CACHE_SECONDS = float(os.getenv("DESKTOP_GROUP_CACHE_SECONDS", "10"))
 DESKTOP_TOUCH_INTERVAL_SECONDS = float(os.getenv("DESKTOP_TOUCH_INTERVAL_SECONDS", "5"))
+CLIENTD_BROADCAST_LOOKUP_ATTEMPTS = max(1, int(os.getenv("CLIENTD_BROADCAST_LOOKUP_ATTEMPTS", "6")))
+CLIENTD_BROADCAST_LOOKUP_DELAY_SECONDS = max(0.0, float(os.getenv("CLIENTD_BROADCAST_LOOKUP_DELAY_SECONDS", "0.05")))
 
 connections = []
 connections_lock = threading.Lock()
@@ -218,24 +220,58 @@ def normalize_color(value):
     return "#" + token.lower()
 
 
-def build_desktop_token(user, ttl_seconds=None):
+def _signed_token_payload(token, expected_kind=None):
+    raw = str(token or "").strip()
+    if "." not in raw:
+        return None
+    payload_b64, signature = raw.rsplit(".", 1)
+    expected = hmac.new(desktop_secret(), payload_b64.encode("ascii"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        return None
+    padding = "=" * (-len(payload_b64) % 4)
+    try:
+        payload = json.loads(base64.urlsafe_b64decode((payload_b64 + padding).encode("ascii")).decode("utf-8"))
+    except Exception:
+        return None
+    if expected_kind is not None and str(payload.get("kind") or "") != str(expected_kind):
+        return None
+    if int(payload.get("exp") or 0) < int(time.time()):
+        return None
+    return payload
+
+
+def _token_session_id(payload):
+    value = str((payload or {}).get("sid") or (payload or {}).get("session_id") or "").strip()
+    return value if value and len(value) <= 128 else ""
+
+
+def _session_id_for_user(user, session_id=None):
+    wanted = str(session_id or (user or {}).get("desktop_session_id") or (user or {}).get("session_id") or "").strip()
+    return wanted if wanted and len(wanted) <= 128 else ""
+
+
+def build_desktop_token(user, ttl_seconds=None, session_id=None):
     ttl = ttl_seconds if ttl_seconds is not None else DESKTOP_TOKEN_TTL_SECONDS
     expires_at = int(time.time()) + max(60, ttl)
+    sid = _session_id_for_user(user, session_id)
     payload = {
         "user_id": str(user.get("id") if user.get("id") is not None else "").strip(),
         "username": str(user.get("username") or ""),
         "role": str(user.get("role") or ""),
         "exp": expires_at,
     }
+    if sid:
+        payload["sid"] = sid
     payload_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     payload_b64 = base64.urlsafe_b64encode(payload_bytes).decode("ascii").rstrip("=")
     signature = hmac.new(desktop_secret(), payload_b64.encode("ascii"), hashlib.sha256).hexdigest()
     return f"{payload_b64}.{signature}", expires_at
 
 
-def build_desktop_refresh_token(user, ttl_seconds=None):
+def build_desktop_refresh_token(user, ttl_seconds=None, session_id=None):
     ttl = ttl_seconds if ttl_seconds is not None else DESKTOP_REFRESH_TOKEN_TTL_SECONDS
     expires_at = int(time.time()) + max(3600, ttl)
+    sid = _session_id_for_user(user, session_id)
     payload = {
         "kind": DESKTOP_REFRESH_TOKEN_PREFIX.rstrip("/"),
         "user_id": str(user.get("id") if user.get("id") is not None else "").strip(),
@@ -243,39 +279,55 @@ def build_desktop_refresh_token(user, ttl_seconds=None):
         "role": str(user.get("role") or ""),
         "exp": expires_at,
     }
+    if sid:
+        payload["sid"] = sid
     payload_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     payload_b64 = base64.urlsafe_b64encode(payload_bytes).decode("ascii").rstrip("=")
     signature = hmac.new(desktop_secret(), payload_b64.encode("ascii"), hashlib.sha256).hexdigest()
     return f"{payload_b64}.{signature}", expires_at
 
 
-def verify_desktop_token(token):
-    raw = str(token or "").strip()
-    if "." not in raw:
+def active_session_for_token(session_id, user_id):
+    sid = str(session_id or "").strip()
+    uid = str(user_id if user_id is not None else "").strip()
+    if not sid or not uid.isdigit():
         return None
-    payload_b64, signature = raw.rsplit(".", 1)
-    expected = hmac.new(desktop_secret(), payload_b64.encode("ascii"), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(signature, expected):
-        return None
-    padding = "=" * (-len(payload_b64) % 4)
     try:
-        payload = json.loads(base64.urlsafe_b64decode((payload_b64 + padding).encode("ascii")).decode("utf-8"))
+        conn = db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT session_id, user_id, session_type, auth_provider, last_seen_at, last_full_activity, expires_at, revoked_at
+                    FROM user_sessions
+                    WHERE session_id=%s AND user_id=%s AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())
+                    LIMIT 1
+                    """,
+                    (sid, uid),
+                )
+                return cur.fetchone()
+        finally:
+            conn.close()
     except Exception:
         return None
-    if int(payload.get("exp") or 0) < int(time.time()):
-        return None
-    if str(payload.get("role") or "") == "guest":
+
+
+def user_from_desktop_payload(payload):
+    if str((payload or {}).get("role") or "") == "guest":
         if not guest_receiver_active():
             return None
         return {"id": GUEST_MEMBER_TOKEN, "username": "Guest", "role": "guest"}
-    user_id = str(payload.get("user_id") if payload.get("user_id") is not None else "").strip()
+    user_id = str((payload or {}).get("user_id") if (payload or {}).get("user_id") is not None else "").strip()
     if not user_id.isdigit():
+        return None
+    session_id = _token_session_id(payload)
+    if not active_session_for_token(session_id, user_id):
         return None
     conn = db()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, username, role, email, accountexpire, loginsleft FROM users WHERE id=%s LIMIT 1",
+                "SELECT id, username, role, email, accountexpire, loginsleft, auth_provider FROM users WHERE id=%s LIMIT 1",
                 (user_id,),
             )
             user = cur.fetchone()
@@ -292,55 +344,22 @@ def verify_desktop_token(token):
         and expire_text < datetime.now().strftime("%Y-%m-%d")
     ):
         return None
+    user["desktop_session_id"] = session_id
     return user
+
+
+def verify_desktop_token(token):
+    payload = _signed_token_payload(token)
+    if not payload:
+        return None
+    return user_from_desktop_payload(payload)
 
 
 def verify_desktop_refresh_token(token):
-    raw = str(token or "").strip()
-    if "." not in raw:
+    payload = _signed_token_payload(token, DESKTOP_REFRESH_TOKEN_PREFIX.rstrip("/"))
+    if not payload:
         return None
-    payload_b64, signature = raw.rsplit(".", 1)
-    expected = hmac.new(desktop_secret(), payload_b64.encode("ascii"), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(signature, expected):
-        return None
-    padding = "=" * (-len(payload_b64) % 4)
-    try:
-        payload = json.loads(base64.urlsafe_b64decode((payload_b64 + padding).encode("ascii")).decode("utf-8"))
-    except Exception:
-        return None
-    if str(payload.get("kind") or "") != DESKTOP_REFRESH_TOKEN_PREFIX.rstrip("/"):
-        return None
-    if int(payload.get("exp") or 0) < int(time.time()):
-        return None
-    if str(payload.get("role") or "") == "guest":
-        if not guest_receiver_active():
-            return None
-        return {"id": GUEST_MEMBER_TOKEN, "username": "Guest", "role": "guest"}
-    user_id = str(payload.get("user_id") if payload.get("user_id") is not None else "").strip()
-    if not user_id.isdigit():
-        return None
-    conn = db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, username, role, email, accountexpire, loginsleft FROM users WHERE id=%s LIMIT 1",
-                (user_id,),
-            )
-            user = cur.fetchone()
-    finally:
-        conn.close()
-    if not user:
-        return None
-    expire_text = str(user.get("accountexpire") or "").strip()[:10]
-    if (
-        len(expire_text) == 10
-        and expire_text.count("-") == 2
-        and expire_text[:4].isdigit()
-        and expire_text != "0000-00-00"
-        and expire_text < datetime.now().strftime("%Y-%m-%d")
-    ):
-        return None
-    return user
+    return user_from_desktop_payload(payload)
 
 
 def groups_for_user(user_id):
@@ -552,6 +571,33 @@ def _remember_broadcast(broadcast):
         recent_broadcasts.pop(key, None)
 
 
+def make_json_safe(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(value, bytes):
+        return base64.b64encode(value).decode("ascii")
+    if isinstance(value, dict):
+        return {str(key): make_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [make_json_safe(item) for item in value]
+    return str(value)
+
+
+def normalize_ipc_broadcast_payload(broadcast, fallback_id=""):
+    if not isinstance(broadcast, dict):
+        return None
+    normalized = dict(broadcast)
+    fallback = str(fallback_id or "").strip()
+    broadcast_id = str(normalized.get("id") or "").strip() or fallback
+    if not broadcast_id:
+        return None
+    normalized["id"] = broadcast_id
+    _remember_broadcast(normalized)
+    return normalized
+
+
 def lookup_broadcast(broadcast_id):
     broadcast = fetch_active_broadcast(broadcast_id)
     if broadcast:
@@ -559,6 +605,22 @@ def lookup_broadcast(broadcast_id):
         return broadcast
     remembered = recent_broadcasts.get(str(broadcast_id or "").strip()) or {}
     return remembered.get("broadcast")
+
+
+def resolve_broadcast_for_dispatch(broadcast_id, provided=None):
+    resolved = normalize_ipc_broadcast_payload(provided, broadcast_id)
+    if resolved:
+        return resolved
+    token = str(broadcast_id or "").strip()
+    if not token:
+        return None
+    for attempt in range(CLIENTD_BROADCAST_LOOKUP_ATTEMPTS):
+        resolved = lookup_broadcast(token)
+        if resolved:
+            return resolved
+        if attempt + 1 < CLIENTD_BROADCAST_LOOKUP_ATTEMPTS and CLIENTD_BROADCAST_LOOKUP_DELAY_SECONDS > 0:
+            time.sleep(CLIENTD_BROADCAST_LOOKUP_DELAY_SECONDS)
+    return None
 
 
 def register_connection(connection):
@@ -627,6 +689,21 @@ def send_binary_packet(sock, packet_type, broadcast_id, payload=b""):
     send_ws_frame(sock, 0x2, packet_type + token + (payload or b""))
 
 
+def send_rtp_stream_command(sock, broadcast_id, command, codec="mulaw", sample_rate=8000, stream_kind="broadcast"):
+    send_ws_json(
+        sock,
+        {
+            "type": "rtp_stream",
+            "command": str(command or "").strip().lower(),
+            "broadcast_id": str(broadcast_id or "").strip(),
+            "stream_kind": str(stream_kind or "broadcast").strip().lower(),
+            "audio_mode": "websocket",
+            "audio_codec": str(codec or "mulaw").strip().lower(),
+            "audio_sample_rate": int(sample_rate or 8000),
+        },
+    )
+
+
 def clientd_ipc_send(payload):
     encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n"
     with socket.create_connection(("127.0.0.1", CLIENTD_IPC_PORT), timeout=2) as sock:
@@ -669,13 +746,15 @@ def send_stream_frame(sock, frame):
     sock.sendall(struct.pack("!H", len(payload)) + payload)
 
 
-def start_desktop_broadcast_stream(broadcast_id, codec="mulaw", sample_rate=8000):
+def start_desktop_broadcast_stream(broadcast_id, codec="mulaw", sample_rate=8000, broadcast=None):
+    normalized_broadcast = normalize_ipc_broadcast_payload(make_json_safe(broadcast), fallback_id=broadcast_id)
     return open_clientd_stream(
         {
             "action": "stream_broadcast",
             "broadcast_id": str(broadcast_id or "").strip(),
             "codec": str(codec or "mulaw").strip().lower(),
             "sample_rate": int(sample_rate or 8000),
+            "broadcast": normalized_broadcast,
         }
     )
 
@@ -729,6 +808,7 @@ def start_livepage_for_group(stream_id, groups_value, sender=""):
             payload["groups"] = list(getattr(connection, "groups_cache", []) or cached_groups_for_user(connection.user.get("id")))
             with connection.send_lock:
                 send_ws_json(connection.sock, payload)
+                send_rtp_stream_command(connection.sock, stream_id, "start", codec="mulaw", sample_rate=8000, stream_kind="livepage")
             connection.last_activity = now
             maybe_touch_connected(connection, now)
             started += 1
@@ -766,6 +846,7 @@ def finish_livepage(stream_id, groups_value):
             continue
         try:
             with connection.send_lock:
+                send_rtp_stream_command(connection.sock, stream_id, "end", codec="mulaw", sample_rate=8000, stream_kind="livepage")
                 send_binary_packet(connection.sock, AUDIO_END_PREFIX, stream_id, b"")
             connection.last_activity = now
             maybe_touch_connected(connection, now)
@@ -862,8 +943,8 @@ def desktop_audio_frames(audio_files_str, codec=None):
         yield from ffmpeg_stream_frames(["-i", file_path], stream_codec)
 
 
-def dispatch_broadcast_start(broadcast_id, codec="mulaw", sample_rate=8000):
-    broadcast = lookup_broadcast(broadcast_id)
+def dispatch_broadcast_start(broadcast_id, codec="mulaw", sample_rate=8000, broadcast=None):
+    broadcast = resolve_broadcast_for_dispatch(broadcast_id, broadcast)
     if not broadcast:
         return 0
     started = 0
@@ -883,7 +964,11 @@ def dispatch_broadcast_start(broadcast_id, codec="mulaw", sample_rate=8000):
                 payload["groups"] = list(getattr(connection, "groups_cache", []) or cached_groups_for_user(connection.user.get("id")))
                 with connection.send_lock:
                     send_ws_json(connection.sock, payload)
+                    send_rtp_stream_command(connection.sock, broadcast_id, "start", codec=codec, sample_rate=sample_rate, stream_kind="broadcast")
                 connection.sent_ids.add(str(broadcast_id or "").strip())
+            else:
+                with connection.send_lock:
+                    send_rtp_stream_command(connection.sock, broadcast_id, "start", codec=codec, sample_rate=sample_rate, stream_kind="broadcast")
             connection.last_activity = now
             maybe_touch_connected(connection, now)
             started += 1
@@ -892,8 +977,8 @@ def dispatch_broadcast_start(broadcast_id, codec="mulaw", sample_rate=8000):
     return started
 
 
-def dispatch_broadcast_frame(broadcast_id, frame):
-    broadcast = lookup_broadcast(broadcast_id)
+def dispatch_broadcast_frame(broadcast_id, frame, broadcast=None):
+    broadcast = normalize_ipc_broadcast_payload(broadcast, fallback_id=broadcast_id) or lookup_broadcast(broadcast_id)
     if not broadcast:
         return 0
     sent = 0
@@ -916,8 +1001,8 @@ def dispatch_broadcast_frame(broadcast_id, frame):
     return sent
 
 
-def dispatch_broadcast_end(broadcast_id):
-    broadcast = lookup_broadcast(broadcast_id)
+def dispatch_broadcast_end(broadcast_id, broadcast=None):
+    broadcast = normalize_ipc_broadcast_payload(broadcast, fallback_id=broadcast_id) or lookup_broadcast(broadcast_id)
     if not broadcast:
         return 0
     sent = 0
@@ -931,6 +1016,7 @@ def dispatch_broadcast_end(broadcast_id):
             continue
         try:
             with connection.send_lock:
+                send_rtp_stream_command(connection.sock, broadcast_id, "end", stream_kind="broadcast")
                 send_binary_packet(connection.sock, AUDIO_END_PREFIX, broadcast_id, b"")
             connection.last_activity = now
             maybe_touch_connected(connection, now)
@@ -956,7 +1042,8 @@ def handle_streaming_ipc(conn, payload):
         broadcast_id = str(payload.get("broadcast_id") or "").strip()
         codec = payload.get("codec") or "mulaw"
         sample_rate = payload.get("sample_rate") or 8000
-        response = dispatch_broadcast_start(broadcast_id, codec=codec, sample_rate=sample_rate)
+        broadcast = resolve_broadcast_for_dispatch(broadcast_id, payload.get("broadcast"))
+        response = dispatch_broadcast_start(broadcast_id, codec=codec, sample_rate=sample_rate, broadcast=broadcast)
         conn.sendall(json.dumps({"ok": True, "matched": response}, separators=(",", ":")).encode("utf-8") + b"\n")
         while True:
             header = recv_exact(conn, 2)
@@ -966,8 +1053,8 @@ def handle_streaming_ipc(conn, payload):
             frame = recv_exact(conn, frame_len)
             if len(frame) < frame_len:
                 break
-            dispatch_broadcast_frame(broadcast_id, frame)
-        dispatch_broadcast_end(broadcast_id)
+            dispatch_broadcast_frame(broadcast_id, frame, broadcast=broadcast)
+        dispatch_broadcast_end(broadcast_id, broadcast=broadcast)
         return
     if action == "stream_livepage":
         stream_id = str(payload.get("stream_id") or "").strip()
@@ -1008,32 +1095,39 @@ def handle_clientd_ipc_payload(payload):
     return {"ok": False, "error": f"unknown action: {action}"}
 
 
+def _handle_clientd_ipc_conn(conn):
+    try:
+        request = recv_until(conn, b"\n", limit=1024 * 1024)
+        payload = json.loads(request.decode("utf-8").strip() or "{}")
+        action = str((payload or {}).get("action") or "").strip().lower()
+        if action in {"stream_broadcast", "stream_livepage"}:
+            handle_streaming_ipc(conn, payload)
+            return
+        response = handle_clientd_ipc_payload(payload)
+    except Exception as exc:
+        response = {"ok": False, "error": str(exc)}
+    try:
+        conn.sendall(json.dumps(response, separators=(",", ":")).encode("utf-8"))
+    except Exception:
+        pass
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
 def clientd_ipc_loop():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("127.0.0.1", CLIENTD_IPC_PORT))
     server.listen(20)
     while True:
-        conn, _addr = server.accept()
+        try:
+            conn, _addr = server.accept()
+        except OSError:
+            break
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        try:
-            request = recv_until(conn, b"\n", limit=1024 * 1024)
-            payload = json.loads(request.decode("utf-8").strip() or "{}")
-            action = str((payload or {}).get("action") or "").strip().lower()
-            if action in {"stream_broadcast", "stream_livepage"}:
-                handle_streaming_ipc(conn, payload)
-                continue
-            response = handle_clientd_ipc_payload(payload)
-        except Exception as exc:
-            response = {"ok": False, "error": str(exc)}
-        try:
-            conn.sendall(json.dumps(response, separators=(",", ":")).encode("utf-8"))
-        except Exception:
-            pass
-        try:
-            conn.close()
-        except Exception:
-            pass
+        threading.Thread(target=_handle_clientd_ipc_conn, args=(conn,), daemon=True).start()
 
 
 def broadcast_watcher_loop():

@@ -4,6 +4,7 @@ import html
 import importlib.util
 import ipaddress
 import io
+import itertools
 import json
 import math
 import os
@@ -37,6 +38,7 @@ except Exception:
     def load_dotenv(*_args, **_kwargs):
         return False
 from active_broadcast_store import (
+    RUNTIME_DIR,
     active_broadcast_stop_requested,
     clear_active_broadcast_stop_request,
     claim_active_broadcast_delivery,
@@ -4207,7 +4209,7 @@ def fetch_broadcast(broadcast_id):
 class BroadcastRecordingWriter:
     def __init__(self, broadcast_id):
         self.broadcast_id = str(broadcast_id or "").strip() or uuid.uuid4().hex
-        self.runtime_dir = Path(tempfile.gettempdir()) / "openpagingserver-runtime" / "broadcast-recordings"
+        self.runtime_dir = RUNTIME_DIR / "broadcast-recordings"
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.runtime_dir / f"broadcast-{self.broadcast_id}.wav"
         self.wave_file = wave.open(str(self.path), "wb")
@@ -4943,8 +4945,20 @@ def input_module_send_message(module_name, message_id, group_id, sender_id=None,
                 sender_value,
                 overrides=overrides or None,
             )
-            expire_message_rule_broadcasts(cur, expires_rule, [broadcast_id], trigger_groups=groups)
-            expire_broadcasts_triggered_by_template(cur, message_id, [broadcast_id], trigger_groups=groups)
+            trigger_priority = (overrides or {}).get("priority") or template.get("priority")
+            if str(trigger_priority or "").strip().lower() != "emergency":
+                expire_message_rule_broadcasts(
+                    cur,
+                    expires_rule,
+                    [broadcast_id],
+                    trigger_groups=groups,
+                )
+                expire_broadcasts_triggered_by_template(
+                    cur,
+                    message_id,
+                    [broadcast_id],
+                    trigger_groups=groups,
+                )
         conn.commit()
         return broadcast_id
     finally:
@@ -4975,8 +4989,19 @@ def input_module_send_custom_message(module_name, group_id, values):
             elif "vendor_parameters" in values:
                 values["vendor_specific"] = vendor_specific_for_module(module_name, values.pop("vendor_parameters")) or ""
             broadcast_id, expires_rule = create_custom_broadcast(cur, values, groups=groups, sender=sender_value)
-            expire_message_rule_broadcasts(cur, expires_rule, [broadcast_id], trigger_groups=groups)
-            expire_any_message_rule_broadcasts(cur, [broadcast_id], trigger_groups=groups)
+            trigger_priority = values.get("priority")
+            if str(trigger_priority or "").strip().lower() != "emergency":
+                expire_message_rule_broadcasts(
+                    cur,
+                    expires_rule,
+                    [broadcast_id],
+                    trigger_groups=groups,
+                )
+                expire_any_message_rule_broadcasts(
+                    cur,
+                    [broadcast_id],
+                    trigger_groups=groups,
+                )
         conn.commit()
         return broadcast_id
     finally:
@@ -5203,16 +5228,17 @@ def finish_stream(stream_id):
     pop_stream_state(stream_id)
 
 
-def recv_line(conn):
+def recv_line(conn, limit=65536):
     data = bytearray()
-    while True:
-        chunk = conn.recv(1)
+    while len(data) < limit:
+        chunk = conn.recv(4096)
         if not chunk:
             break
-        if chunk == b"\n":
-            break
         data.extend(chunk)
-    return bytes(data)
+        if b"\n" in data:
+            break
+    line, _, _ = bytes(data).partition(b"\n")
+    return line
 
 
 def send_ipc_json(conn, payload):
@@ -5399,6 +5425,10 @@ def deliver_broadcast(stream_id, broadcast_id):
     if active_broadcast_stop_requested(broadcast_id):
         return "stopped"
     targets = broadcast_target_tokens(broadcast)
+    desktop_targeted = any(
+        token == "guest" or str(token or "").strip().startswith("user/")
+        for token in targets
+    )
     if not targets:
         log(f"handle_broadcast no_targets stream={stream_id} broadcast={broadcast_id} groups={broadcast.get('groups')}")
         return "failed"
@@ -5424,32 +5454,46 @@ def deliver_broadcast(stream_id, broadcast_id):
             has_audio = False
         if has_audio:
             target_map = normalize_targets(targets)
+            # Kick off endpoint module preparation in background — don't block
+            # desktop delivery on the up-to-10-second ready wait.
+            endpoint_state = None
+            endpoint_wait_deadline = time.perf_counter() + 10.0
+            endpoints_ready = not bool(target_map)
+            if target_map:
+                endpoint_state = create_stream_state(stream_id, target_map)
+                dispatch("prepare_audio", stream_id, broadcast_id, targets, metadata)
+            # Open desktop IPC immediately (before endpoint modules are ready)
             desktop_sock = None
-            recording = None
+            desktop_result = {}
             try:
-                desktop_sock, desktop_result = start_desktop_broadcast_stream(broadcast_id, codec="mulaw", sample_rate=8000)
+                desktop_sock, desktop_result = start_desktop_broadcast_stream(
+                    broadcast_id,
+                    codec="mulaw",
+                    sample_rate=8000,
+                    broadcast=broadcast,
+                )
             except Exception as exc:
                 desktop_sock = None
                 desktop_result = {}
                 log(f"desktop broadcast start error broadcast={broadcast_id}: {exc}")
             desktop_matched = int(desktop_result.get("matched") or 0)
-            if not target_map and desktop_matched <= 0:
+            if not target_map and desktop_matched <= 0 and not desktop_targeted:
                 log(f"handle_broadcast no_target_modules stream={stream_id} broadcast={broadcast_id} targets={targets}")
+                if endpoint_state is not None:
+                    pop_stream_state(stream_id)
                 return "failed"
+            recording = None
             try:
                 recording = BroadcastRecordingWriter(broadcast_id)
             except Exception as exc:
-                recording = None
                 log(f"broadcast recording start error broadcast={broadcast_id}: {exc}")
-            if target_map:
-                state = create_stream_state(stream_id, target_map)
-                dispatch("prepare_audio", stream_id, broadcast_id, targets, metadata)
-                ready = state.ready_event.wait(10.0)
-                log(f"handle_broadcast waited stream={stream_id} ready={ready}")
+            # Unified paced frame loop — desktop gets audio immediately;
+            # endpoint modules receive frames once they signal ready (or after
+            # the 10-second deadline passes to avoid starving them entirely).
             frame_duration = 160 / 8000
             next_send_time = time.perf_counter()
             stopped = False
-            for frame in [first_frame]:
+            for frame in itertools.chain([first_frame], gen):
                 if active_broadcast_stop_requested(broadcast_id):
                     stopped = True
                     break
@@ -5463,53 +5507,34 @@ def deliver_broadcast(stream_id, broadcast_id):
                         except Exception:
                             pass
                         recording = None
-                for module_name in target_map:
-                    with loaded_modules_lock:
-                        mod = loaded_modules.get(module_name)
-                    if mod and hasattr(mod, "receive_audio"):
-                        try:
-                            mod.receive_audio(frame, stream_id)
-                        except Exception as exc:
-                            log(f"receive_audio error in {module_name}: {exc}")
-                try:
-                    if desktop_sock is not None:
-                        send_stream_frame(desktop_sock, frame)
-                except Exception as exc:
-                    log(f"desktop broadcast frame error broadcast={broadcast_id}: {exc}")
-            if not stopped:
-                for frame in gen:
-                    if active_broadcast_stop_requested(broadcast_id):
-                        stopped = True
-                        break
-                    if recording is not None:
-                        try:
-                            recording.write_frame(frame)
-                        except Exception as exc:
-                            log(f"broadcast recording write error broadcast={broadcast_id}: {exc}")
-                            try:
-                                recording.close()
-                            except Exception:
-                                pass
-                            recording = None
-                    next_send_time += frame_duration
-                    sleep_time = next_send_time - time.perf_counter()
-                    if sleep_time > 0:
-                        time.sleep(sleep_time)
-                    else:
-                        next_send_time = time.perf_counter()
-                    for module_name in target_map:
-                        with loaded_modules_lock:
-                            mod = loaded_modules.get(module_name)
-                        if mod and hasattr(mod, "receive_audio"):
-                            try:
-                                mod.receive_audio(frame, stream_id)
-                            except Exception as exc:
-                                log(f"receive_audio error in {module_name}: {exc}")
+                # Desktop: always deliver with no readiness gate
+                if desktop_sock is not None:
                     try:
-                        if desktop_sock is not None:
-                            send_stream_frame(desktop_sock, frame)
+                        send_stream_frame(desktop_sock, frame)
                     except Exception as exc:
                         log(f"desktop broadcast frame error broadcast={broadcast_id}: {exc}")
+                        desktop_sock = None
+                # Endpoint modules: gate on readiness, then deliver
+                if target_map:
+                    if not endpoints_ready:
+                        if endpoint_state.ready_event.is_set() or time.perf_counter() >= endpoint_wait_deadline:
+                            endpoints_ready = True
+                            log(f"handle_broadcast endpoints_ready stream={stream_id} ready={endpoint_state.ready_event.is_set()}")
+                    if endpoints_ready:
+                        for module_name in target_map:
+                            with loaded_modules_lock:
+                                mod = loaded_modules.get(module_name)
+                            if mod and hasattr(mod, "receive_audio"):
+                                try:
+                                    mod.receive_audio(frame, stream_id)
+                                except Exception as exc:
+                                    log(f"receive_audio error in {module_name}: {exc}")
+                next_send_time += frame_duration
+                sleep_time = next_send_time - time.perf_counter()
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                else:
+                    next_send_time = time.perf_counter()
             try:
                 if desktop_sock is not None:
                     desktop_sock.close()

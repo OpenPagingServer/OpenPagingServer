@@ -1,3 +1,4 @@
+#/srv/web/pages/index.py
 import hmac
 import ipaddress
 import json
@@ -376,6 +377,14 @@ def handle_request():
           <i class="fa-solid fa-bag-shopping"></i>
           <span>Demo Mode</span>
         </div>"""
+    desktop_settings_login_visible = bool(session.get("desktop_client"))
+    desktop_settings_login_html = (
+        '<button type="button" id="login-app-settings-btn" class="desktop-app-settings-btn login-app-settings-btn"'
+        + ('' if desktop_settings_login_visible else ' style="display:none;"')
+        + '><span class="nav-icon"><i class="fa-solid fa-sliders"></i></span>'
+        + '<span class="nav-label">App Settings</span></button>'
+    )
+
     maintenance_popup_html = """
     <div id="maintenance-popup-overlay" class="maintenance-popup-overlay">
       <div class="maintenance-popup" role="dialog" aria-modal="true" aria-labelledby="maintenancePopupTitle">
@@ -566,6 +575,13 @@ def handle_request():
       }}
       @media (prefers-color-scheme: dark) and (max-width: 768px) {{ body {{ background: #121212; }} }}
       @media (max-width: 768px) {{ .demo-mode-login {{ position: static; transform: none; margin: 16px 0 10px 0; }} }}
+      .login-app-settings-btn {{ position: fixed; top: 16px; right: 16px; z-index: 3; display: inline-flex; align-items: center; gap: 8px; width: auto; height: auto; padding: 8px 14px; background: rgba(255,255,255,0.9); color: #444; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; font-family: "Roboto", sans-serif; text-transform: none; cursor: pointer; box-shadow: 0 1px 3px rgba(0,0,0,0.08); transition: background 0.15s ease; }}
+      .login-app-settings-btn:hover {{ background: #f0f0f0; }}
+      .login-app-settings-btn .nav-icon {{ display: inline-flex; }}
+      @media (prefers-color-scheme: dark) {{
+        .login-app-settings-btn {{ background: rgba(30,30,30,0.9); color: #e0e0e0; border-color: #444; }}
+        .login-app-settings-btn:hover {{ background: #2a2a2a; }}
+      }}
     </style>
   </head>
   <body>
@@ -579,6 +595,7 @@ def handle_request():
       {demo_mode_html}
     </div>
     {maintenance_popup_html}
+    {desktop_settings_login_html}
     <script>
       function rectsOverlap(a, b) {{
         return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
@@ -618,6 +635,20 @@ def handle_request():
       const captchaProvider = "{captcha_provider}";
       const localLoginMode = {"true" if redirect_provider and show_local_login_form else "false"};
       const autoRedirectSso = {"true" if sso_auto_redirect else "false"};
+
+      (function revealAppSettingsButton() {{
+        function reveal() {{
+          if (!window.__OPS_DESKTOP_CLIENT__) return;
+          const btn = document.getElementById('login-app-settings-btn');
+          if (btn) btn.style.display = '';
+        }}
+        if (document.readyState === 'loading') {{
+          document.addEventListener('DOMContentLoaded', reveal);
+        }} else {{
+          reveal();
+        }}
+        window.addEventListener('load', reveal);
+      }})();
       let maintenanceState = __OPS_MAINTENANCE_STATE__;
       const maintenancePopupInitiallyOpen = __OPS_MAINTENANCE_POPUP_OPEN__;
 
@@ -741,13 +772,35 @@ def handle_request():
         btn.innerHTML = '<div class="loading-circle"></div>';
 
         try {{
-          const res1 = await fetch('/login', {{
+          const isDesktopClient = !!window.__OPS_DESKTOP_CLIENT__;
+          const loginUrl = isDesktopClient ? '/login?desktop_client=1' : '/login';
+          const loginHeaders = {{ 'Content-Type': 'application/x-www-form-urlencoded' }};
+          if (isDesktopClient) loginHeaders['X-OPS-Desktop-Client'] = '1';
+
+          async function parseJsonResponse(response) {{
+            const contentType = (response.headers.get('content-type') || '').toLowerCase();
+            const bodyText = await response.text();
+            if (contentType.indexOf('application/json') !== -1) {{
+              try {{
+                return JSON.parse(bodyText || '{{}}');
+              }} catch (_e) {{
+                throw new Error('Login failed: invalid server response.');
+              }}
+            }}
+            if (bodyText && bodyText.trim().startsWith('<!DOCTYPE')) {{
+              throw new Error('Login failed: server returned a web page instead of a login response.');
+            }}
+            throw new Error('Login failed: unexpected server response.');
+          }}
+
+          const res1 = await fetch(loginUrl, {{
             method: 'POST',
-            headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
+            credentials: 'same-origin',
+            headers: loginHeaders,
             body: new URLSearchParams({{ get_challenge: 1, username: username, login_mode: localLoginMode ? 'local' : '' }})
           }});
 
-          const data1 = await res1.json();
+          const data1 = await parseJsonResponse(res1);
 
           if (!data1.success) throw new Error(data1.message || 'Invalid username or password.');
 
@@ -761,13 +814,14 @@ def handle_request():
           }}
           Object.entries(captchaFields).forEach(([key, value]) => proofPayload.append(key, value));
 
-          const res2 = await fetch('/login', {{
+          const res2 = await fetch(loginUrl, {{
             method: 'POST',
-            headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
+            credentials: 'same-origin',
+            headers: loginHeaders,
             body: proofPayload
           }});
 
-          const data2 = await res2.json();
+          const data2 = await parseJsonResponse(res2);
 
           if (data2.success && data2.maintenance_popup) {{
             btn.classList.remove('loading');

@@ -826,6 +826,10 @@ def parse_expires(value, issued=None):
     return parse_message_expiration(value, issued)
 
 
+def is_emergency_priority(value):
+    return str(value or "").strip().lower() == "emergency"
+
+
 def fetch_template(cursor, message_id):
     columns = table_columns(cursor, "messages")
     wanted = [
@@ -926,7 +930,9 @@ def create_broadcast_from_template(cursor, template, groups, sender="", override
     return create_custom_broadcast(cursor, values, groups=groups, sender=sender)
 
 
-def expire_message_rule_broadcasts(cursor, expires_rule, exclude_broadcast_ids=None, trigger_groups=None):
+def expire_message_rule_broadcasts(cursor, expires_rule, exclude_broadcast_ids=None, trigger_groups=None, trigger_priority=None):
+    if is_emergency_priority(trigger_priority):
+        return
     targets = message_expiration_trigger_targets(expires_rule)
     template_ids = targets["message_ids"]
     if not template_ids:
@@ -947,7 +953,9 @@ def expire_message_rule_broadcasts(cursor, expires_rule, exclude_broadcast_ids=N
     history_update_delivery(cursor, expired_ids, "expired")
 
 
-def expire_broadcasts_triggered_by_template(cursor, template_id, exclude_broadcast_ids=None, trigger_groups=None):
+def expire_broadcasts_triggered_by_template(cursor, template_id, exclude_broadcast_ids=None, trigger_groups=None, trigger_priority=None):
+    if is_emergency_priority(trigger_priority):
+        return
     token = str(template_id or "").strip()
     if str(trigger_groups or "").strip():
         expired_ids = _expire_matching_broadcasts_for_groups(
@@ -964,7 +972,9 @@ def expire_broadcasts_triggered_by_template(cursor, template_id, exclude_broadca
     history_update_delivery(cursor, expired_ids, "expired")
 
 
-def expire_any_message_rule_broadcasts(cursor, exclude_broadcast_ids=None, trigger_groups=None):
+def expire_any_message_rule_broadcasts(cursor, exclude_broadcast_ids=None, trigger_groups=None, trigger_priority=None):
+    if is_emergency_priority(trigger_priority):
+        return
     if str(trigger_groups or "").strip():
         expired_ids = _expire_matching_broadcasts_for_groups(
             cursor,
