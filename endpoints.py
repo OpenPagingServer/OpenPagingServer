@@ -1937,7 +1937,7 @@ def sip_fetch_groups():
         rows = sip_query_all("SELECT `id`, `name` FROM `groups` ORDER BY CAST(`id` AS UNSIGNED), `id`")
     except Exception:
         rows = []
-    return [{"id": "0", "name": "All Recipients"}] + rows
+    return [{"id": "0", "name": "All Recipients"}] + list(rows)
 
 
 def sip_fetch_messages():
@@ -2907,7 +2907,7 @@ class BuiltinSipTrunksWeb:
                     error = "A dialplan entry already exists for that extension."
                 else:
                     sip_execute(
-                        f"UPDATE `{table}` SET name=%s, extension=%s, `group`=%s, trigger=%s, passcode=%s WHERE id=%s",
+                        f"UPDATE `{table}` SET `name`=%s, `extension`=%s, `group`=%s, `trigger`=%s, `passcode`=%s WHERE `id`=%s",
                         (name, extension, group or None, trigger, passcode or None, row_id),
                     )
                     return page("Endpoint Saved", "<script>window.top.location.href='/admin/manage-endpoints'</script><p>Endpoint saved.</p>", "endpoints", user)
@@ -5583,7 +5583,7 @@ def deliver_broadcast(stream_id, broadcast_id):
             frame_duration = 160 / 8000
             delivery_lead = MULTICAST_DELIVERY_LEAD_SECONDS
             next_send_time = time.perf_counter() - delivery_lead
-            stop_check_interval = max(1, int(0.25 / frame_duration))
+            stop_check_interval = max(1, int(0.5 / frame_duration))
             frames_since_stop_check = 0
             stopped = False
 
@@ -5640,8 +5640,8 @@ def deliver_broadcast(stream_id, broadcast_id):
                 sleep_time = next_send_time - time.perf_counter()
                 if sleep_time > 0:
                     time.sleep(sleep_time)
-                elif sleep_time < -2.0:
-                    # Massive stall: resync rather than bursting the backlog.
+                elif sleep_time < -0.5:
+                    # Stall detected: resync rather than bursting the backlog.
                     next_send_time = time.perf_counter() - delivery_lead
             try:
                 if desktop_sock is not None:

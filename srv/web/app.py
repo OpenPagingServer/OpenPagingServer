@@ -4139,6 +4139,7 @@ document.addEventListener('keydown', function(event) {
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>{h(title)} - {h(ctx["product_name"])}</title>
 {favicon_html}
+<link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin />
 <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet" />
 <link href="/assets/sidebar-brand.css" rel="stylesheet" />
 {desktop_inject}
@@ -4810,7 +4811,9 @@ def bundled_asset(filename):
         abort(404)
     if not safe_path.is_file():
         abort(404)
-    return send_from_directory(WEB_STATIC_DIR, filename)
+    response = send_from_directory(WEB_STATIC_DIR, filename)
+    response.headers["Cache-Control"] = "public, max-age=3600, stale-while-revalidate=86400"
+    return response
 
 
 @app.route("/", methods=["GET", "POST"])

@@ -40,14 +40,15 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 .info-label { color:#BBB; }
 .info-row { border-bottom:1px solid #333; }
 }
-.header-actions { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-.btn-primary { background:#1976D2; color:#FFF; border:none; padding:10px 16px; border-radius:6px; font-size:14px; cursor:pointer; text-decoration:none; display:inline-flex; align-items:center; }
+.header-actions { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 10px; }
+.btn-primary { background:#1976D2; color:#FFF; border:none; padding:10px 16px; border-radius:6px; font-size:14px; cursor:pointer; text-decoration:none; display:inline-flex; align-items:center; white-space: nowrap; }
 .btn-primary:hover { background:#1565C0; }
-.btn-custom-send { background:#2E7D32; color:#FFF; border:none; padding:10px 16px; border-radius:6px; font-size:14px; cursor:pointer; text-decoration:none; display:inline-flex; align-items:center; }
+.btn-custom-send { background:#2E7D32; color:#FFF; border:none; padding:10px 16px; border-radius:6px; font-size:14px; cursor:pointer; text-decoration:none; display:inline-flex; align-items:center; white-space: nowrap; }
 .btn-custom-send:hover { background:#1B5E20; }
-.btn-send { background:#2E7D32; color:#FFF; border:none; padding:8px 12px; border-radius:4px; font-size:13px; cursor:pointer; text-decoration:none; }
+.btn-send { background:#2E7D32; color:#FFF; border:none; padding:8px 12px; border-radius:4px; font-size:13px; cursor:pointer; text-decoration:none; white-space: nowrap; }
 .btn-send:hover { background:#1B5E20; }
 .dropbtn:hover,.dropbtn:focus { background:transparent; color:#555; }
+@media(max-width:767px){ .header-actions { flex-direction: column; align-items: stretch; } .header-actions > div { display: flex; flex-direction: column; gap: 8px; } .btn-primary, .btn-custom-send { justify-content: center; font-size: 14px; padding: 10px 14px; } }
 @media(prefers-color-scheme:dark){ .btn-primary { background:#8AB4F8; color:#10233A; } .btn-primary:hover { background:#9CC0FA; } .btn-custom-send { background:#81C784; color:#000; } .btn-custom-send:hover { background:#66BB6A; } }
 .msg-type { font-size: 0.8em; color: #777; font-weight: 400; display: block; }
 .dropdown { position: relative; display: inline-block; }
