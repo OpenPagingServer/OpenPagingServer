@@ -115,7 +115,7 @@ def handle_request():
             if not selected_groups:
                 return redirect(f"/messages/send?msgid={h(msgid)}")
             targets = ".".join(selected_groups)
-        if targets in {"", "0"}:
+        if not targets:
             return redirect(f"/messages/send?msgid={h(msgid)}")
         try:
             broadcast_id = create_broadcast(msgid, targets, user.get("username") or session.get("username") or "User")
