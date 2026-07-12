@@ -3844,6 +3844,17 @@ def legacy_guest_context():
     }
 
 
+def _request_behind_reverse_proxy():
+    proxy_headers = (
+        "X-Forwarded-For",
+        "X-Forwarded-Host",
+        "X-Real-IP",
+        "Via",
+        "Forwarded",
+    )
+    return any(request.headers.get(header) for header in proxy_headers)
+
+
 def request_is_insecure():
     insecure = request.scheme != "https"
     forwarded = str(
@@ -3854,6 +3865,8 @@ def request_is_insecure():
         or ""
     ).split(",", 1)[0].strip().lower()
     if forwarded == "https":
+        insecure = False
+    if insecure and _request_behind_reverse_proxy():
         insecure = False
     return insecure
 
