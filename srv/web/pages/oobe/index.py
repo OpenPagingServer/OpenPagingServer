@@ -88,7 +88,9 @@ def stage_body(stage, settings, error, notice):
         content = '<h1>Welcome to Open Paging Server</h1><p class="lead">You are a few steps away from getting started with your new paging system.</p><form method="post">' + form_buttons("welcome", None, "Start", "button good") + "</form>"
     elif stage == "account":
         content = """<h1>Create an account</h1><p class="lead">To begin, please create your user account. This will be the main administrator account, and cannot be deleted.</p>
-        <form method="post"><input type="hidden" name="stage" value="account">
+        <form method="post">
+        <input type="hidden" name="stage" value="account">
+        <button type="submit" style="display:none" aria-hidden="true"></button>
         <div class="field"><label>Username</label><input name="username" required autocomplete="username"></div>
         <div class="field"><label>Email (optional)</label><input type="email" name="email" autocomplete="email"></div>
         <div class="field"><label>Password</label><input type="password" name="password" required autocomplete="new-password"></div>
@@ -97,14 +99,23 @@ def stage_body(stage, settings, error, notice):
     elif stage == "time":
         content = f"""<h1>Is this date and time correct?</h1><p class="lead">If not, ensure this system is using the correct NTP server and timezone. Correct date &amp; time is important for bells, scheduled broadcasts, history, message expiration, and general housekeeping.</p>
         <div class="timebox"><div class="time" id="serverTime" data-iso="{h(now.isoformat())}">{h(now.strftime("%I:%M %p").lstrip("0"))}</div><div class="date" id="serverDate" data-iso="{h(now.isoformat())}">{h(now.strftime("%A %b %d, %Y"))}</div></div>
-        <form method="post"><input type="hidden" name="stage" value="time"><div class="actions"><button class="button secondary" name="action" value="back" type="submit">Back</button><input type="hidden" name="back_stage" value="account"><button class="button" name="action" value="next" type="submit">Continue</button></div></form>"""
+        <form method="post">
+        <input type="hidden" name="stage" value="time">
+        <button type="submit" style="display:none" aria-hidden="true"></button>
+        <div class="actions"><button class="button secondary" name="action" value="back" type="submit">Back</button><input type="hidden" name="back_stage" value="account"><button class="button" name="action" value="next" type="submit">Continue</button></div></form>"""
     elif stage == "modules":
         items = "".join(f"<li>{h(item['name'])}{(' ' + h(item['version'])) if item['version'] else ''}{(' by ' + h(item['author'])) if item['author'] else ''}</li>" for item in modules) or "<li>No endpoint modules found.</li>"
         content = f"""<h1>Endpoint modules</h1><p class="lead">Open Paging Server uses endpoint modules. You have the following endpoint modules installed:</p><ul class="module-list">{items}</ul><p class="lead">You can add more in /var/lib/openpagingserver/endpointmodules</p>
-        <form method="post"><input type="hidden" name="stage" value="modules"><div class="actions"><button class="button secondary" name="action" value="back" type="submit">Back</button><input type="hidden" name="back_stage" value="time"><button class="button" type="submit">Next</button></div></form>"""
+        <form method="post">
+        <input type="hidden" name="stage" value="modules">
+        <button type="submit" style="display:none" aria-hidden="true"></button>
+        <div class="actions"><button class="button secondary" name="action" value="back" type="submit">Back</button><input type="hidden" name="back_stage" value="time"><button class="button" type="submit">Next</button></div></form>"""
     elif stage == "analytics":
         content = """<h1>Would you like to enable optional analytics?</h1><p class="lead">To help the Open Paging Server project improve, you can opt-in to share optional analytics. Analytics contain mainly anonymous data such as your operating system, software versions, anonymized crash logs, etc. And may include your public IP address. You can change this setting later.</p>
-        <form method="post"><input type="hidden" name="stage" value="analytics"><div class="actions"><button class="button secondary" name="action" value="back" type="submit">Back</button><input type="hidden" name="back_stage" value="modules"><button class="button good" name="action" value="continue_disabled" type="submit">Continue disabled</button><button class="button" name="action" value="opt_in" type="submit">Opt-in</button></div></form>"""
+        <form method="post">
+        <input type="hidden" name="stage" value="analytics">
+        <button type="submit" name="action" value="opt_in" style="display:none" aria-hidden="true"></button>
+        <div class="actions"><button class="button secondary" name="action" value="back" type="submit">Back</button><input type="hidden" name="back_stage" value="modules"><button class="button good" name="action" value="continue_disabled" type="submit">Continue disabled</button><button class="button" name="action" value="opt_in" type="submit">Opt-in</button></div></form>"""
     else:
         content = '<h1>Setup complete!</h1><p class="lead">To continue, login with your username and password you just made.</p><p class="lead">Happy Paging!</p><div class="actions"><a class="button" href="/">Login</a></div>'
     script = """<script>
@@ -112,7 +123,6 @@ const serverTime=document.getElementById('serverTime'),serverDate=document.getEl
 if(serverTime&&serverDate){const d=new Date(serverTime.dataset.iso);if(!Number.isNaN(d.getTime())){serverTime.textContent=new Intl.DateTimeFormat(undefined,{hour:'numeric',minute:'2-digit'}).format(d);serverDate.textContent=new Intl.DateTimeFormat(undefined,{weekday:'long',month:'short',day:'numeric',year:'numeric'}).format(d);}}
 </script>"""
     return f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Setup - {h(settings["product_name"])}</title>{f'<link rel="icon" href="{h(settings["favicon"])}" type="image/x-icon">' if settings.get("favicon") else ""}<style>{OOBE_STYLE}</style></head><body><div class="page">{logo_html(settings)}<main class="wrap"><section class="card">{alerts}{content}</section></main></div>{script}</body></html>"""
-
 
 def handle_request():
     if not oobe_trigger_enabled() or oobe_user_count() > 0:
