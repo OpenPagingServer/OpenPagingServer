@@ -590,16 +590,30 @@ class LivePageSession:
             page_debug(f"preflight_no_targets stream={self.stream_id} group={self.group_id!r}")
             raise RuntimeError("503 Service Unavailable")
         if endpoint_targets:
-            self.control_sock = connect_endpoint_ipc(timeout=10)
-            command = f"PREPARELIVE {self.stream_id} {self.group_id} {' '.join(endpoint_targets)}\n"
-            page_debug(
-                f"preflight_connect stream={self.stream_id} command={command.strip()!r}"
-            )
-            self.control_sock.sendall(command.encode("utf-8"))
-            response = self.control_sock.recv(1024)
-            page_debug(f"preflight_response stream={self.stream_id} response={response!r}")
-            if b"OK" not in response:
-                raise RuntimeError("503 Service Unavailable")
+            try:
+                self.control_sock = connect_endpoint_ipc(timeout=10)
+                command = f"PREPARELIVE {self.stream_id} {self.group_id} {' '.join(endpoint_targets)}\n"
+                page_debug(
+                    f"preflight_connect stream={self.stream_id} command={command.strip()!r}"
+                )
+                self.control_sock.sendall(command.encode("utf-8"))
+                response = self.control_sock.recv(1024)
+                page_debug(f"preflight_response stream={self.stream_id} response={response!r}")
+                if b"OK" not in response:
+                    raise RuntimeError("endpoint targets not ready")
+            except Exception as exc:
+                page_debug(
+                    f"preflight_endpoint_error stream={self.stream_id} group={self.group_id!r} "
+                    f"error={exc.__class__.__name__}: {exc}"
+                )
+                try:
+                    if self.control_sock is not None:
+                        self.control_sock.close()
+                except OSError:
+                    pass
+                self.control_sock = None
+                if self.desktop_clients <= 0:
+                    raise RuntimeError("503 Service Unavailable")
         try:
             self.desktop_stream_sock, result = start_desktop_livepage(
                 self.stream_id,
@@ -615,6 +629,9 @@ class LivePageSession:
                 f"resolved_group={self.resolved_group_id!r} error={exc.__class__.__name__}: {exc}"
             )
             self.desktop_clients = 0
+        if self.control_sock is None and self.desktop_clients <= 0:
+            page_debug(f"preflight_no_working_targets stream={self.stream_id} group={self.group_id!r}")
+            raise RuntimeError("503 Service Unavailable")
         page_debug(f"preflight_ok stream={self.stream_id}")
 
     def start(self):
@@ -900,19 +917,25 @@ def handle_websocket_client(conn, addr, request=None):
         send_ws_json(conn, {"type": "ready", "stream_id": session.stream_id, "pretone": bool(session.pre_tones)})
         session.begin(conn)
         try:
-            conn.settimeout(0.25)
+            conn.settimeout(10)
         except OSError:
             pass
         while True:
             if session.end_requested.is_set() or session.stop_event.is_set():
                 break
+            has_buffered = hasattr(conn, "pending") and conn.pending() > 0
+            if not has_buffered:
+                try:
+                    ready, _, _ = select.select([conn], [], [], 0.25)
+                except (ValueError, OSError):
+                    break
+                if not ready:
+                    continue
             try:
                 opcode, payload = read_ws_frame(conn)
-            except socket.timeout:
-                continue
+            except (socket.timeout, TimeoutError):
+                break
             except BlockingIOError:
-                continue
-            except TimeoutError:
                 continue
             if opcode is None or opcode == 0x8:
                 break

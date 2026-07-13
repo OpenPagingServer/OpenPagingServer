@@ -64,16 +64,24 @@
     if (sync.audioCtx && sync.audioNode) return;
     var AudioContextCtor = window.AudioContext || window.webkitAudioContext;
     if (!AudioContextCtor) return;
-    sync.audioCtx = new AudioContextCtor();
+    sync.audioCtx = new AudioContextCtor({sampleRate: 8000});
     var node = sync.audioCtx.createScriptProcessor(1024, 0, 1);
     node.onaudioprocess = function (event) {
       var output = event.outputBuffer.getChannelData(0);
       output.fill(0);
       if (sync.livePaused || !sync.liveQueue.length) return;
-      var frame = sync.liveQueue.shift();
-      if (!frame) return;
-      var len = Math.min(output.length, frame.length);
-      for (var i = 0; i < len; i += 1) output[i] = frame[i];
+      var offset = 0;
+      while (offset < output.length && sync.liveQueue.length > 0) {
+        var frame = sync.liveQueue[0];
+        var take = Math.min(frame.length, output.length - offset);
+        for (var i = 0; i < take; i += 1) output[offset + i] = frame[i];
+        offset += take;
+        if (take >= frame.length) {
+          sync.liveQueue.shift();
+        } else {
+          sync.liveQueue[0] = frame.slice(take);
+        }
+      }
     };
     node.connect(sync.audioCtx.destination);
     sync.audioNode = node;
