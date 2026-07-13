@@ -22,7 +22,8 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .header-actions { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:20px; gap:16px; flex-wrap:wrap; }
 .back-link { color:#1976D2; text-decoration:none; display:inline-flex; align-items:center; gap:8px; margin-top:8px; }
 .muted { color:#666; margin-top:0; }
-.settings-frame { width:100%; min-height:760px; border:1px solid #EEE; border-radius:8px; background:#FFF; box-sizing:border-box; }
+.frame-shell { background:#FFF; border:1px solid #EEE; border-radius:10px; box-shadow:0 2px 4px rgba(0,0,0,0.08); padding:12px; box-sizing:border-box; }
+.settings-frame { width:100%; min-height:760px; border:0; border-radius:8px; background:#FFF; box-sizing:border-box; display:block; }
 @media(min-width:768px){ #mobile-header{ display:none; } }
 @media(prefers-color-scheme:dark){
 body,html{ background-color:#121212; color:#E0E0E0; }
@@ -34,8 +35,35 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 #content{ background-color:#121212; }
 .back-link { color:#BB86FC; }
 .muted{ color:#BBB; }
-.settings-frame { border-color:#333; background:#1E1E1E; }
+.frame-shell { border-color:#333; background:#1E1E1E; box-shadow:none; }
+.settings-frame { background:#1E1E1E; }
 }
+"""
+
+
+MODULE_CONFIGURE_FRAME_SCRIPT = r"""
+(function() {
+  var frame = document.getElementById('moduleSettingsFrame');
+  function applyHeight(height) {
+    if (!frame) return;
+    var numeric = Number(height);
+    if (!Number.isFinite(numeric) || numeric <= 0) return;
+    frame.style.height = Math.max(360, Math.ceil(numeric) + 8) + 'px';
+  }
+  window.addEventListener('message', function(event) {
+    if (event.origin !== window.location.origin) return;
+    if (!event.data || event.data.type !== 'ops-frame-height') return;
+    applyHeight(event.data.height);
+  });
+  if (frame) {
+    frame.addEventListener('load', function() {
+      try {
+        applyHeight(frame.contentWindow.document.documentElement.scrollHeight);
+      } catch (_error) {
+      }
+    });
+  }
+})();
 """
 
 
@@ -43,18 +71,38 @@ def module_safe_name(value):
     return re.fullmatch(r"[A-Za-z0-9_-]+", str(value or "")) is not None
 
 
-def module_settings_response(title, body, active="endpoints", user=None, status=200):
+def module_settings_frame_response(title, body, active="endpoints", user=None, status=200):
     return Response(
-        f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{h(title)}</title></head><body>{body}</body></html>""",
+        f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{h(title)}</title></head><body>{body}<script>
+(function() {{
+  function sendHeight() {{
+    var body = document.body;
+    var html = document.documentElement;
+    var height = Math.max(
+      body ? body.scrollHeight : 0,
+      body ? body.offsetHeight : 0,
+      html ? html.scrollHeight : 0,
+      html ? html.offsetHeight : 0
+    );
+    if (window.parent && window.parent !== window) {{
+      window.parent.postMessage({{ type: 'ops-frame-height', height: height }}, window.location.origin);
+    }}
+  }}
+  window.addEventListener('load', sendHeight);
+  window.addEventListener('resize', sendHeight);
+  if (window.ResizeObserver) {{
+    var observer = new ResizeObserver(sendHeight);
+    observer.observe(document.documentElement);
+    if (document.body) observer.observe(document.body);
+  }} else {{
+    setInterval(sendHeight, 300);
+  }}
+  setTimeout(sendHeight, 0);
+}})();
+</script></body></html>""",
         status=status,
         mimetype="text/html",
     )
-
-
-def response_body(response):
-    text = response.get_data(as_text=True) if isinstance(response, Response) else str(response)
-    match = re.search(r"<body[^>]*>(.*)</body>", text, re.IGNORECASE | re.DOTALL)
-    return match.group(1) if match else text
 
 
 def handle_request():
@@ -68,9 +116,10 @@ def handle_request():
     mod = load_endpoint_web(module)
     if getattr(mod, "render_settings", None) is None:
         abort(404)
+    if request.args.get("frame") == "1":
+        return mod.render_settings(request, db, module_settings_frame_response, user)
     description = f'<p class="muted">{h(info.get("description") or "")}</p>' if info.get("description") else ""
-    rendered = mod.render_settings(request, db, module_settings_response, user)
-    settings_body = response_body(rendered)
+    frame_src = "/admin/endpoint-module-settings-configure?" + urlencode({"module": module, "frame": "1"})
     content = f"""    <div class="header-actions">
         <div>
             <h1>{h(info.get("name") or module)} Settings</h1>
@@ -78,5 +127,7 @@ def handle_request():
         </div>
         <a class="back-link" href="/admin/endpoint-module-settings"><i class="fa-solid fa-arrow-left"></i> Manage Endpoint Modules</a>
     </div>
-    <div class="settings-frame" style="padding:18px; overflow:auto;">{settings_body}</div>"""
-    return legacy_page(f"{info.get('name') or module} Settings", legacy_user_context(user), "endpoints", MODULE_CONFIGURE_STYLE, content)
+    <div class="frame-shell">
+        <iframe id="moduleSettingsFrame" class="settings-frame" sandbox="allow-forms allow-same-origin allow-scripts allow-top-navigation" src="{h(frame_src)}" title="{h(info.get("name") or module)} settings"></iframe>
+    </div>"""
+    return legacy_page(f"{info.get('name') or module} Settings", legacy_user_context(user), "endpoints", MODULE_CONFIGURE_STYLE, content, MODULE_CONFIGURE_FRAME_SCRIPT)

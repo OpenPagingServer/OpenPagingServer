@@ -2503,7 +2503,7 @@ class BuiltinSipTrunksWeb:
                 "label": "Outbound-Authenticated SIP Trunk",
                 "description": "Trunk Open Paging Server into a VoIP server or ITSP. Does not require SIP/RTP to be open to the internet on this server.",
             },
-            "dialplan": {"label": "Dialplan Extension", "description": "Define where incoming calls from a SIP trunk go on a per DID basis. Paging, sending messages, test tone, and echo test."},
+            "dialplan": {"label": "Dial Plan Extension", "description": "Define where incoming calls from a SIP trunk go on a per DID basis. Paging, sending messages, test tone, and echo test."},
             "number": {"label": "Outbound Dial", "description": "Send broadcasts to any phone number or extension over a SIP trunk. Such as cellphones, POTS telephones, zone controllers, page groups, and more. Use outbound dial endpoints in any group."},
         }
 
@@ -2712,7 +2712,7 @@ class BuiltinSipTrunksWeb:
         elif form_type == "number":
             body = sip_number_form_html(values, error, "Add SIP Number Endpoint")
         else:
-            body = f'<form method="post" class="grid form-surface" id="dialplanForm">{sip_dialplan_fields(values)}<button class="button" type="submit">Add SIP Dialplan Extension</button></form>'
+            body = f'<form method="post" class="grid form-surface" id="dialplanForm">{sip_dialplan_fields(values)}<button class="button" type="submit">Add SIP Dial Plan Extension</button></form>'
         if error and form_type in {"ip", "auth", "dialplan"}:
             body = f'<div class="error">{h(error)}</div>' + body
         return page(self.forms()[form_type]["label"], sip_form_frame(body), "endpoints", user)
@@ -2904,7 +2904,7 @@ class BuiltinSipTrunksWeb:
                 elif passcode and not re.fullmatch(r"[0-9A-D]+", passcode):
                     error = "Passcode can only contain 0-9 and A-D."
                 elif duplicate:
-                    error = "A dialplan entry already exists for that extension."
+                    error = "A dial plan entry already exists for that extension."
                 else:
                     sip_execute(
                         f"UPDATE `{table}` SET `name`=%s, `extension`=%s, `group`=%s, `trigger`=%s, `passcode`=%s WHERE `id`=%s",
@@ -2959,7 +2959,7 @@ class BuiltinSipTrunksWeb:
                 "require_passcode": "1" if row.get("passcode") else "",
                 "passcode": str(row.get("passcode") or ""),
             }
-            body = f'<form method="post" class="grid form-surface" id="dialplanForm">{sip_dialplan_fields(values)}<button class="button" type="submit">Save SIP Dialplan Extension</button></form>'
+            body = f'<form method="post" class="grid form-surface" id="dialplanForm">{sip_dialplan_fields(values)}<button class="button" type="submit">Save SIP Dial Plan Extension</button></form>'
             if error:
                 body = f'<div class="error">{h(error)}</div>' + body
         return page("Endpoint Action", sip_form_frame(body), "endpoints", user)
