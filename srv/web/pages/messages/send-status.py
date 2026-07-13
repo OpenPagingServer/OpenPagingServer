@@ -98,12 +98,20 @@ def send_status_state(broadcast_id):
         append_send_status_debug(broadcast_id, f"delivery=failed record={json.dumps({k: str(v) for k, v in record.items() if k != 'payload'})}")
         return {"state": "failed", "detail": "The broadcast could not be delivered to any recipient."}
     report = broadcast_recipient_report(record)
-    if report["endpoint_error"] or report["unavailable"]:
+    if report["endpoint_error"]:
         append_send_status_debug(
             broadcast_id,
-            f"delivery={delivery} endpoint_error={report['endpoint_error']!r} unavailable_recipients={report['unavailable']}",
+            f"delivery={delivery} endpoint_error={report['endpoint_error']!r}",
         )
         return {"state": "partial", "detail": ""}
+    if report["unavailable"]:
+        count = len(report["unavailable"])
+        noun = "recipient is" if count == 1 else "recipients are"
+        append_send_status_debug(
+            broadcast_id,
+            f"delivery={delivery} unavailable_recipients={report['unavailable']}",
+        )
+        return {"state": "sent", "detail": f"{count} {noun} offline and cannot receive the broadcast"}
     return {"state": "sent", "detail": ""}
 
 
@@ -158,7 +166,7 @@ const POLL_URL = "/messages/send-status?{('bid=' + h(bid)) if bid else ('fail=' 
 const INITIAL_FAILED = {initial_failed};
 let finished = false;
 let polls = 0;
-function finish(state, showDebug) {{
+function finish(state, showDebug, detailText) {{
     if (finished) return;
     finished = true;
     const icon = document.getElementById('status-icon');
@@ -167,6 +175,7 @@ function finish(state, showDebug) {{
     if (state === 'sent') {{
         icon.innerHTML = ICONS.success;
         title.textContent = 'Broadcast sent';
+        if (detailText) detail.textContent = detailText;
     }} else if (state === 'partial') {{
         icon.innerHTML = ICONS.partial;
         title.textContent = 'Errors sending broadcast';
@@ -200,7 +209,7 @@ function poll() {{
                 setTimeout(poll, 1000);
                 return;
             }}
-            finish(data.state === 'sent' ? 'sent' : (data.state === 'partial' ? 'partial' : 'failed'), data.debug);
+            finish(data.state === 'sent' ? 'sent' : (data.state === 'partial' ? 'partial' : 'failed'), data.debug, data.detail);
         }})
         .catch(function() {{
             if (polls >= 90) {{ finish('failed', false); return; }}

@@ -253,6 +253,10 @@ def sip_settings_body(ctx, data, detected_external_ipv4, user, unlock_page_token
         intrusion_switch_html = '<span class="switch locked static checked" aria-disabled="true"><span class="slider"></span></span>'
     else:
         intrusion_switch_html = f'<label class="{h(intrusion_switch_class)}"{intrusion_aria_attr}><input type="checkbox" id="intrusionPreventionToggle"{intrusion_checkbox_attrs}><span class="slider"></span></label>'
+    docker_mode = os.environ.get("OPS_DOCKER_MODE", "") == "1"
+    docker_port_disabled = " disabled" if docker_mode else ""
+    docker_port_style = ' style="background:rgba(0,0,0,0.05); color:#777;"' if docker_mode else ""
+    docker_port_notice = '<div style="display:flex; align-items:center; gap:6px; margin-top:4px;"><svg width="16" height="16" viewBox="0 0 24 24" fill="#1976D2"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg><span style="color:#1976D2; font-size:0.85em;">Change port by editing .env in Docker</span></div>' if docker_mode else ""
     return f"""
     <style>
     .switch.locked {{
@@ -458,7 +462,8 @@ def sip_settings_body(ctx, data, detected_external_ipv4, user, unlock_page_token
                 </div>
                 <div class="info-row" style="flex-direction: column; align-items: flex-start; gap: 8px; margin-bottom:16px;">
                     <span class="info-label">Port</span>
-                    <input type="number" name="insecure_sip_port" id="udpPort" min="1" max="65535" value="{h(data.get("insecure_sip_port", "5060"))}"{udp_disabled}>
+                    <input type="number" name="insecure_sip_port" id="udpPort" min="1" max="65535" value="{h(data.get("insecure_sip_port", "5060"))}"{docker_port_disabled if docker_mode else udp_disabled}{docker_port_style}>
+                    {docker_port_notice}
                     <span id="udpPortError" class="port-error-text">Please enter a valid port (1-65535).</span>
                 </div>
                 <div class="info-row" style="align-items:center; gap:16px; flex-wrap:wrap;">

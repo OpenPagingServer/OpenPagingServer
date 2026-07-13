@@ -115,7 +115,7 @@ def handle_request():
             if not selected_groups:
                 return redirect(f"/messages/send?msgid={h(msgid)}")
             targets = ".".join(selected_groups)
-        if targets in {"", "0"}:
+        if not targets:
             return redirect(f"/messages/send?msgid={h(msgid)}")
         try:
             broadcast_id = create_broadcast(msgid, targets, user.get("username") or session.get("username") or "User")
@@ -143,10 +143,6 @@ def handle_request():
         group_rows = []
         for group in groups:
             recipients = list(group_member_tokens(group.get("members")))
-            if "messages" in set(group.get("monitor_categories") or []):
-                for member in group_member_tokens(group.get("monitor_members")):
-                    if member not in recipients:
-                        recipients.append(member)
             available = sum(1 for member in recipients if group_member_available(member, endpoint_availability))
             has_available = endpoint_error is not None or available > 0
             row_cls = "" if has_available else " unavailable"

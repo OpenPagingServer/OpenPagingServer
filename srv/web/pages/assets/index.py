@@ -523,7 +523,7 @@ def handle_request():
                 <div class="upload-box">
                     <i class="fa-solid fa-cloud-arrow-up" style="font-size:2em;"></i>
                     <div style="margin-top:10px;">Choose an asset to upload</div>
-                    <div class="muted" style="margin-top:10px;">You will have temporary access to assets you upload for up to 48 hours. Add them where necessary within that timeframe.</div>
+                    {"" if can_view_existing else '<div class="muted" style="margin-top:10px;">You will have temporary access to assets you upload for up to 48 hours. Add them where necessary within that timeframe.</div>'}
                     <div class="muted" style="margin-top:6px;">Allowed: txt, jpg, png, bmp, wav, mp3. Limit: {h(format_bytes(MAX_UPLOAD_BYTES))}.</div>
                     <input class="control" type="file" name="asset_file" accept=".txt,.jpg,.png,.bmp,.wav,.mp3,text/plain,image/jpeg,image/png,image/bmp,audio/wav,audio/mpeg" required>
                 </div>

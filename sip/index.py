@@ -2361,7 +2361,12 @@ class SipServer:
                 conn.sendall(data)
             return
         if self.udp_sock is None:
-            raise OSError("UDP SIP socket is unavailable")
+            tmp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                tmp.sendto(data, (host, port))
+            finally:
+                tmp.close()
+            return
         self.udp_sock.sendto(data, (host, port))
 
     def route_header_uri(self, route):

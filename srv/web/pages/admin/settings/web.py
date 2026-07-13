@@ -1,3 +1,5 @@
+import os
+
 from srv.web.app import *
 from srv.web.pages.admin.settings.sip import is_port_in_use
 from srv.web.pages.admin.settings.common import settings_page
@@ -76,6 +78,10 @@ def handle_request():
     https_field_disabled = "" if https_checked else " disabled"
     http_to_https_checked = " checked" if data.get("webserver_http_to_https", "0") == "1" else ""
     hsts_checked = " checked" if data.get("webserver_hsts", "0") == "1" else ""
+    docker_mode = os.environ.get("OPS_DOCKER_MODE", "") == "1"
+    docker_port_disabled = " disabled" if docker_mode else ""
+    docker_port_style = ' style="background:rgba(0,0,0,0.05); color:#777;"' if docker_mode else ""
+    docker_port_notice = '<div style="display:flex; align-items:center; gap:6px; margin-top:4px;"><svg width="16" height="16" viewBox="0 0 24 24" fill="#1976D2"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg><span style="color:#1976D2; font-size:0.85em;">Change port by editing .env in Docker</span></div>' if docker_mode else ""
     body = f"""
     <div id="web" class="tab-content active">
         <div class="info-card login-settings">
@@ -83,7 +89,8 @@ def handle_request():
             <form id="webSettingsForm">
                 <div class="info-row" style="flex-direction: column; align-items: flex-start; gap: 8px; margin-bottom:16px;">
                     <span class="info-label">HTTP Port</span>
-                    <input type="number" name="webserver_http_port" id="webHttpPort" min="1" max="65535" value="{h(data.get("webserver_http_port", "80") or "80")}">
+                    <input type="number" name="webserver_http_port" id="webHttpPort" min="1" max="65535" value="{h(data.get("webserver_http_port", "80") or "80")}"{docker_port_disabled}{docker_port_style}>
+                    {docker_port_notice}
                     <span id="webHttpPortError" class="port-error-text">Please enter a valid port (1-65535).</span>
                 </div>
                 <div class="info-row" style="border-bottom:none;">
@@ -95,7 +102,8 @@ def handle_request():
                 <div id="webHttpsSettings">
                 <div class="info-row" style="flex-direction: column; align-items: flex-start; gap: 8px; margin-bottom:16px; border-top:none; border-bottom:none;">
                     <span class="info-label">HTTPS Port</span>
-                    <input type="number" name="webserver_https_port" id="webHttpsPort" min="1" max="65535" value="{h(data.get("webserver_https_port", "443") or "443")}"{https_field_disabled}>
+                    <input type="number" name="webserver_https_port" id="webHttpsPort" min="1" max="65535" value="{h(data.get("webserver_https_port", "443") or "443")}"{docker_port_disabled if docker_mode else https_field_disabled}{docker_port_style}>
+                    {docker_port_notice}
                     <span id="webHttpsPortError" class="port-error-text">Please enter a valid port (1-65535).</span>
                 </div>
                 <div class="info-row" style="flex-direction: column; align-items: flex-start; gap: 8px; border-bottom:none;">
