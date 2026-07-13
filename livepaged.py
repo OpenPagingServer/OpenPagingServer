@@ -965,7 +965,6 @@ def serve_websocket():
     server.bind((WS_HOST, WS_PORT))
     server.listen(25)
     page_debug(f"websocket_server_start host={WS_HOST} port={WS_PORT}")
-    print(f"livepaged websocket server listening on {WS_HOST}:{WS_PORT}", flush=True)
     while True:
         conn, addr = server.accept()
         threading.Thread(target=handle_websocket_client, args=(conn, addr), daemon=True).start()
