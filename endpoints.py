@@ -3433,6 +3433,23 @@ class SipOutputSession:
                     if not sender.send_frame(frame):
                         break
                 elif self.recorder.finished.is_set():
+                    # Drain any frames written between our read and the
+                    # finished flag being set to avoid cutting off the tail.
+                    while not self.stop_event.is_set():
+                        tail = handle.read(SIP_OUTPUT_FRAME_BYTES)
+                        if len(tail) == SIP_OUTPUT_FRAME_BYTES:
+                            if not sender.send_frame(tail):
+                                break
+                            next_send += 0.02
+                            sleep_for = next_send - time.monotonic()
+                            if sleep_for > 0:
+                                time.sleep(sleep_for)
+                            else:
+                                next_send = time.monotonic()
+                        else:
+                            if tail:
+                                sender.send_frame(tail.ljust(SIP_OUTPUT_FRAME_BYTES, b"\xff"))
+                            break
                     break
                 else:
                     if not sender.send_frame(SIP_OUTPUT_SILENCE_FRAME):
