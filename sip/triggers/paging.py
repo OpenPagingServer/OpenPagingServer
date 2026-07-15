@@ -214,10 +214,24 @@ class SipLivePageSession(livepaged.LivePageSession):
 
         threading.Thread(target=prepare, daemon=True).start()
         loops = 0
+        max_loops = 1500  # 30 seconds at 20ms per frame
+        next_send = time.monotonic()
         while not setup_done.is_set():
+            if loops >= max_loops:
+                page_debug(
+                    f"preflight_timeout stream={self.stream_id} group={self.group_id!r} "
+                    f"loops={loops}"
+                )
+                setup_error.append(RuntimeError("503 Service Unavailable"))
+                break
             self.send_rtp(get_ringback_frame(loops))
             loops += 1
-            time.sleep(0.02)
+            next_send += 0.02
+            sleep_for = next_send - time.monotonic()
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            else:
+                next_send = time.monotonic()
         if setup_error:
             raise setup_error[0]
         self._preflight_done = True

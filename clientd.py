@@ -148,6 +148,9 @@ def db():
         database=DB_NAME,
         cursorclass=pymysql.cursors.DictCursor,
         autocommit=False,
+        connect_timeout=10,
+        read_timeout=10,
+        write_timeout=10,
     )
 
 

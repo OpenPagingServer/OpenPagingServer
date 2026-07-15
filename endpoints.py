@@ -141,12 +141,19 @@ class StreamState:
         self.target_map = target_map
         self.pending_modules = {name for name, targets in target_map.items() if targets}
         self.ready_modules = set()
+        self.failed_modules = set()
         self.ready_event = threading.Event()
 
     def mark_ready(self, module_name):
         if module_name in self.pending_modules:
             self.ready_modules.add(module_name)
-        if self.ready_modules >= self.pending_modules:
+        if (self.ready_modules | self.failed_modules) >= self.pending_modules:
+            self.ready_event.set()
+
+    def mark_failed(self, module_name):
+        if module_name in self.pending_modules:
+            self.failed_modules.add(module_name)
+        if (self.ready_modules | self.failed_modules) >= self.pending_modules:
             self.ready_event.set()
 
 
@@ -3620,7 +3627,7 @@ class BuiltinSipTrunksRuntime:
         with self.lock:
             self.streams[stream_id] = state
         if not rows:
-            mark_ready("siptrunks", stream_id)
+            mark_failed("siptrunks", stream_id)
             return
         for row in rows:
             session = SipOutputSession(row, metadata or {}, state.recorder, state.session_ready, state.session_done)
@@ -4110,7 +4117,7 @@ class BuiltinMulticastRTPModule:
             except Exception as exc:
                 log(f"multicast rtp stream replace error stream={stream_id}: {exc}")
         if not rows:
-            mark_ready(MULTICAST_RTP_MODULE, stream_id)
+            mark_failed(MULTICAST_RTP_MODULE, stream_id)
 
     def receive_audio(self, chunk, stream_id):
         with self.lock:
@@ -5238,6 +5245,7 @@ def dispatch_to_module(module_name, action, stream_id, msg_id, sub_targets, meta
     if mod is None:
         log(f"dispatch_to_module missing module={module_name} action={action} stream={stream_id} msg={msg_id} targets={sub_targets}")
         page_debug(f"dispatch_to_module_missing module={module_name} action={action} stream={stream_id} msg={msg_id} targets={sub_targets}")
+        mark_failed(module_name, stream_id)
         return
     try:
         log(f"dispatch_to_module start module={module_name} action={action} stream={stream_id} msg={msg_id} targets={sub_targets}")
@@ -5254,7 +5262,7 @@ def dispatch_to_module(module_name, action, stream_id, msg_id, sub_targets, meta
     except Exception as exc:
         log(f"dispatch error in {module_name}: {exc}")
         page_debug(f"dispatch_to_module_error module={module_name} action={action} stream={stream_id} error={exc.__class__.__name__}: {exc}")
-        mark_ready(module_name, stream_id)
+        mark_failed(module_name, stream_id)
 
 
 def dispatch(action, stream_id, msg_id, targets, metadata=None):
@@ -5302,6 +5310,18 @@ def mark_ready(module_name, stream_id):
     state.mark_ready(module_name)
     log(f"mark_ready module={module_name} stream={stream_id} ready={sorted(state.ready_modules)} pending={sorted(state.pending_modules)}")
     page_debug(f"mark_ready module={module_name} stream={stream_id} ready={sorted(state.ready_modules)} pending={sorted(state.pending_modules)}")
+
+
+def mark_failed(module_name, stream_id):
+    with stream_states_lock:
+        state = stream_states.get(stream_id)
+    if state is None:
+        log(f"mark_failed missing_state module={module_name} stream={stream_id}")
+        page_debug(f"mark_failed_missing_state module={module_name} stream={stream_id}")
+        return
+    state.mark_failed(module_name)
+    log(f"mark_failed module={module_name} stream={stream_id} failed={sorted(state.failed_modules)} ready={sorted(state.ready_modules)} pending={sorted(state.pending_modules)}")
+    page_debug(f"mark_failed module={module_name} stream={stream_id} failed={sorted(state.failed_modules)} ready={sorted(state.ready_modules)} pending={sorted(state.pending_modules)}")
 
 
 def finish_stream(stream_id):
@@ -5459,11 +5479,11 @@ def handle_stream_prepare(conn, parts, action_name):
     log(f"handle_stream_prepare action={action_name} waited stream={stream_id} ready={ready}")
     page_debug(
         f"handle_stream_prepare_ready action={action_name} stream={stream_id} ready={ready} "
-        f"ready_modules={sorted(state.ready_modules)} pending={sorted(state.pending_modules)}"
+        f"ready_modules={sorted(state.ready_modules)} failed_modules={sorted(state.failed_modules)} pending={sorted(state.pending_modules)}"
     )
-    if not ready:
+    if not ready or not state.ready_modules:
         pop_stream_state(stream_id)
-        page_debug(f"handle_stream_prepare_timeout action={action_name} stream={stream_id}")
+        page_debug(f"handle_stream_prepare_timeout action={action_name} stream={stream_id} ready_modules={sorted(state.ready_modules)}")
         conn.sendall(b"ERROR\n")
         return
     conn.sendall(b"OK\n")

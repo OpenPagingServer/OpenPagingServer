@@ -77,6 +77,9 @@ def get_db_connection():
         user=DB_USER,
         password=DB_PASS,
         database=DB_NAME,
+        connect_timeout=10,
+        read_timeout=10,
+        write_timeout=10,
     )
 
 

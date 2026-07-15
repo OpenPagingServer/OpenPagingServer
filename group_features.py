@@ -37,6 +37,9 @@ def db(cursorclass=pymysql.cursors.DictCursor):
         database=DB_NAME,
         cursorclass=cursorclass,
         autocommit=False,
+        connect_timeout=10,
+        read_timeout=10,
+        write_timeout=10,
     )
 
 

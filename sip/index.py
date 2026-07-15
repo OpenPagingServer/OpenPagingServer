@@ -3913,8 +3913,7 @@ class SipServer:
         )
 
         try:
-            if not getattr(session, "defers_preflight", False):
-                self.run_trigger_preflight(session)
+            self.run_trigger_preflight(session)
         except Exception:
             traceback.print_exc()
             return self.build_503(headers, local_ip=local_sip_ip, local_port=local_sip_port, transport=transport)
