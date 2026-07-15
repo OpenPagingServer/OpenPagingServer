@@ -3913,7 +3913,8 @@ class SipServer:
         )
 
         try:
-            self.run_trigger_preflight(session)
+            if not getattr(session, "defers_preflight", False):
+                self.run_trigger_preflight(session)
         except Exception:
             traceback.print_exc()
             return self.build_503(headers, local_ip=local_sip_ip, local_port=local_sip_port, transport=transport)
@@ -4130,6 +4131,16 @@ class SipServer:
                 sock.sendto(encoded, addr)
                 return None
             trusted = client_trunk_id is not None or self.outbound_source_is_trusted(addr[0])
+            trying = self.build_response(headers, "100 Trying")
+            try:
+                encoded_trying = trying.encode("utf-8")
+                if tcp:
+                    if conn is not None:
+                        conn.sendall(encoded_trying)
+                else:
+                    sock.sendto(encoded_trying, addr)
+            except Exception:
+                pass
             response = self.handle_invite(method, uri, headers, body, addr[0], addr[1], transport=transport, conn=conn, trusted=trusted)
         elif method == "ACK":
             call_id = self.get_first(headers, "Call-ID")

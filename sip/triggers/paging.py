@@ -103,6 +103,8 @@ def make_rtp_packet(seq, ts, payload, pt=0):
 
 
 class SipLivePageSession(livepaged.LivePageSession):
+    defers_preflight = True
+
     def __init__(self, remote_ip, remote_port, group_id, generator=None, on_finish=None, sender=None):
         super().__init__(remote_ip, remote_port, group_id=group_id, generator=generator, on_finish=on_finish, sender=sender)
         self.seq = 1000
@@ -110,6 +112,8 @@ class SipLivePageSession(livepaged.LivePageSession):
         self.rtp_packets_sent = 0
         self.rtp_send_errors = 0
         self.rtp_keepalive_payload = None
+        self.setup_failed = False
+        self._preflight_done = False
         page_debug(
             f"session_init stream={self.stream_id} remote={remote_ip}:{remote_port} "
             f"group={self.group_id!r} sender={self.sender!r} local_port={self.local_port}"
@@ -186,6 +190,8 @@ class SipLivePageSession(livepaged.LivePageSession):
         page_debug(f"progress_tone_done stream={self.stream_id} tone={tone}")
 
     def preflight(self):
+        if self._preflight_done:
+            return
         page_debug(f"preflight_start stream={self.stream_id} group={self.group_id!r}")
         setup_done = threading.Event()
         setup_error = []
@@ -214,6 +220,7 @@ class SipLivePageSession(livepaged.LivePageSession):
             time.sleep(0.02)
         if setup_error:
             raise setup_error[0]
+        self._preflight_done = True
         page_debug(f"preflight_ok stream={self.stream_id} ringback_frames={loops}")
 
     def start(self):
@@ -222,7 +229,6 @@ class SipLivePageSession(livepaged.LivePageSession):
             self.cleanup_after_run = False
             self.thread = threading.Thread(target=self.run, daemon=True)
             self.thread.start()
-            threading.Thread(target=self.enable_livepage_tracking, daemon=True).start()
 
     def play_pre_tones_with_silence(self):
         if not self.pre_tones:
@@ -327,6 +333,14 @@ class SipLivePageSession(livepaged.LivePageSession):
     def run(self):
         live_audio_started = False
         try:
+            try:
+                self.preflight()
+            except Exception as exc:
+                page_debug(f"run_preflight_failed stream={self.stream_id} error={exc.__class__.__name__}: {exc}")
+                self.setup_failed = True
+                self.play_progress_tone(tone="reorder", duration=4.0)
+                return
+            threading.Thread(target=self.enable_livepage_tracking, daemon=True).start()
             self.play_pre_tones_with_silence()
             if self.end_requested.is_set():
                 page_debug(f"run_end_during_pretone stream={self.stream_id}")
