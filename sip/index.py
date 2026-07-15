@@ -3238,9 +3238,9 @@ class SipServer:
     def choose_outbound_route(self, trunk):
         auth_type = str(trunk.get("auth") or "").upper()
         trunk_type = str(trunk.get("trunk_type") or "").upper()
-        if not self.is_outbound_trunk_row(trunk) and (auth_type == "IP" or trunk_type == "IP"):
+        if not self.is_outbound_trunk_row(trunk) and (auth_type == "IP" or trunk_type == "IP" or trunk_type == "INBOUND_AUTH" or auth_type == "USERPASS"):
             host = str(trunk.get("ipaddr") or "").strip()
-            if not host:
+            if not host or host == "0.0.0.0":
                 return None, None
             return {"host": host, "port": 5060, "transport": "udp"}, None
         with self.outbound_lock:

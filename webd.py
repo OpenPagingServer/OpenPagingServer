@@ -573,9 +573,10 @@ class FrontServer:
         self.scheme = str(scheme or "http").lower()
         self.internal_server = create_waitress_server(app, 0, self.allowlist, self.denied_html, hsts_enabled=hsts_enabled, default_scheme=self.scheme)
         self.internal_port = self.internal_server.effective_port
+        self.bind_host = os.getenv("WEB_HOST", "0.0.0.0")
         self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.listener.bind(("0.0.0.0", port))
+        self.listener.bind((self.bind_host, port))
         self.listener.listen(100)
         self.effective_port = self.listener.getsockname()[1]
         self.ssl_context = ssl_context
@@ -813,7 +814,7 @@ def main():
                 for port in ports:
                     try:
                         server = create_front_server(app, port, **options)
-                        print(f"webd serving {title} on {options.get('scheme', 'http')}://0.0.0.0:{server.effective_port}", flush=True)
+                        print(f"webd serving {title} on {options.get('scheme', 'http')}://{server.bind_host}:{server.effective_port}", flush=True)
                         break
                     except (OSError, socket.error, ssl.SSLError, ValueError) as exc:
                         last_errors[label] = exc

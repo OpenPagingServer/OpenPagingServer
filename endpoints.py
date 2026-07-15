@@ -1558,7 +1558,8 @@ def siptrunks_row_name(row):
     trunk_type = str(row.get("trunk_type") or "").upper()
     auth_type = str(row.get("auth") or "").upper()
     ipaddr = str(row.get("ipaddr") or "").strip()
-    if (trunk_type == SIP_TRUNK_TYPE_IP or auth_type == "IP") and ipaddr:
+    is_ip_trunk = (trunk_type == SIP_TRUNK_TYPE_IP or auth_type == "IP") and auth_type != "USERPASS" and trunk_type != SIP_TRUNK_TYPE_INBOUND_AUTH
+    if is_ip_trunk and ipaddr:
         return f"{name} ({ipaddr})"
     return name
 
@@ -2093,7 +2094,10 @@ def sip_trunk_output_choices():
     choices = []
     for row in sip_fetch_trunk_rows(include_ip=True):
         auth_type = str(row.get("auth") or "").upper()
+        trunk_type = str(row.get("trunk_type") or "").upper()
         if auth_type == "IP" or siptrunks_is_outbound_row(row):
+            choices.append(row)
+        elif trunk_type == SIP_TRUNK_TYPE_INBOUND_AUTH or auth_type == "USERPASS":
             choices.append(row)
     return choices
 
