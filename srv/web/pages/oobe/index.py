@@ -111,7 +111,7 @@ def stage_body(stage, settings, error, notice):
         <button type="submit" style="display:none" aria-hidden="true"></button>
         <div class="actions"><button class="button secondary" name="action" value="back" type="submit">Back</button><input type="hidden" name="back_stage" value="time"><button class="button" type="submit">Next</button></div></form>"""
     elif stage == "analytics":
-        content = """<h1>Would you like to enable optional analytics?</h1><p class="lead">To help the Open Paging Server project improve, you can opt-in to share optional analytics. Analytics contain mainly anonymous data such as your operating system, software versions, anonymized crash logs, etc. And may include your public IP address. You can change this setting later.</p>
+        content = """<h1>Would you like to enable optional analytics?</h1><p class="lead">To help the Open Paging Server project improve, you can opt-in to share optional analytics. Analytics contain mainly anonymous data such as your operating system, software versions, anonymized crash logs, etc. And may include your public IP address. You can change this setting later. <a href="https://www.openpagingserver.org/privacypolicy/analytics">Privacy Policy</a></p>
         <form method="post">
         <input type="hidden" name="stage" value="analytics">
         <button type="submit" name="action" value="opt_in" style="display:none" aria-hidden="true"></button>
