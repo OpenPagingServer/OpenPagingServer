@@ -87,7 +87,7 @@ def stage_body(stage, settings, error, notice):
     if stage == "welcome":
         content = '<h1>Welcome to Open Paging Server</h1><p class="lead">You are a few steps away from getting started with your new paging system.</p><form method="post">' + form_buttons("welcome", None, "Start", "button good") + "</form>"
     elif stage == "account":
-        content = """<h1>Create an account</h1><p class="lead">To begin, please create your user account. This will be the main administrator account, and cannot be deleted.</p>
+        content = """<h1>Create an account</h1><p class="lead">To begin, please create your user account. This will be the root administrator account, and cannot be deleted.</p>
         <form method="post">
         <input type="hidden" name="stage" value="account">
         <button type="submit" style="display:none" aria-hidden="true"></button>
