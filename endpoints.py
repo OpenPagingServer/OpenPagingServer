@@ -1744,8 +1744,10 @@ def sip_fetch_output_rows():
 def sip_fetch_output_row(row_id):
     rows = sip_query_all(
         f"SELECT o.*, t.name AS trunk_name, t.status AS trunk_status, t.auth AS trunk_auth, "
-        f"t.trunk_type AS trunk_type, t.connected_server AS trunk_connected_server, "
-        f"t.username AS trunk_username, t.password AS trunk_password, t.ipaddr AS trunk_ipaddr "
+        f"t.trunk_type AS trunk_trunk_type, t.connected_server AS trunk_connected_server, "
+        f"t.username AS trunk_username, t.password AS trunk_password, t.ipaddr AS trunk_ipaddr, "
+        f"t.servers_json AS trunk_servers_json, t.outbound_nat AS trunk_outbound_nat, "
+        f"t.connected_transport AS trunk_connected_transport "
         f"FROM `{SIP_OUTPUT_TABLE}` o "
         f"LEFT JOIN `{SIP_TRUNK_TABLE}` t ON t.id = o.trunk_id "
         f"WHERE o.id=%s LIMIT 1",
@@ -3476,14 +3478,30 @@ class SipOutputSession:
         import sip.index as sip_index
 
         cid_number, cnam_name = sip_output_caller_values(self.row, self.metadata)
+        trunk_id = self.row.get("trunk_id")
+        trunk_fallback = {
+            "id": trunk_id,
+            "name": self.row.get("trunk_name"),
+            "status": self.row.get("trunk_status"),
+            "auth": self.row.get("trunk_auth"),
+            "trunk_type": self.row.get("trunk_trunk_type"),
+            "username": self.row.get("trunk_username"),
+            "password": self.row.get("trunk_password"),
+            "ipaddr": self.row.get("trunk_ipaddr"),
+            "servers_json": self.row.get("trunk_servers_json"),
+            "outbound_nat": self.row.get("trunk_outbound_nat"),
+            "connected_server": self.row.get("trunk_connected_server"),
+            "connected_transport": self.row.get("trunk_connected_transport"),
+        }
         return sip_index.sip_server.place_outbound_call(
-            self.row.get("trunk_id"),
+            trunk_id,
             self.row.get("number"),
             caller_id_number=cid_number,
             caller_id_name=cnam_name,
             alert_info_value=sip_output_alert_value(self.row),
             custom_headers=sip_output_headers(self.row),
             answer_timeout=answer_timeout,
+            trunk_fallback=trunk_fallback,
         )
 
     def run_page_mode(self):
