@@ -1701,16 +1701,42 @@ class SipServer:
             return match.group(1).strip()
         if "," in raw:
             raw = raw.split(",", 1)[0].strip()
-        return raw.split(";", 1)[0].strip() if raw.lower().startswith("sip:") else raw
+        if raw.lower().startswith(("sip:", "sips:", "tel:")):
+            return raw.split(";", 1)[0].strip()
+        return raw
 
     def request_user_from_uri(self, uri):
         raw_uri = self.sip_uri_from_header(uri)
         if not raw_uri:
             return ""
         target = re.sub(r'^sips?:', '', raw_uri, flags=re.IGNORECASE)
+        target = re.sub(r'^tel:', '', target, flags=re.IGNORECASE)
         user_part = target.rsplit("@", 1)[0] if "@" in target else target
         user_part = user_part.split(";", 1)[0].strip()
         return urllib.parse.unquote(user_part)
+
+    def called_extension_from_invite(self, uri, headers):
+        candidates = []
+        for header_name in (
+            "P-Called-Party-ID",
+            "X-Original-To",
+            "X-Called-Number",
+            "History-Info",
+            "Diversion",
+            "To",
+        ):
+            for value in self.get_all(headers, header_name):
+                candidate = self.request_user_from_uri(value)
+                if candidate:
+                    candidates.append(candidate)
+        request_user = self.request_user_from_uri(uri)
+        if request_user:
+            candidates.append(request_user)
+        for candidate in candidates:
+            normalized = str(candidate or "").strip()
+            if normalized:
+                return normalized
+        return ""
 
     def parse_sip_target(self, value, fallback_ip=None, fallback_port=5060, fallback_transport="udp"):
         uri = self.sip_uri_from_header(value)
@@ -3791,7 +3817,7 @@ class SipServer:
         if not trusted:
             self.mark_authorized_trunk_seen(method, source_ip, headers)
         nat_mode = self.sip_nat_mode()
-        user = self.request_user_from_uri(uri)
+        user = self.called_extension_from_invite(uri, headers)
         
         db_status, trigger, passcode = self.get_endpoint_trigger(user)
 
