@@ -3263,6 +3263,10 @@ class SipServer:
             if servers:
                 trunk["servers"] = servers
         if not self.is_outbound_trunk_row(trunk) and (auth_type == "IP" or trunk_type == "IP" or trunk_type == "INBOUND_AUTH" or auth_type == "USERPASS"):
+            host = str(trunk.get("connected_server") or "").strip()
+            transport = str(trunk.get("connected_transport") or "udp").strip().lower() or "udp"
+            if host:
+                return {"host": host, "port": 5061 if transport == "tls" else 5060, "transport": transport}, None
             host = str(trunk.get("ipaddr") or "").strip()
             if not host or host == "0.0.0.0":
                 return None, None
