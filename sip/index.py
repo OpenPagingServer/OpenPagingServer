@@ -1274,17 +1274,36 @@ class SipServer:
         )
 
     def fetch_trunk_row(self, trunk_id):
+        raw_trunk_id = trunk_id
+        trunk_id_text = str(trunk_id or "").strip()
+        trunk_id_int = safe_int(trunk_id_text, 0)
         conn = self.connect_db()
         try:
             with conn.cursor(pymysql.cursors.DictCursor) as cur:
                 select_columns = self.sip_trunk_select_columns()
-                cur.execute(
-                    f"SELECT {select_columns} FROM `sip-trunks` WHERE `id`=%s LIMIT 1",
-                    (trunk_id,),
-                )
+                if trunk_id_int > 0:
+                    cur.execute(
+                        f"SELECT {select_columns} FROM `sip-trunks` WHERE `id`=%s LIMIT 1",
+                        (trunk_id_int,),
+                    )
+                else:
+                    cur.execute(
+                        f"SELECT {select_columns} FROM `sip-trunks` WHERE `id`=%s LIMIT 1",
+                        (trunk_id_text,),
+                    )
                 row = cur.fetchone()
+                if not row and trunk_id_text:
+                    cur.execute(
+                        f"SELECT {select_columns} FROM `sip-trunks` WHERE CAST(`id` AS CHAR)=%s LIMIT 1",
+                        (trunk_id_text,),
+                    )
+                    row = cur.fetchone()
         finally:
             conn.close()
+        sip_debug(
+            f"fetch_trunk_row requested={raw_trunk_id!r} normalized={trunk_id_text!r} "
+            f"numeric={trunk_id_int} found={'yes' if row else 'no'}"
+        )
         if row and self.is_outbound_trunk_row(row):
             row["servers"] = [clean for clean in (self.clean_trunk_server(item) for item in self.parse_servers_json(row.get("servers_json"))[:8]) if clean]
         return row
@@ -1487,16 +1506,14 @@ class SipServer:
     def trunk_user_agent(self, headers):
         return self.get_first(headers, "User-Agent") or self.get_first(headers, "Server") or "Unknown"
 
-    def mark_authorized_trunk_seen(self, method, ipaddr, headers, transport="udp"):
+    def mark_authorized_trunk_seen(self, method, ipaddr, headers):
         user_agent = self.trunk_user_agent(headers)
         if auth.auth_ip(ipaddr):
             auth.update_trunk_status_by_ip(ipaddr, f"Online, '{user_agent}'")
             return
         username = self.extract_username_from_auth(headers)
         if username and self.ip_allowed(method, ipaddr, headers=headers):
-            status = f"{ipaddr}, '{user_agent}'"
-            auth.update_trunk_status_by_user(username, status)
-            self.update_authenticated_trunk_row(username, status=status, connected_server=ipaddr, connected_transport=transport)
+            auth.update_trunk_status_by_user(username, f"{ipaddr}, '{user_agent}'")
 
     def sip_trunk_hold_behavior(self, ipaddr, headers):
         behavior_columns = ("holdbehabior", "hold-behavipr", "holdbehavior", "holdbehaviour", "hold-behavior")
@@ -1703,42 +1720,16 @@ class SipServer:
             return match.group(1).strip()
         if "," in raw:
             raw = raw.split(",", 1)[0].strip()
-        if raw.lower().startswith(("sip:", "sips:", "tel:")):
-            return raw.split(";", 1)[0].strip()
-        return raw
+        return raw.split(";", 1)[0].strip() if raw.lower().startswith("sip:") else raw
 
     def request_user_from_uri(self, uri):
         raw_uri = self.sip_uri_from_header(uri)
         if not raw_uri:
             return ""
         target = re.sub(r'^sips?:', '', raw_uri, flags=re.IGNORECASE)
-        target = re.sub(r'^tel:', '', target, flags=re.IGNORECASE)
         user_part = target.rsplit("@", 1)[0] if "@" in target else target
         user_part = user_part.split(";", 1)[0].strip()
         return urllib.parse.unquote(user_part)
-
-    def called_extension_from_invite(self, uri, headers):
-        candidates = []
-        for header_name in (
-            "P-Called-Party-ID",
-            "X-Original-To",
-            "X-Called-Number",
-            "History-Info",
-            "Diversion",
-            "To",
-        ):
-            for value in self.get_all(headers, header_name):
-                candidate = self.request_user_from_uri(value)
-                if candidate:
-                    candidates.append(candidate)
-        request_user = self.request_user_from_uri(uri)
-        if request_user:
-            candidates.append(request_user)
-        for candidate in candidates:
-            normalized = str(candidate or "").strip()
-            if normalized:
-                return normalized
-        return ""
 
     def parse_sip_target(self, value, fallback_ip=None, fallback_port=5060, fallback_transport="udp"):
         uri = self.sip_uri_from_header(value)
@@ -2270,37 +2261,6 @@ class SipServer:
                     cur.execute(
                         f"UPDATE `sip-trunks` SET {', '.join(assignments)} WHERE `id`=%s",
                         tuple(params + [trunk_id]),
-                    )
-            finally:
-                conn.close()
-        except Exception:
-            pass
-
-    def update_authenticated_trunk_row(self, username, status=None, connected_server=None, connected_transport=None):
-        wanted = str(username or "").strip()
-        if not wanted:
-            return
-        try:
-            existing = self.table_columns("sip-trunks")
-            assignments = []
-            params = []
-            if status is not None and "status" in existing:
-                assignments.append("`status`=%s")
-                params.append(str(status or "").strip() or "Offline")
-            if connected_server is not None and "connected_server" in existing:
-                assignments.append("`connected_server`=%s")
-                params.append(str(connected_server or "").strip())
-            if connected_transport is not None and "connected_transport" in existing:
-                assignments.append("`connected_transport`=%s")
-                params.append(str(connected_transport or "").strip())
-            if not assignments:
-                return
-            conn = self.connect_db()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        f"UPDATE `sip-trunks` SET {', '.join(assignments)} WHERE `auth`='USERPASS' AND `username`=%s",
-                        tuple(params + [wanted]),
                     )
             finally:
                 conn.close()
@@ -3297,11 +3257,12 @@ class SipServer:
     def choose_outbound_route(self, trunk):
         auth_type = str(trunk.get("auth") or "").upper()
         trunk_type = str(trunk.get("trunk_type") or "").upper()
+        servers = trunk.get("servers") or []
+        if not servers:
+            servers = [clean for clean in (self.clean_trunk_server(item) for item in self.parse_servers_json(trunk.get("servers_json"))[:8]) if clean]
+            if servers:
+                trunk["servers"] = servers
         if not self.is_outbound_trunk_row(trunk) and (auth_type == "IP" or trunk_type == "IP" or trunk_type == "INBOUND_AUTH" or auth_type == "USERPASS"):
-            host = str(trunk.get("connected_server") or "").strip()
-            transport = str(trunk.get("connected_transport") or "udp").strip().lower() or "udp"
-            if host:
-                return {"host": host, "port": 5061 if transport == "tls" else 5060, "transport": transport}, None
             host = str(trunk.get("ipaddr") or "").strip()
             if not host or host == "0.0.0.0":
                 return None, None
@@ -3310,14 +3271,23 @@ class SipServer:
             state = self.outbound_trunks.get(str(trunk.get("id")))
         if state and state.get("active_route"):
             return dict(state["active_route"]), state
-        for server_row in trunk.get("servers") or []:
+        for server_row in servers:
             routes = self.resolve_trunk_server_routes(server_row)
             if routes:
                 return dict(routes[0]), state
         return None, state
 
-    def place_outbound_call(self, trunk_id, number, caller_id_number="", caller_id_name="", alert_info_value="", custom_headers=None, answer_timeout=45):
+    def place_outbound_call(self, trunk_id, number, caller_id_number="", caller_id_name="", alert_info_value="", custom_headers=None, answer_timeout=45, trunk_fallback=None):
         trunk = self.fetch_trunk_row(trunk_id)
+        if not trunk and isinstance(trunk_fallback, dict):
+            trunk = dict(trunk_fallback)
+            trunk["id"] = str(trunk.get("id") or trunk_id).strip()
+            if self.is_outbound_trunk_row(trunk):
+                trunk["servers"] = [clean for clean in (self.clean_trunk_server(item) for item in self.parse_servers_json(trunk.get("servers_json"))[:8]) if clean]
+            sip_debug(
+                f"place_outbound_call using_fallback trunk_id={trunk.get('id')} "
+                f"auth={trunk.get('auth')} trunk_type={trunk.get('trunk_type')}"
+            )
         if not trunk:
             raise RuntimeError("SIP trunk not found")
         route, state = self.choose_outbound_route(trunk)
@@ -3852,9 +3822,9 @@ class SipServer:
             nonce = uuid.uuid4().hex
             return self.build_response(headers, "401 Unauthorized", extra_headers=[f'WWW-Authenticate: Digest realm="OpenPagingServer", nonce="{nonce}", algorithm=MD5, qop="auth"'])
         if not trusted:
-            self.mark_authorized_trunk_seen(method, source_ip, headers, transport=transport)
+            self.mark_authorized_trunk_seen(method, source_ip, headers)
         nat_mode = self.sip_nat_mode()
-        user = self.called_extension_from_invite(uri, headers)
+        user = self.request_user_from_uri(uri)
         
         db_status, trigger, passcode = self.get_endpoint_trigger(user)
 
@@ -4113,7 +4083,7 @@ class SipServer:
             return None
             
         if method == "OPTIONS":
-            self.mark_authorized_trunk_seen("OPTIONS", addr[0], headers, transport=transport)
+            self.mark_authorized_trunk_seen("OPTIONS", addr[0], headers)
             response = self.build_response(headers, "200 OK")
         elif method == "REGISTER":
             if self.ip_allowed("REGISTER", addr[0], headers=headers):
@@ -4141,14 +4111,11 @@ class SipServer:
                     if expires_int > 0:
                         with self.lock:
                             self.registrations[username] = time.time() + expires_int
-                        status = f"{addr[0]}, '{user_agent}'"
-                        auth.update_trunk_status_by_user(username, status)
-                        self.update_authenticated_trunk_row(username, status=status, connected_server=addr[0], connected_transport=transport)
+                        auth.update_trunk_status_by_user(username, f"{addr[0]}, '{user_agent}'")
                     else:
                         with self.lock:
                             self.registrations.pop(username, None)
                         auth.update_trunk_status_by_user(username, "Offline")
-                        self.update_authenticated_trunk_row(username, status="Offline", connected_server="", connected_transport="")
             else:
                 if self.note_unauthorized_attempt(addr[0], "REGISTER", conn=conn):
                     response = None
@@ -4450,7 +4417,6 @@ class SipServer:
                         del self.registrations[user]
             for user in expired_users:
                 auth.update_trunk_status_by_user(user, "Offline")
-                self.update_authenticated_trunk_row(user, status="Offline", connected_server="", connected_transport="")
 
             timed_out_pings = []
             with self.lock:
