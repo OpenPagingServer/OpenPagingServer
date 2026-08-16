@@ -20,11 +20,15 @@ import tarfile
 import tempfile
 import threading
 import time
+import subprocess
+import urllib.error
+import urllib.request
 import uuid
 import wave
 import xml.etree.ElementTree as ET
+import ast
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta as _timedelta
 from pathlib import Path, PurePosixPath
 
 try:
@@ -48,14 +52,51 @@ from active_broadcast_store import (
     list_pending_active_broadcast_ids,
     mark_active_broadcast_delivery,
     put_active_broadcast,
+    request_active_broadcast_stop,
 )
 from group_features import fetch_group_rows, record_is_bell, record_is_immediate, regular_group_targets
 from tts import decode_tts_token, iter_tts_ffmpeg_chunks, split_audio_entries
 from multicastgatewayd import encode_local_source_packet
+try:
+    from sip.codec import (
+        SIP_CODEC_PAYLOADS as SIP_EDGE_CODEC_PAYLOADS,
+        encode_sip_rtp_payload as encode_edge_rtp_payload,
+        decode_sip_rtp_payload as decode_edge_rtp_payload,
+    )
+except ImportError:
+    SIP_EDGE_CODEC_PAYLOADS = {
+        "PCMU": {"payload_type": 0, "samples_per_frame": 160},
+        "PCMA": {"payload_type": 8, "samples_per_frame": 160},
+        "G722": {"payload_type": 9, "samples_per_frame": 160, "sample_rate_wire": 16000},
+        "OPUS": {"payload_type": 111, "samples_per_frame": 960},
+        "G7221C": {"payload_type": 121, "samples_per_frame": 640, "sample_rate_wire": 32000},
+        "G726-32": {"payload_type": 2, "samples_per_frame": 160},
+    }
+
+    def encode_edge_rtp_payload(codec_name, payload, encoder_state=None):
+        frame = bytes(payload or b"")[:160].ljust(160, b"\xff")
+        if str(codec_name or "").upper() == "PCMA":
+            return frame.translate(ULAW_TO_ALAW_TABLE), encoder_state
+        return frame, encoder_state
+
+    def decode_edge_rtp_payload(codec_name, payload, decoder_state=None):
+        # Fallback decoder used only when sip.codec is unavailable. Normalizes
+        # inbound RTP payloads to u-law bytes so AMD analysis works on the
+        # codecs we can decode without native libraries (PCMU/PCMA); other
+        # codecs return empty so AMD simply skips those frames.
+        data = bytes(payload or b"")
+        codec = str(codec_name or "").upper()
+        if codec == "PCMA":
+            return data.translate(ALAW_TO_ULAW_TABLE), decoder_state
+        if codec in ("", "PCMU"):
+            return data, decoder_state
+        return b"", decoder_state
 
 try:
-    from broadcasts import is_audio_type, message_expiration_is_immediate
+    from broadcasts import expand_message_variables, is_audio_type, message_expiration_is_immediate
 except Exception:
+    def expand_message_variables(text, _cursor, sender="", sender_context=None, now=None, api_cache=None, product_name=""):
+        return str(text or "")
     def is_audio_type(value):
         return str(value or "").strip() in ("audio", "text+audio", "liveaudio", "liveaudio+text", "AudioMessage", "Text+AudioMessage", "Page")
     def message_expiration_is_immediate(value):
@@ -129,6 +170,8 @@ server_socket = None
 thirdparty_warning_keys = set()
 siptrunks_runtime = None
 multicast_rtp_runtime = None
+http_request_runtime = None
+service_monitor_runtime = None
 multicast_gateway_source_sock = None
 multicast_gateway_source_lock = threading.Lock()
 multicast_gateway_source_next_retry = 0.0
@@ -175,6 +218,14 @@ def init(core_obj):
         ensure_multicast_rtp_schema()
     except Exception as exc:
         log(f"multicast rtp schema init error: {exc}")
+    try:
+        ensure_httprequest_schema()
+    except Exception as exc:
+        log(f"http request schema init error: {exc}")
+    try:
+        ensure_servicemonitor_schema()
+    except Exception as exc:
+        log(f"service monitor schema init error: {exc}")
     ensure_builtin_modules_loaded()
     threading.Thread(target=start_ipc_server, daemon=True).start()
     threading.Thread(target=broadcast_watcher_loop, daemon=True).start()
@@ -854,19 +905,106 @@ MULTICAST_RTP_TABLE = "endpoints-output-multicastrtp"
 MULTICAST_RTP_NAME = "Multicast RTP"
 MULTICAST_RTP_DESCRIPTION = "Send a plain old multicast RTP stream. The vast majority of SME VoIP phones and speakers can subscribe to and accept to these."
 MULTICAST_RTP_WARNING = "Open Paging Server is unable to guarantee the delivery of audio to endpoints. Ensure that every single device subscribed to a multicast stream is able to reliably receive audio before beginning production use. Multicast packets are not transmitted over WAN and most VPN tunnels. In such a case you will need a multicast gateway."
-MULTICAST_RTP_CODECS = {"PCMU": 0, "PCMA": 8}
+MULTICAST_RTP_CODECS = {"PCMU": 0, "PCMA": 8, "G722": 9, "OPUS": 111, "G7221C": 121, "G726-32": 2}
 MULTICAST_RTP_DEFAULT_PACKET_MS = 20
 MULTICAST_RTP_MIN_PACKET_MS = 20
 MULTICAST_RTP_MAX_PACKET_MS = 200
 MULTICAST_RTP_FRAME_MS = 20
 MULTICAST_RTP_FRAME_SIZE = 160
-MULTICAST_RTP_READY_SILENCE_FRAMES = 3
+# When the codec changes on a live channel, stop the stream for this long
+# before rebuilding the RTP sender so listeners cleanly re-sync.
+MULTICAST_RTP_CODEC_RESTART_SECONDS = 5.0
+# Number of preroll frames the multicast channel streams before the source is
+# reported ready. Matches the original 60 ms priming (3 * 20 ms) so calls are
+# answered immediately; tunable via env for sites whose devices need more
+# settling time.
+try:
+    MULTICAST_RTP_READY_SILENCE_FRAMES = max(1, int(os.getenv("OPS_MULTICAST_PREROLL_FRAMES", "3")))
+except (TypeError, ValueError):
+    MULTICAST_RTP_READY_SILENCE_FRAMES = 3
 MULTICAST_RTP_IDLE_SECONDS = 1.0
+# Standby (background audio) configuration for a multicast stream. Controls what
+# the stream emits while no message/livepage is in effect.
+MULTICAST_RTP_STANDBY_MODES = ("stop", "rebroadcast", "silence")
+MULTICAST_RTP_STANDBY_MSG_ACTIONS = ("keep", "stop", "silence", "emergency")
+MULTICAST_RTP_MAX_STANDBY_SOURCES = 250
+MULTICAST_RTP_STANDBY_SOURCE_PLACEHOLDER = (
+    "ex: https://radio.example.com/stream.mp3, rtp://239.255.0.1:2000, rtp://10.0.0.10:5004"
+)
+# Per-endpoint gain (dB) applied to the standby background audio. Each field is
+# either an integer dB value in [MIN, MAX] or the string "mute" (background
+# silenced). "on message/page/bell" duck the background while a broadcast of
+# that class is in effect; the master field applies at all times.
+MULTICAST_RTP_AMP_MIN_DB = -40
+MULTICAST_RTP_AMP_MAX_DB = 20
+MULTICAST_RTP_AMP_DEFAULTS = {
+    "amp_master": "0",
+    "amp_page": "-10",
+    "amp_bell": "0",
+    "amp_message": "mute",
+}
+MESSAGE_PRIORITY_ORDER = {"Low": 0, "Normal": 1, "High": 2, "Emergency": 3}
 # How far ahead of real time deliver_broadcast feeds endpoint modules; this
 # jitter cushion keeps the self-pacing RTP senders from underrunning.
 MULTICAST_DELIVERY_LEAD_SECONDS = max(0.0, float(os.getenv("MULTICAST_DELIVERY_LEAD_SECONDS", "0.3")))
 MULTICAST_GATEWAY_HOST = os.getenv("OPS_MULTICAST_GATEWAY_HOST", "127.0.0.1")
 MULTICAST_GATEWAY_PORT = int(os.getenv("OPS_MULTICAST_GATEWAY_PORT", "8710"))
+HTTP_REQUEST_MODULE = "httprequest"
+HTTP_REQUEST_TABLE = "endpoints-output-httprequest"
+HTTP_REQUEST_NAME = "HTTP Request"
+HTTP_REQUEST_DESCRIPTION = "Send messages via HTTP requests"
+HTTP_REQUEST_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD")
+HTTP_REQUEST_AUTH_TYPES = {"none", "basic", "digest", "apikey"}
+HTTP_REQUEST_DEFAULT_TIMEOUT = 30
+HTTP_REQUEST_VARIABLE_RE = re.compile(r"\$\{(shortmessage|longmessage|color)(?::([^}]+))?\}", re.IGNORECASE)
+SERVICE_MONITOR_MODULE = "servicemonitor"
+SERVICE_MONITOR_TABLE = "endpoints-input-servicemonitor"
+SERVICE_MONITOR_NAME = "Service Monitor"
+SERVICE_MONITOR_DESCRIPTION = "Get notified when a service goes down"
+SERVICE_MONITOR_TYPES = ("ping", "tcp", "http", "sip", "uptimekuma")
+SERVICE_MONITOR_TYPE_LABELS = {
+    "ping": "Ping",
+    "tcp": "TCP Port",
+    "http": "HTTP(s)",
+    "sip": "SIP OPTIONS",
+    "uptimekuma": "Uptime Kuma",
+}
+SERVICE_MONITOR_DEFAULT_INTERVAL = 60
+SERVICE_MONITOR_MIN_INTERVAL = 5
+SERVICE_MONITOR_MAX_INTERVAL = 86400
+SERVICE_MONITOR_DEFAULT_RETRIES = 5
+SERVICE_MONITOR_MIN_RETRIES = 0
+SERVICE_MONITOR_MAX_RETRIES = 4096
+# Grace window (seconds) after the monitor module boots during which probe
+# failures are absorbed instead of latching a monitor offline or firing a
+# "went down" alert. Startup load (SIP/DB/network stack still initialising) can
+# make even a healthy host miss a ping, which on a 0-retry monitor would
+# otherwise blast a false "server is down" broadcast seconds after boot. A down
+# that genuinely begins during this window is not missed: it simply alerts once
+# the window elapses and the failure is still present.
+SERVICE_MONITOR_STARTUP_GRACE_SECONDS = 15
+SERVICE_MONITOR_DEFAULT_WAIT_FOR_UP = 0
+SERVICE_MONITOR_MIN_WAIT_FOR_UP = 0
+SERVICE_MONITOR_MAX_WAIT_FOR_UP = 86400
+SERVICE_MONITOR_DOWN_DEFAULTS_AUDIO = "OPS-ShortBlip10Second-400Tria.wav"
+# Preferred default audio per direction, tried in order; the first file that
+# exists in the asset library is used, otherwise no audio file is inserted.
+SERVICE_MONITOR_DOWN_AUDIO_CANDIDATES = (
+    "OPS-ShortBlip10Second-400Tria.wav",
+    "OPS-400HZ-MedPulse.wav",
+)
+SERVICE_MONITOR_UP_AUDIO_CANDIDATES = (
+    "OPS-DualChime.wav",
+    "OPS-900HZ-SlowPulse.wav",
+)
+# HTTP failure token choices. "noresponse" and the 4xx/5xx families are the
+# defaults; individual status codes can also be selected.
+SERVICE_MONITOR_HTTP_FAIL_TOKENS = ("noresponse", "4xx", "5xx")
+SERVICE_MONITOR_HTTP_DEFAULT_FAIL = ["noresponse", "4xx", "5xx"]
+SERVICE_MONITOR_HTTP_CODE_CHOICES = (
+    400, 401, 403, 404, 405, 408, 409, 410, 429,
+    500, 501, 502, 503, 504, 505,
+)
 
 
 def linear_to_alaw(sample):
@@ -960,6 +1098,26 @@ def _build_linear_to_ulaw_table():
 
 LINEAR_TO_ULAW_TABLE = _build_linear_to_ulaw_table()
 
+
+def _build_alaw_to_ulaw_table():
+    values = []
+    for index in range(256):
+        alaw = index ^ 0x55
+        sign = alaw & 0x80
+        exponent = (alaw >> 4) & 0x07
+        mantissa = alaw & 0x0F
+        sample = (mantissa << 4) + 8
+        if exponent > 0:
+            sample += 0x100
+            sample <<= (exponent - 1)
+        if not sign:
+            sample = -sample
+        values.append(linear_to_ulaw(sample))
+    return bytes(values)
+
+
+ALAW_TO_ULAW_TABLE = _build_alaw_to_ulaw_table()
+
 ULAW_TO_PCM16LE_TABLE = tuple(
     struct.pack("<h", int(sample)) for sample in ULAW_TO_LINEAR_TABLE
 )
@@ -991,6 +1149,22 @@ def multicast_priority_value(metadata):
         return "Normal"
     priority = str(metadata.get("priority") or "Normal").strip().title()
     return priority if priority in VALID_MESSAGE_PRIORITIES else "Normal"
+
+
+def multicast_broadcast_class(action, metadata):
+    """Classify a dispatch as 'page', 'bell' or 'message' so standby background
+    ducking can pick the matching amplify setting."""
+    if action == "prepare_livepage":
+        return "page"
+    meta = metadata if isinstance(metadata, dict) else {}
+    msg_type = str(meta.get("type") or "").strip().lower()
+    if msg_type in ("page", "liveaudio"):
+        return "page"
+    sender = str(meta.get("sender") or "").strip().lower()
+    template_id = str(meta.get("template_id") or "").strip().lower()
+    if sender == "belld" or template_id.startswith("bell-"):
+        return "bell"
+    return "message"
 
 
 def default_ipv4_multicast_interface():
@@ -1201,6 +1375,17 @@ def ensure_multicast_rtp_schema():
                 "`port` INT NOT NULL DEFAULT 0, "
                 "`codec` VARCHAR(8) NOT NULL DEFAULT 'PCMU', "
                 "`packet_ms` INT NOT NULL DEFAULT 20, "
+                "`standby_mode` VARCHAR(16) NOT NULL DEFAULT 'stop', "
+                "`standby_sources` MEDIUMTEXT NULL, "
+                "`standby_msg_action` VARCHAR(16) NOT NULL DEFAULT 'stop', "
+                "`standby_msg_priority` VARCHAR(12) NOT NULL DEFAULT 'Emergency', "
+                "`emergency_sources` MEDIUMTEXT NULL, "
+                "`amp_master` VARCHAR(8) NOT NULL DEFAULT '0', "
+                "`amp_page` VARCHAR(8) NOT NULL DEFAULT '-10', "
+                "`amp_bell` VARCHAR(8) NOT NULL DEFAULT '0', "
+                "`amp_message` VARCHAR(8) NOT NULL DEFAULT 'mute', "
+                "`mute_priority_enabled` TINYINT(1) NOT NULL DEFAULT 0, "
+                "`mute_priority` VARCHAR(12) NOT NULL DEFAULT 'High', "
                 "PRIMARY KEY (`id`), UNIQUE KEY `address_port_unique` (`address`, `port`)"
                 ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci"
             )
@@ -1211,6 +1396,17 @@ def ensure_multicast_rtp_schema():
                 "port": "`port` INT NOT NULL DEFAULT 0",
                 "codec": "`codec` VARCHAR(8) NOT NULL DEFAULT 'PCMU'",
                 "packet_ms": "`packet_ms` INT NOT NULL DEFAULT 20",
+                "standby_mode": "`standby_mode` VARCHAR(16) NOT NULL DEFAULT 'stop'",
+                "standby_sources": "`standby_sources` MEDIUMTEXT NULL",
+                "standby_msg_action": "`standby_msg_action` VARCHAR(16) NOT NULL DEFAULT 'stop'",
+                "standby_msg_priority": "`standby_msg_priority` VARCHAR(12) NOT NULL DEFAULT 'Emergency'",
+                "emergency_sources": "`emergency_sources` MEDIUMTEXT NULL",
+                "amp_master": "`amp_master` VARCHAR(8) NOT NULL DEFAULT '0'",
+                "amp_page": "`amp_page` VARCHAR(8) NOT NULL DEFAULT '-10'",
+                "amp_bell": "`amp_bell` VARCHAR(8) NOT NULL DEFAULT '0'",
+                "amp_message": "`amp_message` VARCHAR(8) NOT NULL DEFAULT 'mute'",
+                "mute_priority_enabled": "`mute_priority_enabled` TINYINT(1) NOT NULL DEFAULT 0",
+                "mute_priority": "`mute_priority` VARCHAR(12) NOT NULL DEFAULT 'High'",
             }
             for column, sql in additions.items():
                 if column not in columns:
@@ -1261,16 +1457,245 @@ def multicast_rtp_clean_packet_ms(value):
     return packet_ms
 
 
+def multicast_rtp_clean_standby_mode(value):
+    mode = str(value or "stop").strip().lower()
+    if mode not in MULTICAST_RTP_STANDBY_MODES:
+        raise ValueError("Choose a valid standby behaviour.")
+    return mode
+
+
+def multicast_rtp_clean_msg_action(value):
+    action = str(value or "stop").strip().lower()
+    if action not in MULTICAST_RTP_STANDBY_MSG_ACTIONS:
+        raise ValueError("Choose a valid standby message action.")
+    return action
+
+
+def multicast_rtp_gain_options(selected):
+    """Build <option> markup for an amplify dropdown: Mute at the top, then
+    +20 dB down to -40 dB."""
+    selected = str(selected or "0").strip().lower()
+    opts = [f'<option value="mute"{" selected" if selected == "mute" else ""}>Mute</option>']
+    for db in range(MULTICAST_RTP_AMP_MAX_DB, MULTICAST_RTP_AMP_MIN_DB - 1, -1):
+        if db > 0:
+            label = f"+{db} dB"
+        elif db < 0:
+            label = f"{db} dB"
+        else:
+            label = "0 dB"
+        is_sel = selected == str(db)
+        opts.append(f'<option value="{db}"{" selected" if is_sel else ""}>{label}</option>')
+    return "".join(opts)
+
+
+def multicast_rtp_clean_msg_priority(value):
+    priority = str(value or "High").strip().title()
+    if priority not in VALID_MESSAGE_PRIORITIES:
+        raise ValueError("Choose a valid message priority.")
+    return priority
+
+
+def multicast_rtp_clean_gain(value, default="0"):
+    """Normalize an amplify field to either 'mute' or a clamped integer dB
+    string. Falls back to ``default`` for blank/garbage input."""
+    raw = str(value if value not in (None, "") else default).strip().lower()
+    if raw == "mute":
+        return "mute"
+    try:
+        db = int(round(float(raw)))
+    except (TypeError, ValueError):
+        raw = str(default).strip().lower()
+        if raw == "mute":
+            return "mute"
+        try:
+            db = int(round(float(raw)))
+        except (TypeError, ValueError):
+            db = 0
+    db = max(MULTICAST_RTP_AMP_MIN_DB, min(MULTICAST_RTP_AMP_MAX_DB, db))
+    return str(db)
+
+
+def multicast_rtp_gain_factor(spec):
+    """Return a linear amplitude multiplier for an amplify spec. 'mute' -> 0.0,
+    0 dB -> 1.0."""
+    if spec == "mute":
+        return 0.0
+    try:
+        db = float(spec)
+    except (TypeError, ValueError):
+        return 1.0
+    return 10.0 ** (db / 20.0)
+
+
+def multicast_rtp_combine_gain(a, b):
+    """Sum two gain specs (dB) into one clamped spec; 'mute' is absorbing."""
+    if a == "mute" or b == "mute":
+        return "mute"
+    try:
+        total = int(round(float(a))) + int(round(float(b)))
+    except (TypeError, ValueError):
+        total = 0
+    total = max(MULTICAST_RTP_AMP_MIN_DB, min(MULTICAST_RTP_AMP_MAX_DB, total))
+    return str(total)
+
+
+def apply_gain_ulaw_frame(frame, spec):
+    """Apply a gain spec to a u-law frame, returning a new u-law frame. Fast
+    paths for the common no-op (0 dB) and mute cases."""
+    if spec == "mute":
+        return MULTICAST_RTP_SILENCE_FRAME
+    if spec in (None, "0", 0):
+        return frame
+    factor = multicast_rtp_gain_factor(spec)
+    if factor == 1.0:
+        return frame
+    if factor == 0.0:
+        return MULTICAST_RTP_SILENCE_FRAME
+    out = bytearray(len(frame))
+    for i in range(len(frame)):
+        sample = int(ULAW_TO_LINEAR_TABLE[frame[i]] * factor)
+        if sample > 32767:
+            sample = 32767
+        elif sample < -32768:
+            sample = -32768
+        out[i] = LINEAR_TO_ULAW_TABLE[sample & 0xFFFF]
+    return bytes(out)
+
+
+def multicast_rtp_parse_source(url):
+    """Parse a single background audio source string into a descriptor.
+
+    Accepts http(s) URLs and rtp://host:port addresses. Returns a dict with a
+    ``kind`` of ``http``, ``multicast`` or ``unicast`` plus the normalized
+    ``url``. Raises ValueError on anything that isn't a supported source.
+    """
+    raw = str(url or "").strip()
+    if not raw:
+        raise ValueError("Enter a stream URL.")
+    lowered = raw.lower()
+    if lowered.startswith("http://") or lowered.startswith("https://"):
+        return {"kind": "http", "url": raw, "host": "", "port": 0}
+    if lowered.startswith("rtp://"):
+        rest = raw[6:]
+        rest = rest.split("/", 1)[0]
+        if rest.startswith("["):
+            host, _, tail = rest[1:].partition("]")
+            port_part = tail[1:] if tail.startswith(":") else ""
+        else:
+            host, _, port_part = rest.partition(":")
+        host = host.strip()
+        port_part = port_part.strip()
+        if not host or not port_part:
+            raise ValueError("Enter an rtp:// address as rtp://host:port.")
+        try:
+            port = int(port_part)
+        except ValueError as exc:
+            raise ValueError("Enter a valid rtp:// port.") from exc
+        if port < 1 or port > 65535:
+            raise ValueError("Enter a valid rtp:// port.")
+        kind = "unicast"
+        try:
+            ip = ipaddress.ip_address(host)
+            if ip.is_multicast:
+                kind = "multicast"
+        except ValueError:
+            kind = "unicast"
+        return {"kind": kind, "url": raw, "host": host, "port": port}
+    raise ValueError("Enter an http(s) URL or rtp://host:port address.")
+
+
+def multicast_rtp_clean_source_list(value):
+    """Normalize a background source list (JSON array or newline text) into a
+    validated list of source URL strings (highest priority first)."""
+    items = []
+    if isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        text = str(value or "").strip()
+        if text:
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    items = parsed
+                else:
+                    items = [text]
+            except (ValueError, TypeError):
+                items = [line for line in text.splitlines()]
+    cleaned = []
+    for item in items:
+        if isinstance(item, dict):
+            item = item.get("url")
+        url = str(item or "").strip()
+        if not url:
+            continue
+        multicast_rtp_parse_source(url)
+        cleaned.append(url)
+        if len(cleaned) >= MULTICAST_RTP_MAX_STANDBY_SOURCES:
+            break
+    return cleaned
+
+
+def multicast_rtp_unicast_port_in_use(port):
+    """Best-effort check whether a UDP port can be bound locally. Used to warn
+    when a unicast RTP background source targets a port already in use."""
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return False
+    if port < 1 or port > 65535:
+        return False
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("0.0.0.0", port))
+        return False
+    except OSError:
+        return True
+    finally:
+        sock.close()
+
+
+def multicast_rtp_standby_port_conflicts(source_urls):
+    conflicts = []
+    for url in source_urls or []:
+        try:
+            parsed = multicast_rtp_parse_source(url)
+        except ValueError:
+            continue
+        if parsed["kind"] == "unicast" and multicast_rtp_unicast_port_in_use(parsed["port"]):
+            conflicts.append(parsed["port"])
+    return conflicts
+
+
 def multicast_rtp_clean_values(values):
     name = str(values.get("name") or "").strip()
     if not name:
         raise ValueError("Name is required.")
+    standby_mode = multicast_rtp_clean_standby_mode(values.get("standby_mode"))
+    standby_sources = multicast_rtp_clean_source_list(values.get("standby_sources"))
+    msg_action = multicast_rtp_clean_msg_action(values.get("standby_msg_action"))
+    emergency_sources = multicast_rtp_clean_source_list(values.get("emergency_sources"))
+    if standby_mode == "rebroadcast" and not standby_sources:
+        raise ValueError("Add at least one background audio source.")
+    if standby_mode == "rebroadcast" and msg_action == "emergency" and not emergency_sources:
+        raise ValueError("Add at least one emergency stream.")
     return {
         "name": name,
         "address": multicast_rtp_normalize_address(values.get("address")),
         "port": multicast_rtp_clean_port(values.get("port"), require_even=True),
         "codec": multicast_rtp_clean_codec(values.get("codec")),
         "packet_ms": multicast_rtp_clean_packet_ms(values.get("packet_ms")),
+        "standby_mode": standby_mode,
+        "standby_sources": json.dumps(standby_sources),
+        "standby_msg_action": multicast_rtp_clean_msg_action(values.get("standby_msg_action")),
+        "standby_msg_priority": multicast_rtp_clean_msg_priority(values.get("standby_msg_priority")),
+        "emergency_sources": json.dumps(emergency_sources),
+        "amp_master": multicast_rtp_clean_gain(values.get("amp_master"), MULTICAST_RTP_AMP_DEFAULTS["amp_master"]),
+        "amp_page": multicast_rtp_clean_gain(values.get("amp_page"), MULTICAST_RTP_AMP_DEFAULTS["amp_page"]),
+        "amp_bell": multicast_rtp_clean_gain(values.get("amp_bell"), MULTICAST_RTP_AMP_DEFAULTS["amp_bell"]),
+        "amp_message": multicast_rtp_clean_gain(values.get("amp_message"), MULTICAST_RTP_AMP_DEFAULTS["amp_message"]),
+        "mute_priority_enabled": 1 if str(values.get("mute_priority_enabled") or "").strip().lower() in ("1", "on", "true", "yes") else 0,
+        "mute_priority": multicast_rtp_clean_msg_priority(values.get("mute_priority")),
     }
 
 
@@ -1282,24 +1707,61 @@ def multicast_rtp_form_values(form, row=None):
         "port": str(row.get("port") or ""),
         "codec": multicast_rtp_clean_codec(row.get("codec") or "PCMU"),
         "packet_ms": str(row.get("packet_ms") or MULTICAST_RTP_DEFAULT_PACKET_MS),
+        "standby_mode": str(row.get("standby_mode") or "stop"),
+        "standby_sources": json.dumps(multicast_rtp_clean_source_list(row.get("standby_sources"))) if row else "[]",
+        "standby_msg_action": str(row.get("standby_msg_action") or "stop"),
+        "standby_msg_priority": str(row.get("standby_msg_priority") or "Emergency"),
+        "emergency_sources": json.dumps(multicast_rtp_clean_source_list(row.get("emergency_sources"))) if row else "[]",
+        "amp_master": multicast_rtp_clean_gain(row.get("amp_master"), MULTICAST_RTP_AMP_DEFAULTS["amp_master"]),
+        "amp_page": multicast_rtp_clean_gain(row.get("amp_page"), MULTICAST_RTP_AMP_DEFAULTS["amp_page"]),
+        "amp_bell": multicast_rtp_clean_gain(row.get("amp_bell"), MULTICAST_RTP_AMP_DEFAULTS["amp_bell"]),
+        "amp_message": multicast_rtp_clean_gain(row.get("amp_message"), MULTICAST_RTP_AMP_DEFAULTS["amp_message"]),
+        "mute_priority_enabled": "1" if str(row.get("mute_priority_enabled") or "0").strip() in ("1", "on", "true", "yes", "True") else "0",
+        "mute_priority": str(row.get("mute_priority") or "High"),
     }
-    return {key: str(form.get(key, defaults[key]) if form is not None else defaults[key]).strip() for key in defaults}
+    result = {key: str(form.get(key, defaults[key]) if form is not None else defaults[key]).strip() for key in defaults}
+    if form is not None:
+        # An unchecked checkbox is simply absent from the POST body; treat that
+        # as disabled so the toggle can actually be turned off.
+        result["mute_priority_enabled"] = "1" if str(form.get("mute_priority_enabled") or "").strip() else "0"
+    return result
+
+
+MULTICAST_RTP_COLUMNS = (
+    "`id`, `name`, `address`, `port`, `codec`, `packet_ms`, "
+    "`standby_mode`, `standby_sources`, `standby_msg_action`, "
+    "`standby_msg_priority`, `emergency_sources`, "
+    "`amp_master`, `amp_page`, `amp_bell`, `amp_message`, "
+    "`mute_priority_enabled`, `mute_priority`"
+)
 
 
 def multicast_rtp_rows():
     ensure_multicast_rtp_schema()
     return sip_query_all(
-        f"SELECT `id`, `name`, `address`, `port`, `codec`, `packet_ms` FROM `{MULTICAST_RTP_TABLE}` ORDER BY `name` ASC, `id` ASC"
+        f"SELECT {MULTICAST_RTP_COLUMNS} FROM `{MULTICAST_RTP_TABLE}` ORDER BY `name` ASC, `id` ASC"
     )
 
 
 def multicast_rtp_row(row_id):
     ensure_multicast_rtp_schema()
     rows = sip_query_all(
-        f"SELECT `id`, `name`, `address`, `port`, `codec`, `packet_ms` FROM `{MULTICAST_RTP_TABLE}` WHERE id=%s LIMIT 1",
+        f"SELECT {MULTICAST_RTP_COLUMNS} FROM `{MULTICAST_RTP_TABLE}` WHERE id=%s LIMIT 1",
         (row_id,),
     )
     return rows[0] if rows else None
+
+
+def multicast_rtp_notify_config_changed():
+    """Best-effort nudge so the runtime reconciles standby broadcasters after a
+    config change. Safe to call from the web process where the runtime module
+    is not loaded (the runtime also reconciles from the DB periodically)."""
+    runtime = globals().get("multicast_rtp_runtime")
+    if runtime is not None and hasattr(runtime, "reconcile_standby"):
+        try:
+            runtime.reconcile_standby()
+        except Exception as exc:
+            log(f"multicast rtp standby reconcile error: {exc}")
 
 
 def multicast_rtp_rows_for_targets(targets):
@@ -1317,6 +1779,840 @@ def multicast_rtp_rows_for_targets(targets):
         elif lowered.isdigit():
             wanted_ids.add(lowered)
     return [row for row in rows if str(row.get("id")) in wanted_ids]
+
+
+def ensure_httprequest_schema():
+    conn = get_dict_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"CREATE TABLE IF NOT EXISTS `{HTTP_REQUEST_TABLE}` ("
+                "`id` INT NOT NULL AUTO_INCREMENT, "
+                "`name` VARCHAR(255) NOT NULL DEFAULT '', "
+                "`method` VARCHAR(10) NOT NULL DEFAULT 'POST', "
+                "`url` TEXT DEFAULT NULL, "
+                "`body` TEXT DEFAULT NULL, "
+                "`auth_type` VARCHAR(32) NOT NULL DEFAULT 'none', "
+                "`auth_username` VARCHAR(255) NOT NULL DEFAULT '', "
+                "`auth_password` VARCHAR(255) NOT NULL DEFAULT '', "
+                "`auth_header_name` VARCHAR(255) NOT NULL DEFAULT '', "
+                "`auth_header_value` TEXT DEFAULT NULL, "
+                "`headers_json` LONGTEXT DEFAULT NULL, "
+                "`timeout` INT NOT NULL DEFAULT 30, "
+                "`include_audio_only` TINYINT NOT NULL DEFAULT 1, "
+                "PRIMARY KEY (`id`)"
+                ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci"
+            )
+            columns = sip_table_columns(cur, HTTP_REQUEST_TABLE)
+            additions = {
+                "name": "`name` VARCHAR(255) NOT NULL DEFAULT ''",
+                "method": "`method` VARCHAR(10) NOT NULL DEFAULT 'POST'",
+                "url": "`url` TEXT DEFAULT NULL",
+                "body": "`body` TEXT DEFAULT NULL",
+                "auth_type": "`auth_type` VARCHAR(32) NOT NULL DEFAULT 'none'",
+                "auth_username": "`auth_username` VARCHAR(255) NOT NULL DEFAULT ''",
+                "auth_password": "`auth_password` VARCHAR(255) NOT NULL DEFAULT ''",
+                "auth_header_name": "`auth_header_name` VARCHAR(255) NOT NULL DEFAULT ''",
+                "auth_header_value": "`auth_header_value` TEXT DEFAULT NULL",
+                "headers_json": "`headers_json` LONGTEXT DEFAULT NULL",
+                "timeout": "`timeout` INT NOT NULL DEFAULT 30",
+                "include_audio_only": "`include_audio_only` TINYINT NOT NULL DEFAULT 1",
+            }
+            for column, sql in additions.items():
+                if column not in columns:
+                    cur.execute(f"ALTER TABLE `{HTTP_REQUEST_TABLE}` ADD COLUMN {sql}")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def http_request_clean_method(value):
+    method = str(value or "POST").strip().upper()
+    if method not in HTTP_REQUEST_METHODS:
+        raise ValueError("Choose a valid HTTP method.")
+    return method
+
+
+def http_request_clean_auth_type(value):
+    auth_type = str(value or "none").strip().lower()
+    if auth_type not in HTTP_REQUEST_AUTH_TYPES:
+        raise ValueError("Choose a valid authentication type.")
+    return auth_type
+
+
+def http_request_clean_timeout(value):
+    raw = str(value if value not in (None, "") else HTTP_REQUEST_DEFAULT_TIMEOUT).strip()
+    try:
+        timeout = int(raw)
+    except ValueError as exc:
+        raise ValueError("Enter a valid timeout.") from exc
+    if timeout < 1 or timeout > 600:
+        raise ValueError("Timeout must be between 1 and 600 seconds.")
+    return timeout
+
+
+def http_request_form_headers(form, row=None):
+    row = row or {}
+    defaults = sip_clean_headers(row.get("headers") if isinstance(row.get("headers"), list) else row.get("headers_json"))
+    if form is None:
+        return defaults or [{"name": "", "value": ""}]
+    names = form.getlist("header_name") if hasattr(form, "getlist") else []
+    values = form.getlist("header_value") if hasattr(form, "getlist") else []
+    headers = []
+    for index in range(max(len(names), len(values))):
+        headers.append(
+            {
+                "name": str(names[index] if index < len(names) else "").strip(),
+                "value": str(values[index] if index < len(values) else "").strip(),
+            }
+        )
+    return headers or [{"name": "", "value": ""}]
+
+
+def http_request_form_values(form, row=None):
+    row = row or {}
+    include_audio_only_default = row.get("include_audio_only")
+    if include_audio_only_default is None:
+        include_audio_only_default = "1"
+    else:
+        include_audio_only_default = "1" if int(include_audio_only_default) else "0"
+    values = {
+        "name": str(row.get("name") or ""),
+        "method": http_request_clean_method(row.get("method") or "POST"),
+        "url": str(row.get("url") or ""),
+        "body": str(row.get("body") or ""),
+        "auth_type": http_request_clean_auth_type(row.get("auth_type") or "none"),
+        "auth_username": str(row.get("auth_username") or ""),
+        "auth_password": str(row.get("auth_password") or ""),
+        "auth_header_name": str(row.get("auth_header_name") or ""),
+        "auth_header_value": str(row.get("auth_header_value") or ""),
+        "timeout": str(row.get("timeout") or HTTP_REQUEST_DEFAULT_TIMEOUT),
+        "include_audio_only": include_audio_only_default,
+        "headers": http_request_form_headers(None, row),
+    }
+    if form is None:
+        return values
+    return {
+        "name": str(form.get("name", values["name"])).strip(),
+        "method": str(form.get("method", values["method"])).strip().upper(),
+        "url": str(form.get("url", values["url"])).strip(),
+        "body": str(form.get("body", values["body"])),
+        "auth_type": str(form.get("auth_type", values["auth_type"])).strip().lower(),
+        "auth_username": str(form.get("auth_username", values["auth_username"])).strip(),
+        "auth_password": str(form.get("auth_password", values["auth_password"])),
+        "auth_header_name": str(form.get("auth_header_name", values["auth_header_name"])).strip(),
+        "auth_header_value": str(form.get("auth_header_value", values["auth_header_value"])),
+        "timeout": str(form.get("timeout", values["timeout"])).strip(),
+        "include_audio_only": "1" if form.get("include_audio_only") else "0",
+        "headers": http_request_form_headers(form, row),
+    }
+
+
+def http_request_clean_values(values):
+    name = str(values.get("name") or "").strip()
+    url = str(values.get("url") or "").strip()
+    if not name:
+        raise ValueError("Name is required.")
+    if not url:
+        raise ValueError("URL is required.")
+    auth_type = http_request_clean_auth_type(values.get("auth_type"))
+    auth_username = str(values.get("auth_username") or "").strip()
+    auth_password = str(values.get("auth_password") or "")
+    auth_header_name = str(values.get("auth_header_name") or "").strip()
+    auth_header_value = str(values.get("auth_header_value") or "")
+    if auth_type in {"basic", "digest"} and not auth_username:
+        raise ValueError("Username is required for the selected authentication type.")
+    if auth_type == "apikey":
+        if not auth_header_name:
+            raise ValueError("Header name is required for API Key authentication.")
+        if ":" in auth_header_name or "\r" in auth_header_name or "\n" in auth_header_name:
+            raise ValueError("API Key header name is invalid.")
+        if "\r" in auth_header_value or "\n" in auth_header_value:
+            raise ValueError("API Key header value is invalid.")
+    return {
+        "name": name,
+        "method": http_request_clean_method(values.get("method")),
+        "url": url,
+        "body": str(values.get("body") or ""),
+        "auth_type": auth_type,
+        "auth_username": auth_username,
+        "auth_password": auth_password,
+        "auth_header_name": auth_header_name,
+        "auth_header_value": auth_header_value,
+        "headers": sip_clean_headers(values.get("headers") or []),
+        "timeout": http_request_clean_timeout(values.get("timeout")),
+        "include_audio_only": 1 if str(values.get("include_audio_only") or "1") == "1" else 0,
+    }
+
+
+def http_request_rows():
+    ensure_httprequest_schema()
+    return sip_query_all(
+        f"SELECT `id`, `name`, `method`, `url`, `body`, `auth_type`, `auth_username`, `auth_password`, "
+        f"`auth_header_name`, `auth_header_value`, `headers_json`, `timeout`, `include_audio_only` "
+        f"FROM `{HTTP_REQUEST_TABLE}` ORDER BY `name` ASC, `id` ASC"
+    )
+
+
+def http_request_row(row_id):
+    ensure_httprequest_schema()
+    rows = sip_query_all(
+        f"SELECT `id`, `name`, `method`, `url`, `body`, `auth_type`, `auth_username`, `auth_password`, "
+        f"`auth_header_name`, `auth_header_value`, `headers_json`, `timeout`, `include_audio_only` "
+        f"FROM `{HTTP_REQUEST_TABLE}` WHERE id=%s LIMIT 1",
+        (row_id,),
+    )
+    return rows[0] if rows else None
+
+
+def http_request_rows_for_targets(targets):
+    tokens = {str(target or "").strip() for target in targets or [] if str(target or "").strip()}
+    rows = http_request_rows()
+    if any(token.lower() == "all" for token in tokens):
+        return rows
+    wanted_ids = set()
+    for token in tokens:
+        lowered = token.lower()
+        if lowered.startswith("request-"):
+            _, _, suffix = lowered.partition("-")
+            if suffix.isdigit():
+                wanted_ids.add(suffix)
+        elif lowered.isdigit():
+            wanted_ids.add(lowered)
+    return [row for row in rows if str(row.get("id")) in wanted_ids]
+
+
+SERVICE_MONITOR_MESSAGE_FIELDS = (
+    "enabled", "send_all", "groups", "shortmessage", "longmessage",
+    "icon", "color", "audio", "priority", "vendor_specific", "expires",
+)
+
+
+def ensure_servicemonitor_schema():
+    conn = get_dict_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"CREATE TABLE IF NOT EXISTS `{SERVICE_MONITOR_TABLE}` ("
+                "`id` INT NOT NULL AUTO_INCREMENT, "
+                "`name` VARCHAR(255) NOT NULL DEFAULT '', "
+                "`monitor_type` VARCHAR(32) NOT NULL DEFAULT 'ping', "
+                "`check_interval` INT NOT NULL DEFAULT 60, "
+                "`disabled` TINYINT NOT NULL DEFAULT 0, "
+                "`host` VARCHAR(255) NOT NULL DEFAULT '', "
+                "`port` INT NOT NULL DEFAULT 0, "
+                "`http_url` TEXT DEFAULT NULL, "
+                "`http_fail_codes` TEXT DEFAULT NULL, "
+                "`uk_base_url` TEXT DEFAULT NULL, "
+                "`uk_api_key` VARCHAR(512) NOT NULL DEFAULT '', "
+                "`uk_monitor` VARCHAR(255) NOT NULL DEFAULT '', "
+                "`last_state` VARCHAR(16) NOT NULL DEFAULT 'unchecked', "
+                "`last_checked` DATETIME DEFAULT NULL, "
+                "`last_error` TEXT DEFAULT NULL, "
+                "`retries` INT NOT NULL DEFAULT 5, "
+                "`wait_for_up` INT NOT NULL DEFAULT 0, "
+                "`fail_count` INT NOT NULL DEFAULT 0, "
+                "`down_broadcast_id` VARCHAR(64) DEFAULT NULL, "
+                + "".join(
+                    f"`{direction}_{field}` {sql}, "
+                    for direction in ("down", "up")
+                    for field, sql in (
+                        ("enabled", "TINYINT NOT NULL DEFAULT 0"),
+                        ("send_all", "TINYINT NOT NULL DEFAULT 0"),
+                        ("groups", "TEXT DEFAULT NULL"),
+                        ("shortmessage", "TEXT DEFAULT NULL"),
+                        ("longmessage", "TEXT DEFAULT NULL"),
+                        ("icon", "VARCHAR(255) NOT NULL DEFAULT ''"),
+                        ("color", "VARCHAR(16) NOT NULL DEFAULT ''"),
+                        ("audio", "TEXT DEFAULT NULL"),
+                        ("priority", "VARCHAR(16) NOT NULL DEFAULT 'Normal'"),
+                        ("vendor_specific", "LONGTEXT DEFAULT NULL"),
+                        ("expires", "VARCHAR(255) NOT NULL DEFAULT 'manual'"),
+                    )
+                )
+                + "PRIMARY KEY (`id`)"
+                ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci"
+            )
+            columns = sip_table_columns(cur, SERVICE_MONITOR_TABLE)
+            additions = {
+                "name": "`name` VARCHAR(255) NOT NULL DEFAULT ''",
+                "monitor_type": "`monitor_type` VARCHAR(32) NOT NULL DEFAULT 'ping'",
+                "check_interval": "`check_interval` INT NOT NULL DEFAULT 60",
+                "disabled": "`disabled` TINYINT NOT NULL DEFAULT 0",
+                "host": "`host` VARCHAR(255) NOT NULL DEFAULT ''",
+                "port": "`port` INT NOT NULL DEFAULT 0",
+                "http_url": "`http_url` TEXT DEFAULT NULL",
+                "http_fail_codes": "`http_fail_codes` TEXT DEFAULT NULL",
+                "uk_base_url": "`uk_base_url` TEXT DEFAULT NULL",
+                "uk_api_key": "`uk_api_key` VARCHAR(512) NOT NULL DEFAULT ''",
+                "uk_monitor": "`uk_monitor` VARCHAR(255) NOT NULL DEFAULT ''",
+                "last_state": "`last_state` VARCHAR(16) NOT NULL DEFAULT 'unchecked'",
+                "last_checked": "`last_checked` DATETIME DEFAULT NULL",
+                "last_error": "`last_error` TEXT DEFAULT NULL",
+                "retries": "`retries` INT NOT NULL DEFAULT 5",
+                "wait_for_up": "`wait_for_up` INT NOT NULL DEFAULT 0",
+                "fail_count": "`fail_count` INT NOT NULL DEFAULT 0",
+                "down_broadcast_id": "`down_broadcast_id` VARCHAR(64) DEFAULT NULL",
+            }
+            for direction in ("down", "up"):
+                additions[f"{direction}_enabled"] = f"`{direction}_enabled` TINYINT NOT NULL DEFAULT 0"
+                additions[f"{direction}_send_all"] = f"`{direction}_send_all` TINYINT NOT NULL DEFAULT 0"
+                additions[f"{direction}_groups"] = f"`{direction}_groups` TEXT DEFAULT NULL"
+                additions[f"{direction}_shortmessage"] = f"`{direction}_shortmessage` TEXT DEFAULT NULL"
+                additions[f"{direction}_longmessage"] = f"`{direction}_longmessage` TEXT DEFAULT NULL"
+                additions[f"{direction}_icon"] = f"`{direction}_icon` VARCHAR(255) NOT NULL DEFAULT ''"
+                additions[f"{direction}_color"] = f"`{direction}_color` VARCHAR(16) NOT NULL DEFAULT ''"
+                additions[f"{direction}_audio"] = f"`{direction}_audio` TEXT DEFAULT NULL"
+                additions[f"{direction}_priority"] = f"`{direction}_priority` VARCHAR(16) NOT NULL DEFAULT 'Normal'"
+                additions[f"{direction}_vendor_specific"] = f"`{direction}_vendor_specific` LONGTEXT DEFAULT NULL"
+                additions[f"{direction}_expires"] = f"`{direction}_expires` VARCHAR(255) NOT NULL DEFAULT 'manual'"
+            for column, sql in additions.items():
+                if column not in columns:
+                    cur.execute(f"ALTER TABLE `{SERVICE_MONITOR_TABLE}` ADD COLUMN {sql}")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+SERVICE_MONITOR_COLUMNS = (
+    "`id`, `name`, `monitor_type`, `check_interval`, `disabled`, `host`, `port`, "
+    "`http_url`, `http_fail_codes`, `uk_base_url`, `uk_api_key`, `uk_monitor`, "
+    "`last_state`, `last_checked`, `last_error`, `retries`, `wait_for_up`, `fail_count`, `down_broadcast_id`, "
+    + ", ".join(
+        f"`{direction}_{field}`"
+        for direction in ("down", "up")
+        for field in ("enabled", "send_all", "groups", "shortmessage", "longmessage",
+                      "icon", "color", "audio", "priority", "vendor_specific", "expires")
+    )
+)
+
+
+def service_monitor_rows():
+    ensure_servicemonitor_schema()
+    return sip_query_all(
+        f"SELECT {SERVICE_MONITOR_COLUMNS} FROM `{SERVICE_MONITOR_TABLE}` ORDER BY `name` ASC, `id` ASC"
+    )
+
+
+def service_monitor_row(row_id):
+    ensure_servicemonitor_schema()
+    rows = sip_query_all(
+        f"SELECT {SERVICE_MONITOR_COLUMNS} FROM `{SERVICE_MONITOR_TABLE}` WHERE id=%s LIMIT 1",
+        (row_id,),
+    )
+    return rows[0] if rows else None
+
+
+def service_monitor_clean_type(value):
+    monitor_type = str(value or "ping").strip().lower()
+    if monitor_type not in SERVICE_MONITOR_TYPES:
+        raise ValueError("Choose a valid monitor type.")
+    return monitor_type
+
+
+def service_monitor_clean_interval(value):
+    raw = str(value if value not in (None, "") else SERVICE_MONITOR_DEFAULT_INTERVAL).strip()
+    try:
+        interval = int(float(raw))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Enter a valid check interval.") from exc
+    if interval < SERVICE_MONITOR_MIN_INTERVAL or interval > SERVICE_MONITOR_MAX_INTERVAL:
+        raise ValueError(
+            f"Check interval must be between {SERVICE_MONITOR_MIN_INTERVAL} and {SERVICE_MONITOR_MAX_INTERVAL} seconds."
+        )
+    return interval
+
+
+def service_monitor_clean_retries(value):
+    raw = str(value if value not in (None, "") else SERVICE_MONITOR_DEFAULT_RETRIES).strip()
+    try:
+        retries = int(float(raw))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Enter a valid number of retries.") from exc
+    if retries < SERVICE_MONITOR_MIN_RETRIES or retries > SERVICE_MONITOR_MAX_RETRIES:
+        raise ValueError(
+            f"Retries must be between {SERVICE_MONITOR_MIN_RETRIES} and {SERVICE_MONITOR_MAX_RETRIES}."
+        )
+    return retries
+
+
+def service_monitor_clean_wait_for_up(value):
+    raw = str(value if value not in (None, "") else SERVICE_MONITOR_DEFAULT_WAIT_FOR_UP).strip()
+    try:
+        wait = int(float(raw))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Enter a valid Wait for Up value.") from exc
+    if wait < SERVICE_MONITOR_MIN_WAIT_FOR_UP or wait > SERVICE_MONITOR_MAX_WAIT_FOR_UP:
+        raise ValueError(
+            f"Wait for Up must be between {SERVICE_MONITOR_MIN_WAIT_FOR_UP} and {SERVICE_MONITOR_MAX_WAIT_FOR_UP} seconds."
+        )
+    return wait
+    raw = str(value if value not in (None, "") else "").strip()
+    if not raw:
+        if required:
+            raise ValueError("Port is required.")
+        return 0
+    try:
+        port = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Enter a valid port number.") from exc
+    if port < 1 or port > 65535:
+        raise ValueError("Port must be between 1 and 65535.")
+    return port
+
+
+def service_monitor_parse_fail_codes(value):
+    if isinstance(value, list):
+        tokens = value
+    else:
+        try:
+            tokens = json.loads(value) if value else []
+        except (TypeError, ValueError):
+            tokens = [tok.strip() for tok in str(value or "").split(",")]
+    cleaned = []
+    for token in tokens:
+        token = str(token or "").strip().lower()
+        if not token:
+            continue
+        if token in SERVICE_MONITOR_HTTP_FAIL_TOKENS:
+            if token not in cleaned:
+                cleaned.append(token)
+        elif token.isdigit() and 100 <= int(token) <= 599:
+            if token not in cleaned:
+                cleaned.append(token)
+    return cleaned
+
+
+def service_monitor_http_status_is_failure(status_code, fail_tokens):
+    if status_code is None:
+        return "noresponse" in fail_tokens
+    try:
+        code = int(status_code)
+    except (TypeError, ValueError):
+        return False
+    if str(code) in fail_tokens:
+        return True
+    if "4xx" in fail_tokens and 400 <= code <= 499:
+        return True
+    if "5xx" in fail_tokens and 500 <= code <= 599:
+        return True
+    return False
+
+
+def service_monitor_address(row):
+    monitor_type = str(row.get("monitor_type") or "ping").strip().lower()
+    host = str(row.get("host") or "").strip()
+    port = int(row.get("port") or 0)
+    if monitor_type == "http":
+        return str(row.get("http_url") or "").strip()
+    if monitor_type == "uptimekuma":
+        base = str(row.get("uk_base_url") or "").strip()
+        monitor = str(row.get("uk_monitor") or "").strip()
+        return f"{monitor} @ {base}" if monitor else base
+    if monitor_type in ("tcp", "sip") and host and port:
+        return f"{host}:{port}"
+    return host
+
+
+def service_monitor_state_label(state):
+    state = str(state or "unchecked").strip().lower()
+    if state == "online":
+        return "Monitor online"
+    if state == "offline":
+        return "Monitor offline"
+    if state == "kuma_down":
+        return "Uptime Kuma down"
+    if state == "disabled":
+        return "Disabled"
+    return "Unchecked"
+
+
+def get_service_monitor_endpoint_status():
+    endpoints = []
+    for row in service_monitor_rows():
+        row_id = row.get("id")
+        disabled = bool(int(row.get("disabled") or 0))
+        if disabled:
+            state = "disabled"
+        else:
+            state = str(row.get("last_state") or "unchecked").strip().lower()
+            if state not in ("online", "offline", "unchecked", "kuma_down"):
+                state = "unchecked"
+        monitor_type = str(row.get("monitor_type") or "ping").strip().lower()
+        # kuma_down shows red like offline in the endpoints list but keeps its own label.
+        css_state = "offline" if state == "kuma_down" else state
+        endpoints.append(
+            {
+                "id": f"monitor-{row_id}",
+                "name": str(row.get("name") or f"Service Monitor {row_id}"),
+                "address": service_monitor_address(row),
+                "model": "",
+                "status": service_monitor_state_label(state),
+                "status_state": css_state,
+                "type": f"{SERVICE_MONITOR_TYPE_LABELS.get(monitor_type, 'Monitor')} Monitor",
+                "direction": "Input",
+                "input_type": "Input",
+                "input_capable": True,
+                "output_capable": False,
+                "bell_capable": False,
+                "available": not disabled,
+                "capabilities": ["input"],
+            }
+        )
+    return {
+        "module": SERVICE_MONITOR_MODULE,
+        "display_name": SERVICE_MONITOR_NAME,
+        "name": SERVICE_MONITOR_NAME,
+        "description": SERVICE_MONITOR_DESCRIPTION,
+        "input_type": "Input",
+        "system_builtin": True,
+        "enabled": True,
+        "loaded": True,
+        "trusted": True,
+        "can_load": True,
+        "input_capable": True,
+        "output_capable": False,
+        "endpoints": endpoints,
+    }
+
+
+def service_monitor_endpoint_count():
+    try:
+        return len(service_monitor_rows())
+    except Exception as exc:
+        log(f"service monitor endpoint count error: {exc}")
+        return 0
+
+
+# --- Probes -----------------------------------------------------------------
+
+def service_monitor_humanize_conn_error(exc):
+    reason = exc
+    if hasattr(exc, "reason") and getattr(exc, "reason") is not None:
+        reason = getattr(exc, "reason")
+    text = str(reason or exc or "").strip()
+    lowered = text.lower()
+    if isinstance(reason, (ConnectionRefusedError,)) or "refused" in lowered or "10061" in lowered:
+        return "Host refused connection"
+    if "unreachable" in lowered or "10065" in lowered or "no route" in lowered:
+        return "Host unreachable"
+    if "timed out" in lowered or "timeout" in lowered or isinstance(reason, socket.timeout):
+        return "Connection timed out"
+    if "name or service not known" in lowered or "getaddrinfo" in lowered or "nodename nor servname" in lowered or "name resolution" in lowered:
+        return "Host name could not be resolved"
+    return text or "Connection failed"
+
+
+def service_monitor_probe_ping(host, timeout):
+    host = str(host or "").strip()
+    if not host:
+        return False, "No host configured"
+    timeout = max(1, int(timeout or 4))
+    try:
+        if os.name == "nt":
+            args = ["ping", "-n", "4", "-w", str(timeout * 1000), host]
+        else:
+            args = ["ping", "-c", "4", "-W", str(timeout), host]
+        result = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=(timeout * 4) + 6,
+            text=True,
+        )
+        output = (result.stdout or "").strip()
+        if result.returncode == 0:
+            return True, output
+        return False, output or "No ping reply"
+    except subprocess.TimeoutExpired:
+        return False, "Ping timed out"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def service_monitor_probe_tcp(host, port, timeout):
+    host = str(host or "").strip()
+    if not host or not port:
+        return False, "No host/port configured"
+    try:
+        with socket.create_connection((host, int(port)), timeout=max(1, int(timeout or 4))):
+            return True, f"TCP port {port} on {host} is open"
+    except Exception as exc:
+        return False, service_monitor_humanize_conn_error(exc)
+
+
+def service_monitor_probe_http(url, fail_tokens, timeout):
+    url = str(url or "").strip()
+    if not url:
+        return False, "No URL configured"
+    if not re.match(r"^https?://", url, re.IGNORECASE):
+        url = "http://" + url
+    scheme_label = "HTTPS" if url.lower().startswith("https://") else "HTTP"
+    request_obj = urllib.request.Request(url, headers={"User-Agent": "OpenPagingServer-Monitor"}, method="GET")
+    status_code = None
+    try:
+        with urllib.request.urlopen(request_obj, timeout=max(1, int(timeout or 10))) as response:
+            status_code = int(getattr(response, "status", 0) or response.getcode() or 0)
+    except urllib.error.HTTPError as exc:
+        status_code = int(exc.code)
+    except Exception as exc:
+        detail = service_monitor_humanize_conn_error(exc)
+        if service_monitor_http_status_is_failure(None, fail_tokens):
+            return False, detail
+        return True, detail
+    if service_monitor_http_status_is_failure(status_code, fail_tokens):
+        return False, f"URL returned {scheme_label} code {status_code}"
+    return True, f"URL returned {scheme_label} code {status_code}"
+
+
+def service_monitor_probe_sip(host, port, timeout):
+    host = str(host or "").strip()
+    port = int(port or 5060)
+    if not host:
+        return False, "No host configured"
+    timeout = max(1, int(timeout or 4))
+    call_id = uuid.uuid4().hex
+    branch = "z9hG4bK" + uuid.uuid4().hex[:16]
+    tag = uuid.uuid4().hex[:8]
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        sock.bind(("", 0))
+        local_ip = sock.getsockname()[0]
+        local_port = sock.getsockname()[1]
+        request = (
+            f"OPTIONS sip:{host}:{port} SIP/2.0\r\n"
+            f"Via: SIP/2.0/UDP {local_ip}:{local_port};branch={branch};rport\r\n"
+            f"Max-Forwards: 70\r\n"
+            f"From: <sip:monitor@{local_ip}>;tag={tag}\r\n"
+            f"To: <sip:{host}:{port}>\r\n"
+            f"Call-ID: {call_id}\r\n"
+            f"CSeq: 1 OPTIONS\r\n"
+            f"Contact: <sip:monitor@{local_ip}:{local_port}>\r\n"
+            f"User-Agent: OpenPagingServer-Monitor\r\n"
+            f"Content-Length: 0\r\n\r\n"
+        )
+        sock.sendto(request.encode("utf-8"), (host, port))
+        data, _addr = sock.recvfrom(4096)
+        first_line = data.decode("utf-8", "replace").splitlines()[0] if data else ""
+        if "200" in first_line:
+            return True, ""
+        # Any well-formed SIP response means the server is reachable/alive.
+        if first_line.upper().startswith("SIP/2.0"):
+            return False, first_line.strip()
+        return False, "Unexpected SIP response"
+    except socket.timeout:
+        return False, "No SIP response"
+    except Exception as exc:
+        return False, str(exc) or "SIP probe failed"
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
+def service_monitor_fetch_kuma_metrics(base_url, api_key, timeout=10):
+    base_url = str(base_url or "").strip().rstrip("/")
+    if not base_url:
+        raise ValueError("Uptime Kuma base URL is required.")
+    if not re.match(r"^https?://", base_url, re.IGNORECASE):
+        base_url = "http://" + base_url
+    metrics_url = base_url + "/metrics"
+    request_obj = urllib.request.Request(metrics_url, method="GET")
+    token = base64.b64encode(f":{str(api_key or '')}".encode("utf-8")).decode("ascii")
+    request_obj.add_header("Authorization", f"Basic {token}")
+    request_obj.add_header("User-Agent", "OpenPagingServer-Monitor")
+    with urllib.request.urlopen(request_obj, timeout=max(1, int(timeout or 10))) as response:
+        return response.read().decode("utf-8", "replace")
+
+
+SERVICE_MONITOR_KUMA_LABEL_RE = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
+
+
+def service_monitor_parse_kuma_status(metrics_text):
+    """Return {monitor_name: up_bool} parsed from monitor_status metric lines."""
+    monitors = {}
+    for line in metrics_text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or not line.startswith("monitor_status"):
+            continue
+        try:
+            label_part = line[line.index("{") + 1:line.rindex("}")]
+            value_part = line[line.rindex("}") + 1:].strip()
+        except ValueError:
+            continue
+        labels = {}
+        for match in SERVICE_MONITOR_KUMA_LABEL_RE.finditer(label_part):
+            labels[match.group(1)] = match.group(2).replace('\\"', '"').replace("\\\\", "\\")
+        name = labels.get("monitor_name")
+        if not name:
+            continue
+        try:
+            value = float(value_part.split()[0])
+        except (ValueError, IndexError):
+            continue
+        # monitor_status: 1=up, 0=down, 2=pending, 3=maintenance
+        monitors[name] = value == 1
+    return monitors
+
+
+def service_monitor_list_kuma_monitors(base_url, api_key, timeout=10):
+    metrics_text = service_monitor_fetch_kuma_metrics(base_url, api_key, timeout=timeout)
+    return sorted(service_monitor_parse_kuma_status(metrics_text).keys(), key=lambda name: name.lower())
+
+
+def service_monitor_probe_kuma(base_url, api_key, monitor_name):
+    monitor_name = str(monitor_name or "").strip()
+    if not monitor_name:
+        return False, "No monitor selected", False
+    try:
+        metrics_text = service_monitor_fetch_kuma_metrics(base_url, api_key)
+    except Exception:
+        # Uptime Kuma itself is unreachable — the monitor is considered down.
+        return False, "Uptime Kuma is down", True
+    statuses = service_monitor_parse_kuma_status(metrics_text)
+    if monitor_name not in statuses:
+        return False, "Monitor not found in Uptime Kuma", False
+    if statuses[monitor_name]:
+        return True, "Uptime Kuma reports the monitor is up", False
+    return False, "Uptime Kuma reports the monitor is down", False
+
+
+def service_monitor_check_row(row):
+    """Run the configured probe for a monitor row.
+
+    Returns (is_up, detail, down_state) where down_state is the last_state to use
+    when the probe fails ("offline" normally, "kuma_down" when Uptime Kuma itself
+    is unreachable).
+    """
+    monitor_type = str(row.get("monitor_type") or "ping").strip().lower()
+    interval = int(row.get("check_interval") or SERVICE_MONITOR_DEFAULT_INTERVAL)
+    probe_timeout = max(3, min(interval - 1, 30)) if interval > 4 else 4
+    if monitor_type == "ping":
+        is_up, detail = service_monitor_probe_ping(row.get("host"), probe_timeout)
+        return is_up, detail, "offline"
+    if monitor_type == "tcp":
+        is_up, detail = service_monitor_probe_tcp(row.get("host"), row.get("port"), probe_timeout)
+        return is_up, detail, "offline"
+    if monitor_type == "http":
+        fail_tokens = service_monitor_parse_fail_codes(row.get("http_fail_codes")) or SERVICE_MONITOR_HTTP_DEFAULT_FAIL
+        is_up, detail = service_monitor_probe_http(row.get("http_url"), fail_tokens, probe_timeout)
+        return is_up, detail, "offline"
+    if monitor_type == "sip":
+        is_up, detail = service_monitor_probe_sip(row.get("host"), row.get("port") or 5060, probe_timeout)
+        return is_up, detail, "offline"
+    if monitor_type == "uptimekuma":
+        is_up, detail, server_down = service_monitor_probe_kuma(
+            row.get("uk_base_url"), row.get("uk_api_key"), row.get("uk_monitor")
+        )
+        return is_up, detail, ("kuma_down" if server_down else "offline")
+    return False, "Unknown monitor type", "offline"
+
+
+SERVICE_MONITOR_DRAFT_TABLE = "servicemonitor_drafts"
+
+
+def ensure_servicemonitor_draft_schema():
+    conn = get_dict_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"CREATE TABLE IF NOT EXISTS `{SERVICE_MONITOR_DRAFT_TABLE}` ("
+                "`token` VARCHAR(64) NOT NULL, "
+                "`data` LONGTEXT DEFAULT NULL, "
+                "`updated_at` DATETIME DEFAULT NULL, "
+                "PRIMARY KEY (`token`)"
+                ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci"
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def service_monitor_load_draft(token):
+    ensure_servicemonitor_draft_schema()
+    rows = sip_query_all(
+        f"SELECT `data` FROM `{SERVICE_MONITOR_DRAFT_TABLE}` WHERE token=%s LIMIT 1",
+        (token,),
+    )
+    if not rows:
+        return None
+    try:
+        return json.loads(rows[0].get("data") or "{}")
+    except (TypeError, ValueError):
+        return {}
+
+
+def service_monitor_save_draft(token, data):
+    ensure_servicemonitor_draft_schema()
+    payload = json.dumps(data or {})
+    sip_execute(
+        f"INSERT INTO `{SERVICE_MONITOR_DRAFT_TABLE}` (`token`, `data`, `updated_at`) VALUES (%s,%s,%s) "
+        f"ON DUPLICATE KEY UPDATE `data`=VALUES(`data`), `updated_at`=VALUES(`updated_at`)",
+        (token, payload, datetime.now()),
+    )
+
+
+def service_monitor_delete_draft(token):
+    try:
+        ensure_servicemonitor_draft_schema()
+        sip_execute(f"DELETE FROM `{SERVICE_MONITOR_DRAFT_TABLE}` WHERE token=%s", (token,))
+        # Opportunistically prune drafts older than a day.
+        sip_execute(
+            f"DELETE FROM `{SERVICE_MONITOR_DRAFT_TABLE}` WHERE `updated_at` IS NOT NULL AND `updated_at` < %s",
+            (datetime.now() - _timedelta(days=1),),
+        )
+    except Exception as exc:
+        log(f"service monitor draft cleanup error: {exc}")
+
+
+def http_request_endpoint_count():
+    try:
+        return len(http_request_rows())
+    except Exception as exc:
+        log(f"http request endpoint count error: {exc}")
+        return 0
+
+
+def get_http_request_endpoint_status():
+    endpoints = []
+    for row in http_request_rows():
+        row_id = row.get("id")
+        method = http_request_clean_method(row.get("method") or "POST")
+        endpoints.append(
+            {
+                "id": f"request-{row_id}",
+                "name": str(row.get("name") or f"HTTP Request {row_id}"),
+                "address": str(row.get("url") or ""),
+                "model": "",
+                "status": "",
+                "type": f"{method} Request",
+                "direction": "Output",
+                "input_type": "Output",
+                "output_capable": True,
+                "bell_capable": False,
+                "available": True,
+                "capabilities": ["output"],
+            }
+        )
+    return {
+        "module": HTTP_REQUEST_MODULE,
+        "display_name": HTTP_REQUEST_NAME,
+        "name": HTTP_REQUEST_NAME,
+        "description": HTTP_REQUEST_DESCRIPTION,
+        "input_type": "Output",
+        "system_builtin": True,
+        "enabled": True,
+        "loaded": True,
+        "trusted": True,
+        "can_load": True,
+        "input_capable": False,
+        "output_capable": True,
+        "endpoints": endpoints,
+    }
 
 
 def multicast_rtp_endpoint_count():
@@ -1734,7 +3030,10 @@ def sip_fetch_output_rows():
     ensure_siptrunks_schema()
     return sip_query_all(
         f"SELECT o.*, t.name AS trunk_name, t.status AS trunk_status, t.auth AS trunk_auth, "
-        f"t.trunk_type AS trunk_type, t.connected_server AS trunk_connected_server "
+        f"t.trunk_type AS trunk_trunk_type, t.connected_server AS trunk_connected_server, "
+        f"t.username AS trunk_username, t.password AS trunk_password, t.ipaddr AS trunk_ipaddr, "
+        f"t.servers_json AS trunk_servers_json, t.outbound_nat AS trunk_outbound_nat, "
+        f"t.connected_transport AS trunk_connected_transport "
         f"FROM `{SIP_OUTPUT_TABLE}` o "
         f"LEFT JOIN `{SIP_TRUNK_TABLE}` t ON t.id = o.trunk_id "
         f"ORDER BY o.name ASC, o.id ASC"
@@ -1744,8 +3043,10 @@ def sip_fetch_output_rows():
 def sip_fetch_output_row(row_id):
     rows = sip_query_all(
         f"SELECT o.*, t.name AS trunk_name, t.status AS trunk_status, t.auth AS trunk_auth, "
-        f"t.trunk_type AS trunk_type, t.connected_server AS trunk_connected_server, "
-        f"t.username AS trunk_username, t.password AS trunk_password, t.ipaddr AS trunk_ipaddr "
+        f"t.trunk_type AS trunk_trunk_type, t.connected_server AS trunk_connected_server, "
+        f"t.username AS trunk_username, t.password AS trunk_password, t.ipaddr AS trunk_ipaddr, "
+        f"t.servers_json AS trunk_servers_json, t.outbound_nat AS trunk_outbound_nat, "
+        f"t.connected_transport AS trunk_connected_transport "
         f"FROM `{SIP_OUTPUT_TABLE}` o "
         f"LEFT JOIN `{SIP_TRUNK_TABLE}` t ON t.id = o.trunk_id "
         f"WHERE o.id=%s LIMIT 1",
@@ -3115,6 +4416,7 @@ class SipRtpSender:
             self.call.rtp_packets_sent = 0
         if not hasattr(self.call, "rtp_packets_received"):
             self.call.rtp_packets_received = 0
+        self.codec_encoder = None
 
     def call_finished(self):
         if bool(getattr(self.call, "released", False)):
@@ -3192,14 +4494,25 @@ class SipRtpSender:
         self.learn_source()
         if not self.call.remote_media_ip or not self.call.remote_media_port:
             return False
+        codec = str(getattr(self.call, "negotiated_codec", "") or "PCMU").upper()
+        codec_info = SIP_EDGE_CODEC_PAYLOADS.get(codec) or SIP_EDGE_CODEC_PAYLOADS["PCMU"]
+        encoded, self.codec_encoder = encode_edge_rtp_payload(
+            codec,
+            bytes(payload or SIP_OUTPUT_SILENCE_FRAME),
+            encoder_state=self.codec_encoder,
+        )
+        if not encoded:
+            # Encoder still priming (first G722/Opus frame): frame consumed,
+            # nothing to put on the wire yet.
+            return True
         packet = struct.pack(
             "!BBHII",
             0x80,
-            0x00,
+            int(codec_info.get("payload_type", 0)) & 0x7F,
             int(self.call.rtp_sequence) & 0xFFFF,
             int(self.call.rtp_timestamp) & 0xFFFFFFFF,
             int(self.call.rtp_ssrc) & 0xFFFFFFFF,
-        ) + bytes(payload or SIP_OUTPUT_SILENCE_FRAME)
+        ) + encoded
         try:
             self.call.rtp_socket.sendto(packet, (self.call.remote_media_ip, int(self.call.remote_media_port)))
         except OSError as exc:
@@ -3217,17 +4530,19 @@ class SipRtpSender:
                 f"remote={self.call.remote_media_ip}:{int(self.call.remote_media_port)} bytes={len(packet)}"
             )
         self.call.rtp_sequence = (int(self.call.rtp_sequence) + 1) & 0xFFFF
-        self.call.rtp_timestamp = (int(self.call.rtp_timestamp) + SIP_OUTPUT_FRAME_BYTES) & 0xFFFFFFFF
+        self.call.rtp_timestamp = (int(self.call.rtp_timestamp) + int(codec_info.get("samples_per_frame", SIP_OUTPUT_FRAME_BYTES))) & 0xFFFFFFFF
         return True
 
 
 class SipOutputSession:
-    def __init__(self, row, metadata, recorder, on_ready, on_done):
+    def __init__(self, row, metadata, recorder, on_ready, on_done, module_name="siptrunks", stream_id=""):
         self.row = dict(row or {})
         self.metadata = dict(metadata or {})
         self.recorder = recorder
         self.on_ready = on_ready
         self.on_done = on_done
+        self.module_name = str(module_name or "siptrunks")
+        self.stream_id = str(stream_id or "")
         self.mode = sip_clean_output_mode(self.row.get("mode"))
         self.stop_event = threading.Event()
         self.input_finished = threading.Event()
@@ -3356,59 +4671,76 @@ class SipOutputSession:
                 or total_speech_ms >= SIP_AMD_MACHINE_TOTAL_MS
             )
 
-        while time.time() < deadline and not self.stop_event.is_set():
-            try:
-                packet, addr = call.rtp_socket.recvfrom(4096)
-            except socket.timeout:
-                if current_speech_ms > 0:
-                    finish_segment()
-                if speech_segments:
-                    silence_after_speech_ms += SIP_AMD_TIMEOUT_STEP_MS
-                    if human_greeting_detected():
-                        return False
-                    if machine_greeting_detected():
+        # AMD analysis operates on 8 kHz u-law samples. Inbound RTP may use any
+        # negotiated codec (PCMA, G722, OPUS, ...), so decode every payload to
+        # u-law first; without this AMD only ever worked on PCMU.
+        codec = str(getattr(call, "negotiated_codec", "") or "PCMU")
+        decoder_state = None
+        try:
+            while time.time() < deadline and not self.stop_event.is_set():
+                try:
+                    packet, addr = call.rtp_socket.recvfrom(4096)
+                except socket.timeout:
+                    if current_speech_ms > 0:
+                        finish_segment()
+                    if speech_segments:
+                        silence_after_speech_ms += SIP_AMD_TIMEOUT_STEP_MS
+                        if human_greeting_detected():
+                            return False
+                        if machine_greeting_detected():
+                            return True
+                    continue
+                except OSError:
+                    return False
+                if not sip_latchable_rtp_packet(packet):
+                    continue
+                if getattr(call, "rtp_latching_enabled", False) and addr and len(addr) >= 2:
+                    source_ip = str(addr[0] or "").strip()
+                    source_port = int(addr[1] or 0)
+                    if source_ip and source_port > 0:
+                        call.remote_media_ip = source_ip
+                        call.remote_media_port = source_port
+                payload, decoder_state = decode_edge_rtp_payload(
+                    codec, sip_parse_rtp_payload(packet), decoder_state
+                )
+                if len(payload) < SIP_OUTPUT_FRAME_BYTES:
+                    continue
+                average = self.amd_average_energy(payload)
+                if self.amd_beep_detected(payload, average):
+                    beep_run_ms += SIP_AMD_FRAME_MS
+                    if beep_run_ms >= SIP_AMD_BEEP_MS:
                         return True
-                continue
-            except OSError:
-                return False
-            if not sip_latchable_rtp_packet(packet):
-                continue
-            if getattr(call, "rtp_latching_enabled", False) and addr and len(addr) >= 2:
-                source_ip = str(addr[0] or "").strip()
-                source_port = int(addr[1] or 0)
-                if source_ip and source_port > 0:
-                    call.remote_media_ip = source_ip
-                    call.remote_media_port = source_port
-            payload = sip_parse_rtp_payload(packet)
-            average = self.amd_average_energy(payload)
-            if self.amd_beep_detected(payload, average):
-                beep_run_ms += SIP_AMD_FRAME_MS
-                if beep_run_ms >= SIP_AMD_BEEP_MS:
-                    return True
-            else:
-                beep_run_ms = 0
-            voice_threshold = max(SIP_AMD_MIN_VOICE_AVERAGE, noise_floor * SIP_AMD_NOISE_MULTIPLIER)
-            is_voice = average >= voice_threshold
-            if is_voice:
-                current_speech_ms += SIP_AMD_FRAME_MS
-                total_speech_ms += SIP_AMD_FRAME_MS
-                silence_after_speech_ms = 0
-                if current_speech_ms >= SIP_AMD_MACHINE_CONTINUOUS_MS:
-                    return True
-            else:
-                noise_floor = (noise_floor * 0.9) + (average * 0.1)
-                if current_speech_ms > 0:
-                    finish_segment()
-                if speech_segments:
-                    silence_after_speech_ms += SIP_AMD_FRAME_MS
-                    if human_greeting_detected():
-                        return False
-                    if machine_greeting_detected():
+                else:
+                    beep_run_ms = 0
+                voice_threshold = max(SIP_AMD_MIN_VOICE_AVERAGE, noise_floor * SIP_AMD_NOISE_MULTIPLIER)
+                is_voice = average >= voice_threshold
+                if is_voice:
+                    current_speech_ms += SIP_AMD_FRAME_MS
+                    total_speech_ms += SIP_AMD_FRAME_MS
+                    silence_after_speech_ms = 0
+                    if current_speech_ms >= SIP_AMD_MACHINE_CONTINUOUS_MS:
                         return True
-        finish_segment()
-        if longest_speech_ms >= SIP_AMD_MACHINE_AFTER_PAUSE_MS or total_speech_ms >= SIP_AMD_MACHINE_TOTAL_MS:
-            return True
-        return False
+                else:
+                    noise_floor = (noise_floor * 0.9) + (average * 0.1)
+                    if current_speech_ms > 0:
+                        finish_segment()
+                    if speech_segments:
+                        silence_after_speech_ms += SIP_AMD_FRAME_MS
+                        if human_greeting_detected():
+                            return False
+                        if machine_greeting_detected():
+                            return True
+            finish_segment()
+            if longest_speech_ms >= SIP_AMD_MACHINE_AFTER_PAUSE_MS or total_speech_ms >= SIP_AMD_MACHINE_TOTAL_MS:
+                return True
+            return False
+        finally:
+            closer = getattr(decoder_state, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:
+                    pass
 
     def next_page_frame(self):
         with self.live_lock:
@@ -3476,15 +4808,44 @@ class SipOutputSession:
         import sip.index as sip_index
 
         cid_number, cnam_name = sip_output_caller_values(self.row, self.metadata)
-        return sip_index.sip_server.place_outbound_call(
-            self.row.get("trunk_id"),
-            self.row.get("number"),
+        trunk_id = str(self.row.get("trunk_id") or "").strip()
+        if not trunk_id:
+            raise RuntimeError("SIP output row is missing trunk_id")
+        log(
+            f"siptrunks place_call row_id={self.row.get('id')} trunk_id={trunk_id} "
+            f"number={self.row.get('number')} mode={self.mode}"
+        )
+        trunk_fallback = {
+            "id": trunk_id,
+            "name": self.row.get("trunk_name"),
+            "status": self.row.get("trunk_status"),
+            "auth": self.row.get("trunk_auth"),
+            "trunk_type": self.row.get("trunk_trunk_type"),
+            "username": self.row.get("trunk_username"),
+            "password": self.row.get("trunk_password"),
+            "ipaddr": self.row.get("trunk_ipaddr"),
+            "servers_json": self.row.get("trunk_servers_json"),
+            "outbound_nat": self.row.get("trunk_outbound_nat"),
+            "connected_server": self.row.get("trunk_connected_server"),
+            "connected_transport": self.row.get("trunk_connected_transport"),
+        }
+        place = sip_index.sip_server.place_outbound_call
+        supports_fallback = True
+        try:
+            import inspect
+            supports_fallback = "trunk_fallback" in inspect.signature(place).parameters
+        except (TypeError, ValueError):
+            supports_fallback = True
+        kwargs = dict(
             caller_id_number=cid_number,
             caller_id_name=cnam_name,
             alert_info_value=sip_output_alert_value(self.row),
             custom_headers=sip_output_headers(self.row),
             answer_timeout=answer_timeout,
         )
+        if supports_fallback:
+            kwargs["trunk_fallback"] = trunk_fallback
+        return place(trunk_id, self.row.get("number"), **kwargs)
 
     def run_page_mode(self):
         answer_timeout = 10
@@ -3518,6 +4879,16 @@ class SipOutputSession:
                     time.sleep(timeout_delay)
                     continue
                 return
+            # Signal readiness as soon as the call is answered so the broadcast
+            # delivery starts feeding the shared recorder immediately. Without
+            # this the stream is never marked ready and deliver_broadcast holds
+            # all audio until its ~10s fallback deadline, which on longer
+            # messages plays back as a large startup delay / dead air. Firing
+            # here (before AMD) also gives the recorder a head start so playback
+            # has a jitter cushion instead of underrunning at the first frame.
+            if not self.ready_sent:
+                self.ready_sent = True
+                self.on_ready(self)
             SipRtpSender(call).prime()
             if amd_enabled and self.detect_answering_machine(call):
                 call.hangup("Answering machine detected")
@@ -3536,6 +4907,10 @@ class SipOutputSession:
                 self.run_page_mode()
             else:
                 self.run_telephone_mode()
+        except Exception as exc:
+            log(f"siptrunks session_error row_id={self.row.get('id')} mode={self.mode} error={exc}")
+            if self.stream_id:
+                mark_failed(self.module_name, self.stream_id)
         finally:
             self.on_done(self)
 
@@ -3555,14 +4930,21 @@ class SipTrunksStreamState:
     def add_session(self, session):
         with self.lock:
             self.sessions.append(session)
+            # Only page-mode sessions gate stream readiness. Telephone-mode
+            # dials are independent: the broadcast must start immediately and
+            # play on other endpoints while the phone rings, so they never
+            # block (and a phone that is never answered must not fail or stall
+            # the broadcast).
             if session.mode == SIP_OUTPUT_MODE_PAGE:
                 self.page_pending += 1
 
     def mark_nonblocking_ready(self):
+        should_mark = False
         with self.lock:
             if not self.ready_marked and self.page_pending <= 0:
                 self.ready_marked = True
-        if self.ready_marked:
+                should_mark = True
+        if should_mark:
             mark_ready(self.module_name, self.stream_id)
 
     def session_ready(self, session):
@@ -3578,9 +4960,20 @@ class SipTrunksStreamState:
 
     def session_done(self, session):
         empty = False
+        should_mark = False
         with self.lock:
+            # A page-mode session that finishes without ever becoming ready
+            # (e.g. the page zone never answered) must release its hold so the
+            # broadcast is not blocked forever.
+            if session.mode == SIP_OUTPUT_MODE_PAGE and not session.ready_sent and self.page_pending > 0:
+                self.page_pending -= 1
+                if not self.ready_marked and self.page_pending <= 0:
+                    self.ready_marked = True
+                    should_mark = True
             self.sessions = [item for item in self.sessions if item is not session]
             empty = not self.sessions
+        if should_mark:
+            mark_ready(self.module_name, self.stream_id)
         if empty:
             self.recorder.cleanup()
             self.on_empty(self.stream_id)
@@ -3620,7 +5013,14 @@ class BuiltinSipTrunksRuntime:
         if any(str(target).strip().lower() == "all" for target in sub_targets):
             return rows
         wanted = {str(target).strip() for target in sub_targets if str(target).strip()}
-        return [row for row in rows if f"number-{row.get('id')}" in wanted or str(row.get("id")) in wanted]
+        matched = []
+        for row in rows:
+            row_id = str(row.get("id") or "").strip()
+            if f"number-{row_id}" not in wanted and row_id not in wanted:
+                continue
+            canonical = sip_fetch_output_row(row_id) if row_id.isdigit() else None
+            matched.append(canonical or row)
+        return matched
 
     def handle_dispatch(self, action, stream_id, msg_id, sub_targets, metadata=None):
         if action not in {"prepare_audio", "prepare_livepage"}:
@@ -3634,7 +5034,19 @@ class BuiltinSipTrunksRuntime:
             mark_failed("siptrunks", stream_id)
             return
         for row in rows:
-            session = SipOutputSession(row, metadata or {}, state.recorder, state.session_ready, state.session_done)
+            if not str(row.get("trunk_id") or "").strip():
+                log(f"siptrunks dispatch invalid_row stream={stream_id} row_id={row.get('id')} reason=missing_trunk_id")
+                mark_failed("siptrunks", stream_id)
+                return
+            session = SipOutputSession(
+                row,
+                metadata or {},
+                state.recorder,
+                state.session_ready,
+                state.session_done,
+                module_name="siptrunks",
+                stream_id=stream_id,
+            )
             state.add_session(session)
             session.start()
         state.mark_nonblocking_ready()
@@ -3663,76 +5075,475 @@ class BuiltinSipTrunksRuntime:
             state.stop_all()
 
 
-def multicast_rtp_form_html(values, error, submit_label):
+MULTICAST_RTP_FORM_SCRIPT = r"""<script>
+(function() {
+  function escapeAttr(value) {
+    return String(value == null ? '' : value).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+  function escapeHtml(value) {
+    return String(value == null ? '' : value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+  function isIpv4MulticastHost(host) {
+    var parts = String(host || '').trim().split('.');
+    if (parts.length !== 4) return false;
+    var first = Number(parts[0]);
+    return Number.isInteger(first) && first >= 224 && first <= 239;
+  }
+  function isMulticastHost(host) {
+    host = String(host || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+    if (host.indexOf(':') >= 0) return host.indexOf('ff') === 0;
+    return isIpv4MulticastHost(host);
+  }
+  function parseRtp(url) {
+    var m = /^rtp:\/\/(.+)$/i.exec(String(url || '').trim());
+    if (!m) return null;
+    var rest = m[1].split('/')[0];
+    var host, port;
+    if (rest.charAt(0) === '[') {
+      var idx = rest.indexOf(']');
+      host = rest.slice(1, idx);
+      port = rest.slice(idx + 2);
+    } else {
+      var bits = rest.split(':');
+      host = bits[0];
+      port = bits[1];
+    }
+    return { host: host, port: Number(port) };
+  }
+  function looksLikeSource(url) {
+    var u = String(url || '').trim().toLowerCase();
+    return u.indexOf('http://') === 0 || u.indexOf('https://') === 0 || u.indexOf('rtp://') === 0;
+  }
+  function warnFor(url) {
+    var rtp = parseRtp(url);
+    if (!rtp || !rtp.port) return '';
+    if (isMulticastHost(rtp.host)) return '';
+    if (STANDBY_PORT_CONFLICTS.indexOf(rtp.port) >= 0) return 'Port ' + rtp.port + ' is already in use';
+    return '';
+  }
+  var DRAG = '\u2630', UP = '\u25B4', DOWN = '\u25BE', TRASH = '\uD83D\uDDD1', WARN = '\u26A0';
+
+  function setupStreamList(listId, hiddenId) {
+    var listEl = document.getElementById(listId);
+    var hiddenEl = document.getElementById(hiddenId);
+    if (!listEl || !hiddenEl) return null;
+    var items;
+    try { items = JSON.parse(hiddenEl.value || '[]'); } catch (e) { items = []; }
+    if (!Array.isArray(items)) items = [];
+    items = items.map(function(x) { return typeof x === 'string' ? x : (x && x.url ? x.url : ''); });
+    if (items.length === 0) items = [''];
+    var dragIndex = null;
+
+    function sync() {
+      hiddenEl.value = JSON.stringify(items.map(function(u) { return String(u || '').trim(); }).filter(function(u) { return u !== ''; }));
+    }
+    function rowHtml(url, i) {
+      var warn = warnFor(url);
+      return '<div class="stream-row" data-idx="' + i + '">' +
+        '<span class="drag-handle" draggable="true" data-idx="' + i + '" title="Drag to reorder">' + DRAG + '</span>' +
+        '<input class="control stream-url" data-idx="' + i + '" value="' + escapeAttr(url) + '" placeholder="' + escapeAttr(STANDBY_PLACEHOLDER) + '">' +
+        '<span class="stream-warn' + (warn ? ' show' : '') + '">' + WARN + ' <span class="warn-text">' + escapeHtml(warn) + '</span></span>' +
+        '<button type="button" class="icon-btn" data-act="add" data-idx="' + i + '" title="Add stream">+</button>' +
+        '<button type="button" class="icon-btn" data-act="up" data-idx="' + i + '"' + (i === 0 ? ' disabled' : '') + ' title="Move up">' + UP + '</button>' +
+        '<button type="button" class="icon-btn" data-act="down" data-idx="' + i + '"' + (i === items.length - 1 ? ' disabled' : '') + ' title="Move down">' + DOWN + '</button>' +
+        '<button type="button" class="icon-btn trash" data-act="remove" data-idx="' + i + '" title="Remove">' + TRASH + '</button>' +
+        '</div>';
+    }
+    function render() {
+      var html = '';
+      for (var i = 0; i < items.length; i++) html += rowHtml(items[i], i);
+      listEl.innerHTML = html;
+      sync();
+    }
+    listEl.addEventListener('click', function(event) {
+      var btn = event.target.closest('.icon-btn');
+      if (!btn) return;
+      var idx = Number(btn.getAttribute('data-idx'));
+      var act = btn.getAttribute('data-act');
+      if (act === 'add') {
+        if (items.length >= STANDBY_MAX_SOURCES) return;
+        items.splice(idx + 1, 0, '');
+      } else if (act === 'remove') {
+        items.splice(idx, 1);
+        if (items.length === 0) items = [''];
+      } else if (act === 'up' && idx > 0) {
+        var a = items[idx]; items[idx] = items[idx - 1]; items[idx - 1] = a;
+      } else if (act === 'down' && idx < items.length - 1) {
+        var b = items[idx]; items[idx] = items[idx + 1]; items[idx + 1] = b;
+      } else { return; }
+      render();
+    });
+    listEl.addEventListener('input', function(event) {
+      if (!event.target.classList.contains('stream-url')) return;
+      var idx = Number(event.target.getAttribute('data-idx'));
+      items[idx] = event.target.value;
+      sync();
+      var row = event.target.closest('.stream-row');
+      var warnEl = row ? row.querySelector('.stream-warn') : null;
+      if (warnEl) {
+        var warn = warnFor(items[idx]);
+        warnEl.classList.toggle('show', !!warn);
+        var wt = warnEl.querySelector('.warn-text');
+        if (wt) wt.textContent = warn;
+      }
+    });
+    listEl.addEventListener('dragstart', function(event) {
+      var handle = event.target.closest('.drag-handle');
+      if (!handle) { event.preventDefault(); return; }
+      dragIndex = Number(handle.getAttribute('data-idx'));
+      event.dataTransfer.effectAllowed = 'move';
+      try { event.dataTransfer.setData('text/plain', String(dragIndex)); } catch (e) {}
+      var row = handle.closest('.stream-row');
+      if (row) row.classList.add('dragging');
+    });
+    listEl.addEventListener('dragover', function(event) { event.preventDefault(); });
+    listEl.addEventListener('drop', function(event) {
+      event.preventDefault();
+      var row = event.target.closest('.stream-row');
+      if (row == null || dragIndex == null) { dragIndex = null; return; }
+      var target = Number(row.getAttribute('data-idx'));
+      if (target === dragIndex) { dragIndex = null; render(); return; }
+      var moved = items.splice(dragIndex, 1)[0];
+      items.splice(target, 0, moved);
+      dragIndex = null;
+      render();
+    });
+    listEl.addEventListener('dragend', function() { dragIndex = null; render(); });
+    render();
+    return {
+      count: function() { return items.map(function(u) { return String(u || '').trim(); }).filter(function(u) { return u !== ''; }).length; },
+      invalid: function() { return items.some(function(u) { var t = String(u || '').trim(); return t !== '' && !looksLikeSource(t); }); },
+    };
+  }
+
+  var multicastForm = document.getElementById('multicastRtpForm');
+  var multicastAddress = document.getElementById('multicastAddress');
+  var multicastPort = document.getElementById('multicastPort');
+  var packetMs = document.getElementById('packetMs');
+  var saveMulticastRtp = document.getElementById('saveMulticastRtp');
+  var multicastClientError = document.getElementById('multicastClientError');
+  var standbyModeRadios = document.getElementsByName('standby_mode');
+  function getStandbyMode() {
+    for (var i = 0; i < standbyModeRadios.length; i++) {
+      if (standbyModeRadios[i].checked) return standbyModeRadios[i].value;
+    }
+    return 'stop';
+  }
+  var standbyRebroadcast = document.getElementById('standbyRebroadcast');
+  var standbyEmergency = document.getElementById('standbyEmergency');
+  var standbyMsgAction = document.getElementById('standbyMsgAction');
+  var standbyMsgPriority = document.getElementById('standbyMsgPriority');
+  var standbyKeepText = document.getElementById('standbyKeepText');
+  var standbyThresholdText = document.getElementById('standbyThresholdText');
+  var standbyOrHigher = document.getElementById('standbyOrHigher');
+  var mutePriority = document.getElementById('mutePriority');
+  var mutePriorityOrHigher = document.getElementById('mutePriorityOrHigher');
+  var multicastCodec = document.getElementById('multicastCodec');
+  var codecChangeWarn = document.getElementById('codecChangeWarn');
+  var codecHdInfo = document.getElementById('codecHdInfo');
+  var codecHdInfoText = document.getElementById('codecHdInfoText');
+
+  function syncCodecNotes() {
+    if (!multicastCodec) return;
+    var codec = String(multicastCodec.value || '').toUpperCase();
+    var isHd = codec !== 'PCMU' && codec !== 'PCMA';
+    if (codecHdInfoText) {
+      codecHdInfoText.textContent = MC_SHOW_DOCS
+        ? "Many telephony endpoints don't support HD audio for multicast streams. For more information, view documentation."
+        : "Many telephony endpoints don't support HD audio for multicast streams";
+    }
+    if (codecHdInfo) codecHdInfo.style.display = isHd ? '' : 'none';
+    var changed = codec !== String(MC_ORIGINAL_CODEC || '').toUpperCase();
+    if (codecChangeWarn) codecChangeWarn.style.display = (changed && MC_STREAM_ACTIVE) ? '' : 'none';
+  }
+  if (multicastCodec) multicastCodec.addEventListener('change', syncCodecNotes);
+  syncCodecNotes();
+
+  var standbyList = setupStreamList('standbyStreamList', 'standbySourcesInput');
+  var emergencyList = setupStreamList('emergencyStreamList', 'emergencySourcesInput');
+
+  function isIpv4Multicast(value) {
+    var parts = String(value || '').trim().split('.');
+    if (parts.length !== 4) return false;
+    var octets = parts.map(function(p) { return Number(p); });
+    if (octets.some(function(o, i) { return !Number.isInteger(o) || o < 0 || o > 255 || String(o) !== parts[i]; })) return false;
+    return octets[0] >= 224 && octets[0] <= 239;
+  }
+  function isIpv6Multicast(value) {
+    var normalized = String(value || '').trim().toLowerCase();
+    if (normalized.indexOf(':') < 0 || !/^[0-9a-f:.]+$/.test(normalized)) return false;
+    var first = normalized.split(':', 1)[0];
+    return first.length > 0 && first.length <= 4 && first.indexOf('ff') === 0;
+  }
+  function isMulticastAddress(value) { return isIpv4Multicast(value) || isIpv6Multicast(value); }
+  function isValidPort(value) { var p = Number(value); return Number.isInteger(p) && p >= 2 && p <= 65534 && p % 2 === 0; }
+  function isValidPacketMs(value) { var ms = Number(value); return Number.isInteger(ms) && ms >= MC_MIN_MS && ms <= MC_MAX_MS && ms % 20 === 0; }
+
+  function syncStandbyVisibility() {
+    var mode = getStandbyMode();
+    if (standbyRebroadcast) standbyRebroadcast.classList.toggle('show', mode === 'rebroadcast');
+    var action = standbyMsgAction ? standbyMsgAction.value : 'keep';
+    if (standbyKeepText) standbyKeepText.style.display = action === 'keep' ? '' : 'none';
+    if (standbyThresholdText) standbyThresholdText.style.display = action === 'keep' ? 'none' : '';
+    if (standbyOrHigher) standbyOrHigher.style.display = (standbyMsgPriority && standbyMsgPriority.value === 'Emergency') ? 'none' : '';
+    if (standbyEmergency) standbyEmergency.classList.toggle('show', mode === 'rebroadcast' && action === 'emergency');
+    if (mutePriorityOrHigher) mutePriorityOrHigher.style.display = (mutePriority && mutePriority.value === 'Emergency') ? 'none' : '';
+  }
+
+  function syncMulticastForm() {
+    var errors = [];
+    if (!isMulticastAddress(multicastAddress.value)) errors.push('Enter a multicast address.');
+    if (!isValidPort(multicastPort.value)) errors.push('Enter an even UDP port.');
+    if (!isValidPacketMs(packetMs.value)) errors.push('Packet size must be a 20 ms increment between 20 and 200 ms.');
+    var mode = getStandbyMode();
+    if (mode === 'rebroadcast') {
+      if (standbyList && standbyList.count() === 0) errors.push('Add at least one background audio source.');
+      if (standbyList && standbyList.invalid()) errors.push('Sources must be http(s):// or rtp:// URLs.');
+      if (standbyMsgAction && standbyMsgAction.value === 'emergency') {
+        if (emergencyList && emergencyList.count() === 0) errors.push('Add at least one emergency stream.');
+        if (emergencyList && emergencyList.invalid()) errors.push('Emergency streams must be http(s):// or rtp:// URLs.');
+      }
+    }
+    multicastAddress.setCustomValidity(errors.some(function(e) { return e.indexOf('multicast') >= 0; }) ? 'Enter a multicast address.' : '');
+    multicastPort.setCustomValidity(errors.some(function(e) { return e.indexOf('port') >= 0; }) ? 'Enter an even UDP port.' : '');
+    packetMs.setCustomValidity(errors.some(function(e) { return e.indexOf('Packet size') >= 0; }) ? 'Packet size must be a 20 ms increment between 20 and 200 ms.' : '');
+    multicastClientError.textContent = errors.join(' ');
+    multicastClientError.style.display = errors.length ? 'block' : 'none';
+    saveMulticastRtp.disabled = errors.length > 0;
+    return errors.length === 0;
+  }
+
+  [multicastAddress, multicastPort, packetMs].forEach(function(input) { input.addEventListener('input', syncMulticastForm); });
+  Array.prototype.forEach.call(standbyModeRadios, function(radio) {
+    radio.addEventListener('change', function() { syncStandbyVisibility(); syncMulticastForm(); });
+  });
+  if (standbyMsgAction) standbyMsgAction.addEventListener('change', function() { syncStandbyVisibility(); syncMulticastForm(); });
+  if (standbyMsgPriority) standbyMsgPriority.addEventListener('change', syncStandbyVisibility);
+  if (mutePriority) mutePriority.addEventListener('change', syncStandbyVisibility);
+  if (multicastForm) multicastForm.addEventListener('submit', function(event) {
+    syncStandbyVisibility();
+    if (!syncMulticastForm()) { event.preventDefault(); multicastForm.reportValidity(); }
+  });
+  document.addEventListener('input', function(event) {
+    if (event.target && event.target.classList && event.target.classList.contains('stream-url')) syncMulticastForm();
+  });
+  document.addEventListener('click', function(event) {
+    if (event.target && event.target.closest && event.target.closest('.icon-btn')) setTimeout(syncMulticastForm, 0);
+  });
+  syncStandbyVisibility();
+  syncMulticastForm();
+})();
+</script>"""
+
+
+MULTICAST_RTP_FORM_CSS = """<style>
+.standby-block{display:none;grid-template-columns:1fr;gap:10px;border:1px solid #e6e8eb;border-radius:6px;padding:12px;margin-top:4px}
+.standby-block.show{display:grid}
+.stream-list{display:grid;gap:8px}
+.stream-row{display:flex;align-items:center;gap:6px}
+.stream-row .drag-handle{cursor:grab;color:#9aa0a6;font-size:15px;line-height:1;user-select:none;padding:0 2px}
+.stream-row.dragging{opacity:.5}
+.stream-url{flex:1 1 auto;min-width:0}
+.icon-btn{background:transparent;border:0;padding:2px 4px;margin:0;color:#5f6368;cursor:pointer;font-size:14px;line-height:1;border-radius:0;box-shadow:none}
+.icon-btn:hover{color:#1976D2}
+.icon-btn.trash{color:#C62828}
+.icon-btn.trash:hover{color:#B71C1C}
+.icon-btn:disabled{opacity:.35;cursor:default}
+.stream-warn{display:none;align-items:center;gap:4px;color:#B7791F;font-size:.82em;white-space:nowrap}
+.stream-warn.show{display:inline-flex}
+.stream-priority-line{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:6px;line-height:1.9}
+.stream-priority-line select{width:auto;min-width:0;display:inline-block}
+.amp-grid{display:grid;gap:8px;margin-top:6px}
+.amp-row{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.amp-row .amp-label{flex:1 1 auto;min-width:0}
+.amp-row select{width:auto;min-width:120px;flex:0 0 auto}
+.amp-mute-line{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:2px;line-height:1.9}
+.amp-mute-line select{width:auto;min-width:0;display:inline-block}
+.amp-check{display:inline-flex;align-items:center;gap:6px}
+.amp-check input{width:auto;margin:0}
+.stream-hint{color:#5f6368;font-size:.84em;margin:2px 0 0}
+.standby-mode-control{max-width:360px}
+.mdc-radio-group{display:grid;gap:2px}
+.mdc-radio-row{display:flex;align-items:flex-start;gap:10px;padding:8px;border-radius:6px;cursor:pointer;position:relative}
+.mdc-radio-row:hover{background:rgba(25,118,210,.06)}
+.mdc-radio-input{position:absolute;opacity:0;width:0;height:0;margin:0}
+.mdc-radio-circle{flex:0 0 auto;position:relative;width:20px;height:20px;margin-top:1px;border:2px solid #5f6368;border-radius:50%;box-sizing:border-box;transition:border-color .15s ease}
+.mdc-radio-circle::after{content:"";position:absolute;top:50%;left:50%;width:10px;height:10px;border-radius:50%;background:#1976D2;transform:translate(-50%,-50%) scale(0);transition:transform .15s ease}
+.mdc-radio-input:checked + .mdc-radio-circle{border-color:#1976D2}
+.mdc-radio-input:checked + .mdc-radio-circle::after{transform:translate(-50%,-50%) scale(1)}
+.mdc-radio-input:focus-visible + .mdc-radio-circle{box-shadow:0 0 0 4px rgba(25,118,210,.2)}
+.mdc-radio-text{display:flex;flex-direction:column;line-height:1.35}
+.mdc-radio-title{font-size:.95em}
+.mdc-radio-desc{color:#5f6368;font-size:.82em}
+.codec-note{display:flex;align-items:flex-start;gap:6px;font-size:.84em;margin:4px 0 0;max-width:360px}
+.codec-note .codec-note-icon{flex:0 0 auto;line-height:1.4}
+.codec-note.warn{color:#B7791F}
+.codec-note.info{color:#1976D2}
+@media(prefers-color-scheme:dark){.standby-block{border-color:#333}.icon-btn{color:#bbb}.icon-btn.trash{color:#EF9A9A}.stream-warn{color:#F6C244}.stream-hint{color:#aaa}.codec-note.warn{color:#F6C244}.codec-note.info{color:#64B5F6}.mdc-radio-row:hover{background:rgba(100,181,246,.12)}.mdc-radio-circle{border-color:#aaa}.mdc-radio-circle::after{background:#64B5F6}.mdc-radio-input:checked + .mdc-radio-circle{border-color:#64B5F6}.mdc-radio-desc{color:#aaa}}
+</style>"""
+
+
+def multicast_rtp_show_online_docs():
+    """Read the server's show_online_docs setting (defaults to enabled)."""
+    try:
+        conn = get_db_connection()
+    except Exception:
+        return True
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM systemsettings WHERE parameter=%s LIMIT 1", ("show_online_docs",))
+            row = cur.fetchone()
+        if not row:
+            return True
+        value = row.get("value") if isinstance(row, dict) else row[0]
+        return str(value if value is not None else "1") == "1"
+    except Exception:
+        return True
+    finally:
+        conn.close()
+
+
+def multicast_rtp_endpoint_streaming(row_id):
+    """True when the resident channel for this endpoint is currently emitting
+    audio (an active broadcast, or rebroadcast background music)."""
+    with loaded_modules_lock:
+        mod = loaded_modules.get(MULTICAST_RTP_MODULE)
+    if mod is None or not hasattr(mod, "endpoint_streaming"):
+        return False
+    try:
+        return bool(mod.endpoint_streaming(row_id))
+    except Exception:
+        return False
+
+
+def multicast_rtp_form_html(values, error, submit_label, stream_active=False):
     error_html = f'<div class="error">{h(error)}</div>' if error else ""
+    show_docs = multicast_rtp_show_online_docs()
     selected_codec = str(values.get("codec") or "PCMU").strip().upper()
     codec_options = "".join(
         f'<option value="{h(codec)}"{" selected" if selected_codec == codec else ""}>{h(codec)}</option>'
-        for codec in ("PCMU", "PCMA")
+        for codec in ("PCMU", "PCMA", "G722", "G7221C", "G726-32", "OPUS")
     )
-    return f"""{error_html}<form method="post" class="grid form-surface" id="multicastRtpForm">
+    standby_mode = str(values.get("standby_mode") or "stop").strip().lower()
+    if standby_mode not in MULTICAST_RTP_STANDBY_MODES:
+        standby_mode = "stop"
+    standby_mode_radios = "".join(
+        '<label class="mdc-radio-row">'
+        f'<input type="radio" class="mdc-radio-input" name="standby_mode" value="{h(value)}"'
+        f' id="standbyMode_{h(value)}"{" checked" if standby_mode == value else ""}>'
+        '<span class="mdc-radio-circle"></span>'
+        '<span class="mdc-radio-text">'
+        f'<span class="mdc-radio-title">{h(title)}</span>'
+        f'<span class="mdc-radio-desc">{h(desc)}</span>'
+        '</span>'
+        '</label>'
+        for value, title, desc in (
+            ("stop", "Stop stream", "Recommended for phones"),
+            ("rebroadcast", "Rebroadcast external source", "Play background audio while idle"),
+            ("silence", "Send silent frames", "Useful for debugging"),
+        )
+    )
+    msg_action = str(values.get("standby_msg_action") or "stop").strip().lower()
+    if msg_action not in MULTICAST_RTP_STANDBY_MSG_ACTIONS:
+        msg_action = "stop"
+    msg_action_options = "".join(
+        f'<option value="{h(value)}"{" selected" if msg_action == value else ""}>{h(label)}</option>'
+        for value, label in (
+            ("keep", "Keep rebroadcasting audio"),
+            ("stop", "Stop audio"),
+            ("silence", "Send silence frames"),
+            ("emergency", "Switch to emergency streams"),
+        )
+    )
+    msg_priority = str(values.get("standby_msg_priority") or "Emergency").strip().title()
+    if msg_priority not in VALID_MESSAGE_PRIORITIES:
+        msg_priority = "Emergency"
+    priority_options = "".join(
+        f'<option value="{h(name)}"{" selected" if msg_priority == name else ""}>{h(name)}</option>'
+        for name in ("Low", "Normal", "High", "Emergency")
+    )
+    amp_master_options = multicast_rtp_gain_options(multicast_rtp_clean_gain(values.get("amp_master"), MULTICAST_RTP_AMP_DEFAULTS["amp_master"]))
+    amp_page_options = multicast_rtp_gain_options(multicast_rtp_clean_gain(values.get("amp_page"), MULTICAST_RTP_AMP_DEFAULTS["amp_page"]))
+    amp_bell_options = multicast_rtp_gain_options(multicast_rtp_clean_gain(values.get("amp_bell"), MULTICAST_RTP_AMP_DEFAULTS["amp_bell"]))
+    amp_message_options = multicast_rtp_gain_options(multicast_rtp_clean_gain(values.get("amp_message"), MULTICAST_RTP_AMP_DEFAULTS["amp_message"]))
+    mute_priority = str(values.get("mute_priority") or "High").strip().title()
+    if mute_priority not in VALID_MESSAGE_PRIORITIES:
+        mute_priority = "High"
+    mute_priority_options = "".join(
+        f'<option value="{h(name)}"{" selected" if mute_priority == name else ""}>{h(name)}</option>'
+        for name in ("Low", "Normal", "High", "Emergency")
+    )
+    mute_priority_checked = " checked" if str(values.get("mute_priority_enabled") or "").strip() in ("1", "on", "true", "yes") else ""
+    mute_or_higher_style = ' style="display:none"' if mute_priority == "Emergency" else ""
+    try:
+        standby_sources_list = json.loads(values.get("standby_sources") or "[]")
+        if not isinstance(standby_sources_list, list):
+            standby_sources_list = []
+    except (ValueError, TypeError):
+        standby_sources_list = []
+    try:
+        emergency_sources_list = json.loads(values.get("emergency_sources") or "[]")
+        if not isinstance(emergency_sources_list, list):
+            emergency_sources_list = []
+    except (ValueError, TypeError):
+        emergency_sources_list = []
+    conflicts = multicast_rtp_standby_port_conflicts(standby_sources_list + emergency_sources_list)
+    standby_sources_attr = h(json.dumps(standby_sources_list))
+    emergency_sources_attr = h(json.dumps(emergency_sources_list))
+    rebroadcast_show = " show" if standby_mode == "rebroadcast" else ""
+    emergency_show = " show" if (standby_mode == "rebroadcast" and msg_action == "emergency") else ""
+    js_config = (
+        "<script>\n"
+        f"const STANDBY_PLACEHOLDER = {json.dumps(MULTICAST_RTP_STANDBY_SOURCE_PLACEHOLDER)};\n"
+        f"const STANDBY_MAX_SOURCES = {MULTICAST_RTP_MAX_STANDBY_SOURCES};\n"
+        f"const STANDBY_PORT_CONFLICTS = {json.dumps(conflicts)};\n"
+        f"const MC_MIN_MS = {MULTICAST_RTP_MIN_PACKET_MS};\n"
+        f"const MC_MAX_MS = {MULTICAST_RTP_MAX_PACKET_MS};\n"
+        f"const MC_ORIGINAL_CODEC = {json.dumps(str(values.get('codec') or 'PCMU').strip().upper())};\n"
+        f"const MC_STREAM_ACTIVE = {json.dumps(bool(stream_active))};\n"
+        f"const MC_SHOW_DOCS = {json.dumps(bool(show_docs))};\n"
+        "</script>"
+    )
+    body = f"""{MULTICAST_RTP_FORM_CSS}{error_html}<form method="post" class="grid form-surface" id="multicastRtpForm">
 <div class="notice">{h(MULTICAST_RTP_WARNING)}</div>
 <div class="row"><label>Name</label><input class="control" name="name" value="{h(values.get("name"))}" required></div>
 <div class="row"><label>Multicast Address</label><input class="control" name="address" id="multicastAddress" value="{h(values.get("address"))}" required></div>
 <div class="row"><label>Port</label><input class="control short-control" type="number" name="port" id="multicastPort" value="{h(values.get("port"))}" min="2" max="65534" step="2" required></div>
-<div class="row"><label>Codec</label><select class="control short-control" name="codec">{codec_options}</select></div>
+<div class="row"><label>Codec</label><select class="control short-control" name="codec" id="multicastCodec">{codec_options}</select></div>
+<div class="codec-note warn" id="codecChangeWarn" style="display:none"><span class="codec-note-icon">&#9888;</span><span>Changing codec will cause audio to stop momentarily</span></div>
+<div class="codec-note info" id="codecHdInfo" style="display:none"><span class="codec-note-icon">&#9432;</span><span id="codecHdInfoText"></span></div>
+<div class="row"><label>On standby</label><div class="mdc-radio-group standby-mode-control" id="standbyMode">{standby_mode_radios}</div></div>
+<div class="standby-block{rebroadcast_show}" id="standbyRebroadcast">
+  <label>Background audio source</label>
+  <input type="hidden" name="standby_sources" id="standbySourcesInput" value="{standby_sources_attr}">
+  <div class="stream-list" id="standbyStreamList"></div>
+  <div class="stream-priority-line">
+    <select class="control short-control" name="standby_msg_action" id="standbyMsgAction">{msg_action_options}</select>
+    <span id="standbyKeepText">during standby when a message is in effect</span>
+    <span id="standbyThresholdText">when a message of <select class="control short-control" name="standby_msg_priority" id="standbyMsgPriority">{priority_options}</select> priority <span id="standbyOrHigher">or higher </span>is in effect while in standby</span>
+  </div>
+  <div class="standby-block{emergency_show}" id="standbyEmergency">
+    <label>Emergency streams</label>
+    <input type="hidden" name="emergency_sources" id="emergencySourcesInput" value="{emergency_sources_attr}">
+    <div class="stream-list" id="emergencyStreamList"></div>
+  </div>
+  <div class="amp-grid">
+    <div class="amp-row"><span class="amp-label">Amplify audio</span><select class="control short-control" name="amp_master">{amp_master_options}</select></div>
+    <div class="amp-row"><span class="amp-label">Amplify audio on page</span><select class="control short-control" name="amp_page">{amp_page_options}</select></div>
+    <div class="amp-row"><span class="amp-label">Amplify audio on bell</span><select class="control short-control" name="amp_bell">{amp_bell_options}</select></div>
+    <div class="amp-row"><span class="amp-label">Amplify audio on message</span><select class="control short-control" name="amp_message">{amp_message_options}</select></div>
+  </div>
+  <div class="amp-mute-line">
+    <label class="amp-check"><input type="checkbox" name="mute_priority_enabled" id="mutePriorityEnabled" value="1"{mute_priority_checked}> Mute audio during broadcast of a message</label>
+    <select class="control short-control" name="mute_priority" id="mutePriority">{mute_priority_options}</select>
+    <span>priority <span id="mutePriorityOrHigher"{mute_or_higher_style}>or higher </span></span>
+  </div>
+</div>
 <details class="advanced"><summary>Advanced options</summary><div class="advanced-body"><div class="row"><label>Packet Size (ms)</label><input class="control short-control" type="number" name="packet_ms" id="packetMs" value="{h(values.get("packet_ms") or MULTICAST_RTP_DEFAULT_PACKET_MS)}" min="{MULTICAST_RTP_MIN_PACKET_MS}" max="{MULTICAST_RTP_MAX_PACKET_MS}" step="20" required></div></div></details>
 <div class="error" id="multicastClientError" style="display:none"></div>
 <button class="button" id="saveMulticastRtp" type="submit">{h(submit_label)}</button>
-</form>
-<script>
-const multicastForm = document.getElementById('multicastRtpForm');
-const multicastAddress = document.getElementById('multicastAddress');
-const multicastPort = document.getElementById('multicastPort');
-const packetMs = document.getElementById('packetMs');
-const saveMulticastRtp = document.getElementById('saveMulticastRtp');
-const multicastClientError = document.getElementById('multicastClientError');
-function isIpv4Multicast(value) {{
-  const parts = value.trim().split('.');
-  if (parts.length !== 4) return false;
-  const octets = parts.map(part => Number(part));
-  if (octets.some((octet, index) => !Number.isInteger(octet) || octet < 0 || octet > 255 || String(octet) !== parts[index])) return false;
-  return octets[0] >= 224 && octets[0] <= 239;
-}}
-function isIpv6Multicast(value) {{
-  const normalized = value.trim().toLowerCase();
-  if (!normalized.includes(':') || !/^[0-9a-f:.]+$/.test(normalized)) return false;
-  const first = normalized.split(':', 1)[0];
-  return first.length > 0 && first.length <= 4 && first.startsWith('ff');
-}}
-function isMulticastAddress(value) {{
-  return isIpv4Multicast(value) || isIpv6Multicast(value);
-}}
-function isValidPort(value) {{
-  const port = Number(value);
-  return Number.isInteger(port) && port >= 2 && port <= 65534 && port % 2 === 0;
-}}
-function isValidPacketMs(value) {{
-  const ms = Number(value);
-  return Number.isInteger(ms) && ms >= {MULTICAST_RTP_MIN_PACKET_MS} && ms <= {MULTICAST_RTP_MAX_PACKET_MS} && ms % 20 === 0;
-}}
-function syncMulticastForm() {{
-  const errors = [];
-  if (!isMulticastAddress(multicastAddress.value)) errors.push('Enter a multicast address.');
-  if (!isValidPort(multicastPort.value)) errors.push('Enter an even UDP port.');
-  if (!isValidPacketMs(packetMs.value)) errors.push('Packet size must be a 20 ms increment between 20 and 200 ms.');
-  multicastAddress.setCustomValidity(errors.some(error => error.includes('multicast')) ? 'Enter a multicast address.' : '');
-  multicastPort.setCustomValidity(errors.some(error => error.includes('port')) ? 'Enter an even UDP port.' : '');
-  packetMs.setCustomValidity(errors.some(error => error.includes('Packet size')) ? 'Packet size must be a 20 ms increment between 20 and 200 ms.' : '');
-  multicastClientError.textContent = errors.join(' ');
-  multicastClientError.style.display = errors.length ? 'block' : 'none';
-  saveMulticastRtp.disabled = errors.length > 0;
-  return errors.length === 0;
-}}
-[multicastAddress, multicastPort, packetMs].forEach(input => input.addEventListener('input', syncMulticastForm));
-multicastForm.addEventListener('submit', event => {{
-  if (!syncMulticastForm()) {{
-    event.preventDefault();
-    multicastForm.reportValidity();
-  }}
-}});
-syncMulticastForm();
-</script>"""
+</form>"""
+    return body + js_config + MULTICAST_RTP_FORM_SCRIPT
 
 
 class BuiltinMulticastRTPWeb:
@@ -3757,9 +5568,10 @@ class BuiltinMulticastRTPWeb:
                 if duplicate:
                     raise ValueError("That multicast address and port already exists.")
                 sip_execute(
-                    f"INSERT INTO `{MULTICAST_RTP_TABLE}` (`name`, `address`, `port`, `codec`, `packet_ms`) VALUES (%s,%s,%s,%s,%s)",
-                    (clean["name"], clean["address"], clean["port"], clean["codec"], clean["packet_ms"]),
+                    f"INSERT INTO `{MULTICAST_RTP_TABLE}` (`name`, `address`, `port`, `codec`, `packet_ms`, `standby_mode`, `standby_sources`, `standby_msg_action`, `standby_msg_priority`, `emergency_sources`, `amp_master`, `amp_page`, `amp_bell`, `amp_message`, `mute_priority_enabled`, `mute_priority`) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (clean["name"], clean["address"], clean["port"], clean["codec"], clean["packet_ms"], clean["standby_mode"], clean["standby_sources"], clean["standby_msg_action"], clean["standby_msg_priority"], clean["emergency_sources"], clean["amp_master"], clean["amp_page"], clean["amp_bell"], clean["amp_message"], clean["mute_priority_enabled"], clean["mute_priority"]),
                 )
+                multicast_rtp_notify_config_changed()
                 return page("Endpoint Saved", "<script>window.top.location.href='/admin/manage-endpoints'</script><p>Endpoint saved.</p>", "endpoints", user)
             except ValueError as exc:
                 error = str(exc)
@@ -3778,6 +5590,7 @@ class BuiltinMulticastRTPWeb:
         if request.method == "POST":
             if action == "delete":
                 sip_execute(f"DELETE FROM `{MULTICAST_RTP_TABLE}` WHERE id=%s", (row_id,))
+                multicast_rtp_notify_config_changed()
                 return page("Endpoint Saved", "<script>window.top.location.href='/admin/manage-endpoints'</script><p>Endpoint saved.</p>", "endpoints", user)
             values = multicast_rtp_form_values(request.form, row)
             try:
@@ -3789,9 +5602,10 @@ class BuiltinMulticastRTPWeb:
                 if duplicate:
                     raise ValueError("That multicast address and port already exists.")
                 sip_execute(
-                    f"UPDATE `{MULTICAST_RTP_TABLE}` SET `name`=%s, `address`=%s, `port`=%s, `codec`=%s, `packet_ms`=%s WHERE id=%s",
-                    (clean["name"], clean["address"], clean["port"], clean["codec"], clean["packet_ms"], row_id),
+                    f"UPDATE `{MULTICAST_RTP_TABLE}` SET `name`=%s, `address`=%s, `port`=%s, `codec`=%s, `packet_ms`=%s, `standby_mode`=%s, `standby_sources`=%s, `standby_msg_action`=%s, `standby_msg_priority`=%s, `emergency_sources`=%s, `amp_master`=%s, `amp_page`=%s, `amp_bell`=%s, `amp_message`=%s, `mute_priority_enabled`=%s, `mute_priority`=%s WHERE id=%s",
+                    (clean["name"], clean["address"], clean["port"], clean["codec"], clean["packet_ms"], clean["standby_mode"], clean["standby_sources"], clean["standby_msg_action"], clean["standby_msg_priority"], clean["emergency_sources"], clean["amp_master"], clean["amp_page"], clean["amp_bell"], clean["amp_message"], clean["mute_priority_enabled"], clean["mute_priority"], row_id),
                 )
+                multicast_rtp_notify_config_changed()
                 return page("Endpoint Saved", "<script>window.top.location.href='/admin/manage-endpoints'</script><p>Endpoint saved.</p>", "endpoints", user)
             except ValueError as exc:
                 error = str(exc)
@@ -3802,7 +5616,7 @@ class BuiltinMulticastRTPWeb:
 <p class="meta">Delete {h(row.get("name") or endpoint_id)}?</p>
 <button class="danger" type="submit">Delete Endpoint</button></form>"""
         else:
-            body = multicast_rtp_form_html(multicast_rtp_form_values(None, row), error, "Save Multicast RTP")
+            body = multicast_rtp_form_html(multicast_rtp_form_values(None, row), error, "Save Multicast RTP", stream_active=multicast_rtp_endpoint_streaming(row_id))
         return page("Endpoint Action", sip_form_frame(body), "endpoints", user)
 
     def render_settings(self, request, conn_factory, page, user):
@@ -3820,6 +5634,7 @@ class MulticastRTPSender:
         self.frames_per_packet = max(1, self.packet_ms // MULTICAST_RTP_FRAME_MS)
         self.pending_payload = bytearray()
         self.pending_frames = 0
+        self.codec_encoder = None
         self.sequence = random.randrange(0, 65536)
         self.timestamp = random.randrange(0, 4294967296)
         self.ssrc = random.randrange(0, 4294967296)
@@ -3840,12 +5655,20 @@ class MulticastRTPSender:
             self.destination = (self.address, self.port, 0, 0)
 
     def encode_frame(self, payload):
-        if self.codec == "PCMA":
-            return payload.translate(ULAW_TO_ALAW_TABLE)
-        return payload
+        payload = bytes(payload or b"")[:MULTICAST_RTP_FRAME_SIZE].ljust(MULTICAST_RTP_FRAME_SIZE, b"\xff")
+        encoded, self.codec_encoder = encode_edge_rtp_payload(
+            self.codec,
+            payload,
+            encoder_state=self.codec_encoder,
+        )
+        return encoded
 
     def send_frame(self, payload):
         frame = self.encode_frame(payload)
+        if not frame:
+            # Encoder is still priming (first G722/Opus frame); don't emit an
+            # empty RTP packet or advance the frame count.
+            return
         self.pending_payload.extend(frame)
         self.pending_frames += 1
         if self.pending_frames >= self.frames_per_packet:
@@ -3857,7 +5680,12 @@ class MulticastRTPSender:
         header = struct.pack("!BBHII", 0x80, self.payload_type, self.sequence, self.timestamp, self.ssrc)
         self.sock.sendto(header + bytes(self.pending_payload), self.destination)
         self.sequence = (self.sequence + 1) & 0xFFFF
-        self.timestamp = (self.timestamp + (self.pending_frames * MULTICAST_RTP_FRAME_SIZE)) & 0xFFFFFFFF
+        codec_info = SIP_EDGE_CODEC_PAYLOADS.get(self.codec, {})
+        # Multicast listeners have no SDP, so they expect the RTP timestamp to
+        # advance at the codec's true sample rate (e.g. 320/frame for G722's
+        # 16 kHz), not the RFC 3551 8 kHz signalling-only clock.
+        samples_per_frame = int(codec_info.get("sample_rate_wire", 0) or 0) // 50 or int(codec_info.get("samples_per_frame", MULTICAST_RTP_FRAME_SIZE))
+        self.timestamp = (self.timestamp + (self.pending_frames * samples_per_frame)) & 0xFFFFFFFF
         self.pending_payload.clear()
         self.pending_frames = 0
 
@@ -3869,13 +5697,19 @@ class MulticastRTPSender:
 
 
 class MulticastRTPSource:
-    def __init__(self, priority="Normal"):
+    def __init__(self, priority="Normal", klass="message", instant_ready=False):
         self.lock = threading.Lock()
         self.partial_frame = bytearray()
         self.closed = False
         self.preroll_frames = 0
         self.ready_sent = False
         self.priority = priority if priority in VALID_MESSAGE_PRIORITIES else "Normal"
+        self.klass = klass if klass in ("message", "page", "bell") else "message"
+        # When the multicast group is already primed (a resident standby channel
+        # is broadcasting), skip the preroll wait so message audio interrupts the
+        # background instantly instead of buffering behind the ready gate.
+        self.instant_ready = bool(instant_ready)
+        self.had_audio = False
 
     def receive_audio(self, chunk):
         if not chunk:
@@ -3890,12 +5724,14 @@ class MulticastRTPSource:
             if len(self.partial_frame) >= MULTICAST_RTP_FRAME_SIZE:
                 frame = bytes(self.partial_frame[:MULTICAST_RTP_FRAME_SIZE])
                 del self.partial_frame[:MULTICAST_RTP_FRAME_SIZE]
+                self.had_audio = True
                 if discard:
                     return None, False
                 return frame, False
             if self.closed and self.partial_frame:
                 frame = bytes(self.partial_frame).ljust(MULTICAST_RTP_FRAME_SIZE, b"\xff")
                 self.partial_frame.clear()
+                self.had_audio = True
                 if discard:
                     return None, True
                 return frame, True
@@ -3908,6 +5744,9 @@ class MulticastRTPSource:
         with self.lock:
             if self.ready_sent:
                 return False
+            if self.instant_ready:
+                self.ready_sent = True
+                return True
             self.preroll_frames += 1
             if self.preroll_frames >= MULTICAST_RTP_READY_SILENCE_FRAMES:
                 self.ready_sent = True
@@ -3919,21 +5758,483 @@ class MulticastRTPSource:
             self.closed = True
 
 
+# --- Standby (background audio) subsystem -----------------------------------
+# These provide a continuous background stream for a multicast endpoint while no
+# message is in effect (the "On standby" behaviour). Audio is normalised to
+# 8 kHz mono u-law 160-byte frames so it can be mixed with message audio and
+# encoded by the endpoint's configured codec.
+STANDBY_BUFFER_FRAMES = 50            # ~1s of jitter buffer per source
+STANDBY_HEALTHY_WINDOW = 2.0          # seconds since last frame to be "healthy"
+STANDBY_RECONNECT_BACKOFF = 1.0       # seconds between reconnect attempts
+MULTICAST_RTP_PT_TO_CODEC = {payload: codec for codec, payload in MULTICAST_RTP_CODECS.items()}
+
+
+class StandbyReaderBase:
+    def __init__(self, url):
+        self.url = url
+        self.frames = deque(maxlen=STANDBY_BUFFER_FRAMES)
+        self.lock = threading.Lock()
+        self.last_frame_ts = 0.0
+        self.stop_event = threading.Event()
+        self.thread = None
+
+    def start(self):
+        if self.thread is None:
+            self.thread = threading.Thread(target=self._safe_run, daemon=True)
+            self.thread.start()
+
+    def _safe_run(self):
+        try:
+            self._run()
+        except Exception as exc:
+            log(f"standby source error url={self.url}: {exc}")
+
+    def _run(self):
+        raise NotImplementedError
+
+    def _push_ulaw(self, buffer):
+        """Split a growing bytearray into 160-byte frames, pushing complete
+        ones. Returns the buffer trimmed to the trailing partial frame."""
+        while len(buffer) >= MULTICAST_RTP_FRAME_SIZE:
+            frame = bytes(buffer[:MULTICAST_RTP_FRAME_SIZE])
+            del buffer[:MULTICAST_RTP_FRAME_SIZE]
+            with self.lock:
+                self.frames.append(frame)
+                self.last_frame_ts = time.monotonic()
+        return buffer
+
+    def read_frame(self):
+        with self.lock:
+            if self.frames:
+                return self.frames.popleft()
+        return None
+
+    def healthy(self):
+        with self.lock:
+            return (time.monotonic() - self.last_frame_ts) < STANDBY_HEALTHY_WINDOW
+
+    def stop(self):
+        self.stop_event.set()
+
+
+class StandbyHttpReader(StandbyReaderBase):
+    def _run(self):
+        while not self.stop_event.is_set():
+            proc = None
+            try:
+                proc = subprocess.Popen(
+                    [
+                        "ffmpeg", "-v", "quiet", "-nostdin",
+                        "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+                        "-i", self.url,
+                        "-ar", "8000", "-ac", "1", "-f", "mulaw", "-flush_packets", "1", "pipe:1",
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
+                )
+            except FileNotFoundError:
+                log("standby source requires ffmpeg but it was not found")
+                return
+            except OSError as exc:
+                log(f"standby http source spawn error url={self.url}: {exc}")
+                proc = None
+            if proc is not None:
+                buffer = bytearray()
+                try:
+                    while not self.stop_event.is_set():
+                        chunk = proc.stdout.read(MULTICAST_RTP_FRAME_SIZE)
+                        if not chunk:
+                            break
+                        buffer.extend(chunk)
+                        buffer = self._push_ulaw(buffer)
+                finally:
+                    try:
+                        proc.stdout.close()
+                    except Exception:
+                        pass
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+            if self.stop_event.wait(STANDBY_RECONNECT_BACKOFF):
+                break
+
+
+class StandbyRtpReader(StandbyReaderBase):
+    def __init__(self, url, host, port, multicast):
+        super().__init__(url)
+        self.host = host
+        self.port = port
+        self.multicast = multicast
+
+    def _open_socket(self):
+        try:
+            ip = ipaddress.ip_address(self.host)
+            family = socket.AF_INET6 if ip.version == 6 else socket.AF_INET
+        except ValueError:
+            family = socket.AF_INET
+        sock = socket.socket(family, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        bind_addr = "" if family == socket.AF_INET else "::"
+        sock.bind((bind_addr, self.port))
+        if self.multicast:
+            if family == socket.AF_INET:
+                mreq = struct.pack("4s4s", socket.inet_aton(self.host), socket.inet_aton("0.0.0.0"))
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            else:
+                group = socket.inet_pton(socket.AF_INET6, self.host)
+                mreq = group + struct.pack("@I", 0)
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, mreq)
+        sock.settimeout(1.0)
+        return sock
+
+    def _expected_ips(self):
+        if self.multicast:
+            return None
+        try:
+            infos = socket.getaddrinfo(self.host, None, proto=socket.IPPROTO_UDP)
+            return {info[4][0] for info in infos}
+        except OSError:
+            return None
+
+    def _run(self):
+        while not self.stop_event.is_set():
+            sock = None
+            try:
+                sock = self._open_socket()
+            except OSError as exc:
+                log(f"standby rtp bind error url={self.url}: {exc}")
+                if self.stop_event.wait(STANDBY_RECONNECT_BACKOFF):
+                    break
+                continue
+            expected = self._expected_ips()
+            decoder_state = None
+            buffer = bytearray()
+            try:
+                while not self.stop_event.is_set():
+                    try:
+                        packet, addr = sock.recvfrom(4096)
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                    if expected is not None and addr[0] not in expected:
+                        continue
+                    if len(packet) < 12:
+                        continue
+                    payload_type = packet[1] & 0x7F
+                    csrc_count = packet[0] & 0x0F
+                    header_len = 12 + (csrc_count * 4)
+                    payload = packet[header_len:]
+                    if not payload:
+                        continue
+                    codec = MULTICAST_RTP_PT_TO_CODEC.get(payload_type, "PCMU")
+                    try:
+                        ulaw, decoder_state = decode_edge_rtp_payload(codec, payload, decoder_state)
+                    except Exception:
+                        ulaw = b""
+                    if ulaw:
+                        buffer.extend(ulaw)
+                        buffer = self._push_ulaw(buffer)
+            finally:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            if self.stop_event.wait(STANDBY_RECONNECT_BACKOFF):
+                break
+
+
+def make_standby_reader(url):
+    parsed = multicast_rtp_parse_source(url)
+    if parsed["kind"] == "http":
+        return StandbyHttpReader(url)
+    return StandbyRtpReader(url, parsed["host"], parsed["port"], parsed["kind"] == "multicast")
+
+
+def standby_lenient_sources(value):
+    urls = []
+    if isinstance(value, (list, tuple)):
+        raw = list(value)
+    else:
+        text = str(value or "").strip()
+        raw = []
+        if text:
+            try:
+                parsed = json.loads(text)
+                raw = parsed if isinstance(parsed, list) else [text]
+            except (ValueError, TypeError):
+                raw = text.splitlines()
+    for item in raw:
+        if isinstance(item, dict):
+            item = item.get("url")
+        candidate = str(item or "").strip()
+        if not candidate:
+            continue
+        try:
+            multicast_rtp_parse_source(candidate)
+        except ValueError:
+            continue
+        urls.append(candidate)
+        if len(urls) >= MULTICAST_RTP_MAX_STANDBY_SOURCES:
+            break
+    return urls
+
+
+def standby_params(row):
+    mode = str(row.get("standby_mode") or "stop").strip().lower()
+    if mode not in ("rebroadcast", "silence"):
+        return None
+    action = str(row.get("standby_msg_action") or "stop").strip().lower()
+    if action not in MULTICAST_RTP_STANDBY_MSG_ACTIONS:
+        action = "stop"
+    priority = str(row.get("standby_msg_priority") or "Emergency").strip().title()
+    if priority not in VALID_MESSAGE_PRIORITIES:
+        priority = "Emergency"
+    sources = standby_lenient_sources(row.get("standby_sources")) if mode == "rebroadcast" else []
+    emergency = (
+        standby_lenient_sources(row.get("emergency_sources"))
+        if (mode == "rebroadcast" and action == "emergency")
+        else []
+    )
+    mute_priority = str(row.get("mute_priority") or "High").strip().title()
+    if mute_priority not in VALID_MESSAGE_PRIORITIES:
+        mute_priority = "High"
+    return {
+        "mode": mode,
+        "action": action,
+        "priority": priority,
+        "sources": sources,
+        "emergency": emergency,
+        "amp": {
+            "master": multicast_rtp_clean_gain(row.get("amp_master"), MULTICAST_RTP_AMP_DEFAULTS["amp_master"]),
+            "page": multicast_rtp_clean_gain(row.get("amp_page"), MULTICAST_RTP_AMP_DEFAULTS["amp_page"]),
+            "bell": multicast_rtp_clean_gain(row.get("amp_bell"), MULTICAST_RTP_AMP_DEFAULTS["amp_bell"]),
+            "message": multicast_rtp_clean_gain(row.get("amp_message"), MULTICAST_RTP_AMP_DEFAULTS["amp_message"]),
+        },
+        "mute_priority_enabled": str(row.get("mute_priority_enabled") or "0").strip() in ("1", "on", "true", "yes", "True"),
+        "mute_priority": mute_priority,
+    }
+
+
+def standby_stream_key(row):
+    """Structural signature that determines whether the underlying standby
+    audio readers must be rebuilt. Only the mode and the actual source chains
+    matter here — volume/priority/action tweaks are applied live without
+    restarting the streams. The emergency chain only exists when the action is
+    'emergency', so it is part of the structure."""
+    params = standby_params(row)
+    if params is None:
+        return None
+    emergency = tuple(params["emergency"]) if (params["action"] == "emergency" and params["emergency"]) else ()
+    return (params["mode"], tuple(params["sources"]), emergency)
+
+
+def standby_config_key(row):
+    params = standby_params(row)
+    if params is None:
+        return None
+    amp = params["amp"]
+    return (
+        params["mode"],
+        params["action"],
+        params["priority"],
+        tuple(params["sources"]),
+        tuple(params["emergency"]),
+        amp["master"], amp["page"], amp["bell"], amp["message"],
+        params["mute_priority_enabled"], params["mute_priority"],
+    )
+
+
+class StandbySourceChain:
+    def __init__(self, urls):
+        self.readers = []
+        for url in urls:
+            try:
+                self.readers.append(make_standby_reader(url))
+            except ValueError:
+                continue
+
+    def start(self):
+        for reader in self.readers:
+            reader.start()
+
+    def next_frame(self):
+        for reader in self.readers:
+            if reader.healthy():
+                frame = reader.read_frame()
+                return frame if frame is not None else MULTICAST_RTP_SILENCE_FRAME
+        return MULTICAST_RTP_SILENCE_FRAME
+
+    def stop(self):
+        for reader in self.readers:
+            reader.stop()
+
+
+class StandbyEngine:
+    def __init__(self, row):
+        params = standby_params(row) or {}
+        self.mode = params.get("mode", "silence")
+        self.msg_action = params.get("action", "keep")
+        self.msg_priority = params.get("priority", "High")
+        self.config_key = standby_config_key(row)
+        self.stream_key = standby_stream_key(row)
+        self.amp = params.get("amp") or dict(MULTICAST_RTP_AMP_DEFAULTS)
+        self.amp = {
+            "master": self.amp.get("master", "0"),
+            "page": self.amp.get("page", "-10"),
+            "bell": self.amp.get("bell", "0"),
+            "message": self.amp.get("message", "mute"),
+        }
+        self.mute_priority_enabled = bool(params.get("mute_priority_enabled"))
+        self.mute_priority = params.get("mute_priority", "High")
+        self.normal = StandbySourceChain(params.get("sources", [])) if self.mode == "rebroadcast" else None
+        self.emergency = (
+            StandbySourceChain(params.get("emergency", []))
+            if (self.mode == "rebroadcast" and self.msg_action == "emergency" and params.get("emergency"))
+            else None
+        )
+
+    def amp_for_class(self, klass):
+        """Return the gain spec ('mute' or int-string) that applies to the
+        background while a broadcast of ``klass`` (page/bell/message) is active.
+        Falls back to the master gain for unknown classes."""
+        return self.amp.get(klass, self.amp.get("master", "0"))
+
+    def apply_live(self, row):
+        """Update the parameters that can change without rebuilding the audio
+        readers (volumes, message action/priority, mute-priority). Attributes
+        are reassigned atomically so the broadcasting thread picks up the new
+        values on its next frame with no stream restart."""
+        params = standby_params(row) or {}
+        amp = params.get("amp") or dict(MULTICAST_RTP_AMP_DEFAULTS)
+        self.amp = {
+            "master": amp.get("master", "0"),
+            "page": amp.get("page", "-10"),
+            "bell": amp.get("bell", "0"),
+            "message": amp.get("message", "mute"),
+        }
+        self.msg_action = params.get("action", "keep")
+        self.msg_priority = params.get("priority", "High")
+        self.mute_priority_enabled = bool(params.get("mute_priority_enabled"))
+        self.mute_priority = params.get("mute_priority", "High")
+        self.config_key = standby_config_key(row)
+
+    def start(self):
+        if self.normal is not None:
+            self.normal.start()
+        if self.emergency is not None:
+            self.emergency.start()
+
+    def next_frame(self, context="normal"):
+        if self.mode != "rebroadcast":
+            return MULTICAST_RTP_SILENCE_FRAME
+        chain = self.emergency if (context == "emergency" and self.emergency is not None) else self.normal
+        if chain is None:
+            return MULTICAST_RTP_SILENCE_FRAME
+        return chain.next_frame()
+
+    def stop(self):
+        if self.normal is not None:
+            self.normal.stop()
+        if self.emergency is not None:
+            self.emergency.stop()
+
+
+def build_standby_engine(row):
+    if standby_config_key(row) is None:
+        return None
+    engine = StandbyEngine(row)
+    engine.start()
+    return engine
+
+
 class MulticastRTPEndpointChannel:
     def __init__(self, row, on_idle):
         self.key = str(row.get("id") or "")
         self.lock = threading.Lock()
         self.sender = MulticastRTPSender(row)
         self.sources = {}
+        self.active_broadcasts = {}
+        self.active_check_at = 0.0
         self.stop_event = threading.Event()
         self.idle_since = None
         self.closing = False
         self.on_idle = on_idle
+        self.standby = build_standby_engine(row)
+        self.persistent = self.standby is not None
+        self.codec_restart_until = 0.0
+        self.pending_sender_row = None
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
 
-    def attach_source(self, stream_id, priority="Normal"):
-        source = MulticastRTPSource(priority=priority)
+    def is_streaming_audio(self):
+        """True when the channel is actively emitting audio right now: either a
+        broadcast source is attached, or the standby engine is rebroadcasting
+        background music."""
+        with self.lock:
+            if self.sources:
+                return True
+            standby = self.standby
+        return standby is not None and standby.mode == "rebroadcast"
+
+    def update_config(self, row):
+        """Apply configuration changes to the running standby engine. Volume,
+        message action/priority and mute-priority changes are applied live
+        without restarting the audio streams; only structural changes (mode or
+        the source chains themselves) rebuild the engine. Setting standby to
+        None (mode 'stop') lets the channel idle-close once no message is in
+        effect."""
+        # A codec change requires rebuilding the RTP sender. Detect it up front
+        # (the codec is not part of standby_config_key, so the early-returns
+        # below would otherwise miss it) and hand the new row to the run thread,
+        # which owns self.sender: it stops the stream for a few seconds, then
+        # rebuilds the sender with the new codec.
+        try:
+            new_codec = multicast_rtp_clean_codec(row.get("codec") or "PCMU")
+        except Exception:
+            new_codec = None
+        if new_codec is not None:
+            with self.lock:
+                sender = self.sender
+                pending = self.pending_sender_row
+            pending_codec = None
+            if pending is not None:
+                try:
+                    pending_codec = multicast_rtp_clean_codec(pending.get("codec") or "PCMU")
+                except Exception:
+                    pending_codec = None
+                current_codec = pending_codec
+            else:
+                current_codec = getattr(sender, "codec", None)
+            if current_codec is not None and new_codec != current_codec:
+                with self.lock:
+                    self.pending_sender_row = dict(row)
+                    self.codec_restart_until = time.monotonic() + MULTICAST_RTP_CODEC_RESTART_SECONDS
+        new_key = standby_config_key(row)
+        new_stream = standby_stream_key(row)
+        with self.lock:
+            current = self.standby
+            current_key = current.config_key if current is not None else None
+            if new_key == current_key:
+                return
+            current_stream = current.stream_key if current is not None else None
+            if current is not None and new_stream is not None and new_stream == current_stream:
+                current.apply_live(row)
+                return
+        engine = build_standby_engine(row)
+        with self.lock:
+            old = self.standby
+            self.standby = engine
+            self.persistent = engine is not None
+            if engine is not None:
+                self.idle_since = None
+        if old is not None:
+            old.stop()
+
+    def attach_source(self, stream_id, priority="Normal", klass="message"):
+        source = MulticastRTPSource(priority=priority, klass=klass, instant_ready=self.persistent)
         with self.lock:
             if self.closing:
                 return None
@@ -3943,6 +6244,100 @@ class MulticastRTPEndpointChannel:
         if previous is not None:
             previous.close()
         return source
+
+    def register_broadcast(self, broadcast_id, priority, klass, metadata):
+        """Record a broadcast that targets this endpoint so its standby action
+        (stop / switch to emergency) stays in effect for the whole time the
+        broadcast is active on the server — not just while its audio frames are
+        streaming.
+
+        Tracking keys off the broadcast's PRIORITY and is independent of the
+        page/bell/message class (that class only picks the amplify-ducking
+        value). The server's active-broadcast store is the source of truth for
+        whether a broadcast is still in effect: the entry is dropped as soon as
+        the store no longer lists it (expired, cancelled or otherwise cleared).
+        Transient broadcasts that never appear in the store (e.g. live pages)
+        fall away after a short grace window, so they only affect the background
+        while their audio is actually playing."""
+        broadcast_id = str(broadcast_id or "").strip()
+        if not broadcast_id or not self.persistent:
+            return
+        meta = metadata or {}
+        expires_at = sip_parse_datetime_value(meta.get("expires"))
+        # Probe the store now so a broadcast that is already active (the common
+        # case — records are written before dispatch) is confirmed immediately
+        # and tracked for its whole lifetime.
+        try:
+            record = fetch_active_broadcast(broadcast_id)
+        except Exception:
+            record = None
+        confirmed = isinstance(record, dict) and str(record.get("delivery") or "").strip().lower() not in {"expired", "cancelled"}
+        with self.lock:
+            existing = self.active_broadcasts.get(broadcast_id)
+            self.active_broadcasts[broadcast_id] = {
+                "priority": priority if priority in VALID_MESSAGE_PRIORITIES else "Normal",
+                "klass": klass,
+                "expires_at": expires_at,
+                "registered_at": time.monotonic(),
+                "confirmed": confirmed or bool(existing and existing.get("confirmed")),
+            }
+            self.idle_since = None
+            # Force a fresh store re-check on the next frame so a just-attached
+            # broadcast is validated promptly.
+            self.active_check_at = 0.0
+        if existing is None:
+            log(f"multicast rtp standby track broadcast={broadcast_id} channel={self.key} "
+                f"priority={priority} klass={klass} in_store={confirmed}")
+
+    def current_active_broadcasts(self):
+        """Return the messages currently in effect for this endpoint, using the
+        server's active-broadcast store as the authority. A tracked broadcast is
+        dropped once the store no longer lists it (with a short grace window
+        right after it is registered to absorb dispatch/store write races), or
+        once its own expiry time passes. The store is polled at most about once
+        per second to keep the per-frame path cheap."""
+        with self.lock:
+            if not self.active_broadcasts:
+                return []
+            items = list(self.active_broadcasts.items())
+        now_mono = time.monotonic()
+        now_dt = datetime.now()
+        do_check = now_mono >= self.active_check_at
+        if do_check:
+            self.active_check_at = now_mono + 1.0
+        drop = []
+        alive = []
+        for bid, info in items:
+            exp = info.get("expires_at")
+            if exp is not None and now_dt >= exp:
+                drop.append(bid)
+                continue
+            if do_check:
+                try:
+                    record = fetch_active_broadcast(bid)
+                except Exception:
+                    record = False  # store error: keep, retry next time
+                if record is None:
+                    # Not in the store. Keep briefly if we have never seen it
+                    # confirmed (dispatch may beat the store write); otherwise it
+                    # is genuinely gone -> restore the audio.
+                    grace = (now_mono - info.get("registered_at", now_mono)) < 15.0
+                    if info.get("confirmed") or not grace:
+                        drop.append(bid)
+                        continue
+                elif isinstance(record, dict):
+                    delivery = str(record.get("delivery") or "").strip().lower()
+                    if delivery in {"expired", "cancelled"}:
+                        drop.append(bid)
+                        continue
+                    info["confirmed"] = True
+            alive.append(info)
+        if drop:
+            with self.lock:
+                for bid in drop:
+                    self.active_broadcasts.pop(bid, None)
+            log(f"multicast rtp standby untrack channel={self.key} broadcasts={drop}")
+        return alive
 
     def stop_source(self, stream_id):
         with self.lock:
@@ -3955,8 +6350,71 @@ class MulticastRTPEndpointChannel:
         with self.lock:
             self.closing = True
             sources = list(self.sources.values())
+            standby = self.standby
         for source in sources:
             source.close()
+        if standby is not None:
+            standby.stop()
+
+    def compose_frame(self, standby, message_frames, in_effect, dominant_class, audio_msg_priority, msg_lifetime_priority):
+        """Combine message audio with the standby background.
+
+        Two independent controls decide what happens to the background:
+
+          * The **standby message action** (keep / stop / switch-to-emergency,
+            gated by ``standby_msg_priority``) applies for the WHOLE time a
+            qualifying message is in effect on the server — during its audio and
+            afterwards, until the message is no longer active. ``stop`` silences
+            the background; ``emergency`` swaps it for the emergency streams.
+
+          * The **mute-during-broadcast checkbox** (``mute_priority``) only
+            applies while message audio is actually playing.
+
+        Independently, the master amplify gain always applies, and while a
+        broadcast is producing audio the background is ducked/muted by the
+        matching amplify-on-<class> setting (message defaults to Mute).
+        """
+        has_audio = bool(message_frames)
+        if standby is None or standby.mode != "rebroadcast":
+            return mix_ulaw_frames(message_frames) if has_audio else MULTICAST_RTP_SILENCE_FRAME
+
+        threshold = MESSAGE_PRIORITY_ORDER.get(standby.msg_priority, 2)
+        action_triggered = msg_lifetime_priority is not None and msg_lifetime_priority >= threshold
+        use_emergency = standby.msg_action == "emergency" and in_effect and action_triggered
+        background = standby.next_frame("emergency" if use_emergency else "normal")
+
+        gain = standby.amp.get("master", "0")
+        muted = gain == "mute"
+        # Stop / silence actions: hold the background silenced for the whole
+        # message lifetime, even between/after the message audio frames.
+        # "stop" additionally sends no RTP at all (the stream truly stops);
+        # "silence" keeps emitting silence frames.
+        stop_action = in_effect and standby.msg_action == "stop" and action_triggered
+        silence_action = in_effect and standby.msg_action == "silence" and action_triggered
+        if stop_action or silence_action:
+            muted = True
+        # Mute-during-broadcast checkbox: only while message audio is playing.
+        if has_audio and standby.mute_priority_enabled:
+            mute_thr = MESSAGE_PRIORITY_ORDER.get(standby.mute_priority, 2)
+            if audio_msg_priority is not None and audio_msg_priority >= mute_thr:
+                muted = True
+        if has_audio and not use_emergency:
+            type_amp = standby.amp_for_class(dominant_class or "message")
+            if type_amp == "mute":
+                muted = True
+            else:
+                gain = multicast_rtp_combine_gain(gain, type_amp)
+
+        background_out = MULTICAST_RTP_SILENCE_FRAME if muted else apply_gain_ulaw_frame(background, gain)
+        if not has_audio:
+            # The stop action stops the stream entirely: emit nothing.
+            if stop_action:
+                return None
+            return background_out
+        message_mix = mix_ulaw_frames(message_frames)
+        if background_out == MULTICAST_RTP_SILENCE_FRAME:
+            return message_mix
+        return mix_ulaw_frames([background_out, message_mix])
 
     def run(self):
         next_send = time.monotonic()
@@ -3964,26 +6422,46 @@ class MulticastRTPEndpointChannel:
             while not self.stop_event.is_set():
                 ready_sources = []
                 finished_stream_ids = []
-                frames = []
+                message_frames = []
+                audio_msg_priority = None
+                msg_lifetime_priority = None
+                best_audio_order = None
+                dominant_class = None
+                best_any_order = None
+                best_any_class = None
                 now = time.monotonic()
+                # Codec change: stop the stream during the restart window, then
+                # rebuild the RTP sender with the new codec. The run thread is
+                # the sole owner of self.sender, so the swap happens here.
+                with self.lock:
+                    pending_row = self.pending_sender_row
+                    restart_until = self.codec_restart_until
+                in_codec_restart = False
+                if pending_row is not None:
+                    if now < restart_until:
+                        in_codec_restart = True
+                    else:
+                        try:
+                            new_sender = MulticastRTPSender(pending_row)
+                        except Exception as exc:
+                            log(f"multicast rtp codec restart error channel={self.key}: {exc}")
+                            new_sender = None
+                        if new_sender is not None:
+                            old_sender = self.sender
+                            self.sender = new_sender
+                            try:
+                                old_sender.close()
+                            except Exception:
+                                pass
+                            log(f"multicast rtp codec restart applied channel={self.key} codec={new_sender.codec}")
+                        with self.lock:
+                            self.pending_sender_row = None
+                            self.codec_restart_until = 0.0
                 with self.lock:
                     source_items = list(self.sources.items())
-                    idle_since = self.idle_since
-                if not source_items:
-                    if idle_since is None:
-                        with self.lock:
-                            if self.idle_since is None:
-                                self.idle_since = now
-                    elif now - idle_since >= MULTICAST_RTP_IDLE_SECONDS:
-                        # Refuse new attachments before exiting so a broadcast
-                        # can never latch onto a dead sender thread.
-                        with self.lock:
-                            if not self.sources:
-                                self.closing = True
-                        if self.closing:
-                            break
-                    mixed_frame = MULTICAST_RTP_SILENCE_FRAME
-                else:
+                    standby = self.standby
+                in_effect = bool(source_items)
+                if source_items:
                     with self.lock:
                         self.idle_since = None
                     emergency_active = any(source.is_emergency() for _stream_id, source in source_items)
@@ -3991,18 +6469,52 @@ class MulticastRTPEndpointChannel:
                         discard = emergency_active and not source.is_emergency()
                         frame, finished = source.next_frame(discard=discard)
                         if frame is not None:
-                            frames.append(frame)
+                            message_frames.append(frame)
+                        order = MESSAGE_PRIORITY_ORDER.get(source.priority, 1)
+                        # The stop / emergency / mute logic keys off broadcast
+                        # PRIORITY for any broadcast in effect — independent of
+                        # the page/bell/message class (which only selects the
+                        # amplify-ducking value below).
+                        if msg_lifetime_priority is None or order > msg_lifetime_priority:
+                            msg_lifetime_priority = order
+                        if frame is not None and (audio_msg_priority is None or order > audio_msg_priority):
+                            audio_msg_priority = order
+                        if best_any_order is None or order > best_any_order:
+                            best_any_order = order
+                            best_any_class = source.klass
+                        if frame is not None and (best_audio_order is None or order > best_audio_order):
+                            best_audio_order = order
+                            dominant_class = source.klass
                         if source.note_preroll_frame():
                             ready_sources.append(stream_id)
                         if finished:
                             finished_stream_ids.append(stream_id)
-                    mixed_frame = mix_ulaw_frames(frames)
-                try:
-                    self.sender.send_frame(mixed_frame)
-                except OSError as exc:
-                    # Transient network errors must not kill the channel
-                    # thread mid-broadcast; skip the frame and keep pacing.
-                    log(f"multicast rtp send error channel={self.key}: {exc}")
+                    if dominant_class is None:
+                        dominant_class = best_any_class
+                # A qualifying message keeps the standby *action* (stop / switch
+                # to emergency) in effect for its whole server lifetime — during
+                # its audio and afterwards until it is no longer active. This is
+                # separate from the mute-during-broadcast checkbox, which only
+                # tracks live audio (audio_msg_priority above).
+                if standby is not None:
+                    for info in self.current_active_broadcasts():
+                        in_effect = True
+                        order = MESSAGE_PRIORITY_ORDER.get(info.get("priority"), 1)
+                        if msg_lifetime_priority is None or order > msg_lifetime_priority:
+                            msg_lifetime_priority = order
+                mixed_frame = self.compose_frame(
+                    standby, message_frames, in_effect, dominant_class, audio_msg_priority, msg_lifetime_priority
+                )
+                # During a codec restart the stream is stopped; emit nothing.
+                # A None frame means the standby stop action wants the stream
+                # silenced with no RTP either.
+                if not in_codec_restart and mixed_frame is not None:
+                    try:
+                        self.sender.send_frame(mixed_frame)
+                    except OSError as exc:
+                        # Transient network errors must not kill the channel
+                        # thread mid-broadcast; skip the frame and keep pacing.
+                        log(f"multicast rtp send error channel={self.key}: {exc}")
                 for stream_id in ready_sources:
                     self.on_idle("ready", self.key, stream_id, self)
                 if finished_stream_ids:
@@ -4011,8 +6523,18 @@ class MulticastRTPEndpointChannel:
                             source = self.sources.get(stream_id)
                             if source is not None and source.closed:
                                 self.sources.pop(stream_id, None)
-                        if not self.sources and self.idle_since is None:
-                            self.idle_since = time.monotonic()
+                # A channel with standby configured stays resident and keeps
+                # broadcasting background audio; only non-standby channels idle
+                # out once their message finishes.
+                if standby is None:
+                    with self.lock:
+                        if not self.sources:
+                            if self.idle_since is None:
+                                self.idle_since = now
+                            elif now - self.idle_since >= MULTICAST_RTP_IDLE_SECONDS:
+                                self.closing = True
+                    if self.closing:
+                        break
                 next_send += MULTICAST_RTP_FRAME_MS / 1000.0
                 sleep_for = next_send - time.monotonic()
                 if sleep_for > 0:
@@ -4020,9 +6542,13 @@ class MulticastRTPEndpointChannel:
                 else:
                     next_send = time.monotonic()
         finally:
+            with self.lock:
+                standby = self.standby
             try:
                 self.sender.close()
             finally:
+                if standby is not None:
+                    standby.stop()
                 self.on_idle("close", self.key, None, self)
 
 
@@ -4065,9 +6591,51 @@ class BuiltinMulticastRTPModule:
         self.lock = threading.Lock()
         self.streams = {}
         self.channels = {}
+        self.reconcile_stop = threading.Event()
+        self.reconcile_thread = threading.Thread(target=self._reconcile_loop, daemon=True)
+        self.reconcile_thread.start()
+
+    def _reconcile_loop(self):
+        while not self.reconcile_stop.is_set():
+            self.reconcile_standby()
+            self.reconcile_stop.wait(5.0)
+
+    def reconcile_standby(self):
+        """Ensure persistent standby broadcasters exist for every multicast
+        endpoint whose 'On standby' behaviour is rebroadcast/silence, refresh
+        their configuration, and tear down standby for endpoints that no longer
+        want it. Safe to call from any thread/process with DB access."""
+        try:
+            rows = multicast_rtp_rows()
+        except Exception as exc:
+            log(f"multicast rtp standby reconcile query error: {exc}")
+            return
+        wanted = {}
+        for row in rows:
+            if standby_config_key(row) is not None:
+                wanted[str(row.get("id") or "")] = row
+        for channel_key, row in wanted.items():
+            try:
+                channel = self.ensure_channel(row)
+                channel.update_config(row)
+            except Exception as exc:
+                log(f"multicast rtp standby start error channel={channel_key}: {exc}")
+        with self.lock:
+            channels = dict(self.channels)
+        for channel_key, channel in channels.items():
+            if channel_key not in wanted and getattr(channel, "persistent", False):
+                try:
+                    channel.update_config({"standby_mode": "stop"})
+                except Exception as exc:
+                    log(f"multicast rtp standby stop error channel={channel_key}: {exc}")
 
     def get_endpoint_status(self):
         return get_multicast_rtp_endpoint_status()
+
+    def endpoint_streaming(self, row_id):
+        with self.lock:
+            channel = self.channels.get(str(row_id))
+        return bool(channel and not channel.closing and channel.is_streaming_audio())
 
     def handle_channel_event(self, action, channel_key, stream_id, channel):
         if action == "ready" and stream_id is not None:
@@ -4088,19 +6656,25 @@ class BuiltinMulticastRTPModule:
             if channel is None or channel.closing:
                 channel = MulticastRTPEndpointChannel(row, self.handle_channel_event)
                 self.channels[channel_key] = channel
-            return channel
+                return channel
+        channel.update_config(row)
+        return channel
 
     def handle_dispatch(self, action, stream_id, msg_id, sub_targets, metadata=None):
         if action not in {"prepare_audio", "prepare_livepage"}:
             return
         rows = multicast_rtp_rows_for_targets(sub_targets)
+        if not rows:
+            mark_ready(MULTICAST_RTP_MODULE, stream_id)
+            return
         state = MulticastRTPStreamState(stream_id)
         priority = multicast_priority_value(metadata)
+        klass = multicast_broadcast_class(action, metadata)
         for row in rows:
             source = None
             for _attempt in range(3):
                 channel = self.ensure_channel(row)
-                source = channel.attach_source(stream_id, priority=priority)
+                source = channel.attach_source(stream_id, priority=priority, klass=klass)
                 if source is not None:
                     break
                 # Channel was shutting down between lookup and attach — drop
@@ -4111,6 +6685,7 @@ class BuiltinMulticastRTPModule:
             if source is None:
                 log(f"multicast rtp attach failed stream={stream_id} channel={row.get('id')}")
                 continue
+            channel.register_broadcast(msg_id, priority, klass, metadata)
             state.add_source(channel.key, source)
         with self.lock:
             previous = self.streams.pop(stream_id, None)
@@ -4120,8 +6695,13 @@ class BuiltinMulticastRTPModule:
                 previous.close()
             except Exception as exc:
                 log(f"multicast rtp stream replace error stream={stream_id}: {exc}")
-        if not rows:
-            mark_failed(MULTICAST_RTP_MODULE, stream_id)
+        # Do not mark ready here: readiness is gated on the channel preroll
+        # (handle_channel_event -> mark_source_ready) so the call is not
+        # answered until the multicast group has been primed and the
+        # receiving devices have had time to join. Only short-circuit when
+        # there is nothing to wait for.
+        if not state.sources:
+            mark_ready(MULTICAST_RTP_MODULE, stream_id)
 
     def receive_audio(self, chunk, stream_id):
         with self.lock:
@@ -4138,6 +6718,7 @@ class BuiltinMulticastRTPModule:
         state.close()
 
     def shutdown(self):
+        self.reconcile_stop.set()
         with self.lock:
             states = list(self.streams.values())
             self.streams.clear()
@@ -4155,8 +6736,1697 @@ class BuiltinMulticastRTPModule:
                 pass
 
 
+def http_request_headers_rows_html(headers):
+    rows_html = []
+    safe_headers = list(headers or [])
+    if not safe_headers:
+        safe_headers = [{"name": "", "value": ""}]
+    for idx, header in enumerate(safe_headers):
+        uid = f"hdrval_init_{idx}"
+        rows_html.append(
+            f"""<div class="http-header-row" style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,2fr) auto;gap:10px;align-items:end">
+<div class="row"><label>Header Name</label><input class="control" name="header_name" value="{h(header.get("name"))}" placeholder="ex: Content-Type"></div>
+<div class="row"><label>Header Value</label><div class="http-var-wrap"><input class="control" id="{uid}" name="header_value" value="{h(header.get("value"))}" placeholder="ex: application/json"><button type="button" class="http-var-badge" onclick="openHttpVarPicker('{uid}')" title="Insert Variable">&#36;&#123;x&#125;</button></div></div>
+<button class="danger" type="button" onclick="removeHttpHeaderRow(this)">Remove</button>
+</div>"""
+        )
+    return "".join(rows_html)
+
+
+def http_request_form_html(values, error, submit_label):
+    error_html = f'<div class="error">{h(error)}</div>' if error else ""
+    method = http_request_clean_method(values.get("method") or "POST")
+    auth_type = http_request_clean_auth_type(values.get("auth_type") or "none")
+    method_options = "".join(
+        f'<option value="{h(item)}"{" selected" if method == item else ""}>{h(item)}</option>'
+        for item in HTTP_REQUEST_METHODS
+    )
+    auth_options = "".join(
+        f'<option value="{h(item)}"{" selected" if auth_type == item else ""}>{h(item.title() if item != "apikey" else "API Key")}</option>'
+        for item in ("none", "basic", "digest", "apikey")
+    )
+    headers_html = http_request_headers_rows_html(values.get("headers"))
+    return f"""{error_html}<form method="post" class="grid form-surface" id="httpRequestForm">
+<div class="row"><label>Name <span style="color:#C62828">*</span></label><input class="control" name="name" value="{h(values.get("name"))}" required></div>
+<div class="row"><label>HTTP Method</label><select class="control short-control" name="method">{method_options}</select></div>
+<div class="row"><label>URL <span style="color:#C62828">*</span></label><div class="http-var-wrap"><input class="control" id="httpUrl" name="url" value="{h(values.get("url"))}" placeholder="ex: https://api.example.com/sendmsg/${{shortmessage}}/${{longmessage}}" required><button type="button" class="http-var-badge" onclick="openHttpVarPicker('httpUrl')" title="Insert Variable">&#36;&#123;x&#125;</button></div></div>
+<div class="row"><label>Body</label><div class="http-var-wrap http-var-wrap-long"><textarea class="control" id="httpBody" name="body" rows="6">{h(values.get("body"))}</textarea><button type="button" class="http-var-badge" onclick="openHttpVarPicker('httpBody')" title="Insert Variable">&#36;&#123;x&#125;</button></div></div>
+<div class="row"><label>Authentication</label><select class="control short-control" id="httpAuthType" name="auth_type">{auth_options}</select></div>
+<div id="httpAuthUserFields" style="display:none;gap:14px">
+<div class="row"><label>Username</label><input class="control" name="auth_username" value="{h(values.get("auth_username"))}"></div>
+<div class="row"><label>Password</label><input class="control" type="password" name="auth_password" value="{h(values.get("auth_password"))}"></div>
+</div>
+<div id="httpAuthApiKeyFields" style="display:none;gap:14px">
+<div class="row"><label>Header Name</label><input class="control" name="auth_header_name" value="{h(values.get("auth_header_name"))}" placeholder="ex: X-API-Key"></div>
+<div class="row"><label>Header Value</label><div class="http-var-wrap"><input class="control" id="httpAuthHeaderValue" name="auth_header_value" value="{h(values.get("auth_header_value"))}"><button type="button" class="http-var-badge" onclick="openHttpVarPicker('httpAuthHeaderValue')" title="Insert Variable">&#36;&#123;x&#125;</button></div></div>
+</div>
+<details class="advanced" open><summary>Headers</summary><div class="advanced-body">
+<div id="httpHeaderRows" style="display:grid;gap:10px">{headers_html}</div>
+<button class="button" type="button" id="addHttpHeaderRow">Add Header</button>
+</div></details>
+<div class="row"><label>Timeout (seconds)</label><input class="control short-control" type="number" name="timeout" value="{h(values.get("timeout") or HTTP_REQUEST_DEFAULT_TIMEOUT)}" min="1" max="600" required></div>
+<div class="row"><label style="display:flex;align-items:center;gap:8px;cursor:pointer"><input type="checkbox" name="include_audio_only" value="1"{"" if values.get("include_audio_only") == "0" else " checked"} style="width:16px;height:16px;margin:0;cursor:pointer"> Include audio only messages</label></div>
+<button class="button" type="submit">{h(submit_label)}</button>
+</form>
+<div id="httpVarBackdrop" class="http-var-modal-backdrop" onclick="closeHttpVarPicker()"></div>
+<div id="httpVarModal" class="http-var-modal" role="dialog" aria-modal="true">
+<div class="http-var-modal-header">
+<h2 id="httpVarTitle">Insert Variable</h2>
+<div class="http-var-modal-header-actions">
+<button type="button" id="httpVarBack" class="http-var-modal-back" onclick="httpVarShowList()">Back</button>
+<button type="button" class="http-var-modal-close" onclick="closeHttpVarPicker()" aria-label="Close">&times;</button>
+</div>
+</div>
+<div class="http-var-modal-body">
+<div id="httpVarList" class="http-var-list">
+<button type="button" class="http-var-choice" onclick="httpVarWizard('shortmessage')">Short Message</button>
+<button type="button" class="http-var-choice" onclick="httpVarWizard('longmessage')">Long Message</button>
+<button type="button" class="http-var-choice" onclick="httpVarInsert('${{color}}')">Color</button>
+<button type="button" class="http-var-choice" onclick="httpVarWizard('date')">Date</button>
+<button type="button" class="http-var-choice" onclick="httpVarWizard('datetime')">Date + Time</button>
+<button type="button" class="http-var-choice" onclick="httpVarWizard('time')">Time</button>
+<button type="button" class="http-var-choice" onclick="httpVarWizard('sender')">Sender</button>
+<button type="button" class="http-var-choice" onclick="httpVarInsert('${{productname}}')">Product Name</button>
+</div>
+<div id="httpVarWizardShortmessage" class="http-var-wizard">
+<div class="http-var-row"><label>Choose a space format</label>
+<div class="http-var-option-list">
+<button type="button" class="http-var-option" onclick="httpVarInsert('${{shortmessage:%20}}')"><strong>%20</strong><span>RFC 3986 space encoding (recommended)</span></button>
+<button type="button" class="http-var-option" onclick="httpVarInsert('${{shortmessage:_}}')"><strong>_</strong><span>Insert a underscore in place of spaces</span></button>
+<button type="button" class="http-var-option" onclick="httpVarInsert('${{shortmessage:+}}')"><strong>+</strong><span>Insert a plus in place of spaces</span></button>
+<button type="button" class="http-var-option" onclick="httpVarInsert('${{shortmessage:nospace}}')"><strong>Omit spaces</strong><span>Remove spaces and send words clustered together</span></button>
+</div></div>
+</div>
+<div id="httpVarWizardLongmessage" class="http-var-wizard">
+<div class="http-var-row"><label>Choose a space format</label>
+<div class="http-var-option-list">
+<button type="button" class="http-var-option" onclick="httpVarInsert('${{longmessage:%20}}')"><strong>%20</strong><span>RFC 3986 space encoding (recommended)</span></button>
+<button type="button" class="http-var-option" onclick="httpVarInsert('${{longmessage:_}}')"><strong>_</strong><span>Insert a underscore in place of spaces</span></button>
+<button type="button" class="http-var-option" onclick="httpVarInsert('${{longmessage:+}}')"><strong>+</strong><span>Insert a plus in place of spaces</span></button>
+<button type="button" class="http-var-option" onclick="httpVarInsert('${{longmessage:nospace}}')"><strong>Omit spaces</strong><span>Remove spaces and send words clustered together</span></button>
+</div></div>
+</div>
+<div id="httpVarWizardDate" class="http-var-wizard">
+<div class="http-var-row"><label>Choose a date format</label>
+<div class="http-var-option-list">
+<button type="button" class="http-var-option" onclick="httpVarInsert('${{date}}')"><strong>Default</strong><span>06/22/2026</span></button>
+<button type="button" class="http-var-option" onclick="httpVarInsert('${{date:MM/DD/YYYY}}')"><strong>US Long</strong><span>06/22/2026</span></button>
+<button type="button" class="http-var-option" onclick="httpVarInsert('${{date:MM/DD/YY}}')"><strong>US Short</strong><span>06/22/26</span></button>
+<button type="button" class="http-var-option" onclick="httpVarInsert('${{date:YYYY-MM-DD}}')"><strong>ISO</strong><span>2026-06-22</span></button>
+</div></div>
+</div>
+<div id="httpVarWizardDatetime" class="http-var-wizard">
+<div class="http-var-row"><label>Choose a date and time format</label>
+<div class="http-var-option-list">
+<button type="button" class="http-var-option" onclick="httpVarInsert('${{date+time}}')"><strong>Default</strong><span>06/22/2026 03:04 PM</span></button>
+<button type="button" class="http-var-option" onclick="httpVarInsert('${{date+time:MM/DD/YYYY hh:mm A}}')"><strong>US 12-Hour</strong><span>06/22/2026 03:04 PM</span></button>
+<button type="button" class="http-var-option" onclick="httpVarInsert('${{date+time:MM/DD/YYYY HH:mm:ss}}')"><strong>US 24-Hour With Seconds</strong><span>06/22/2026 15:04:05</span></button>
+<button type="button" class="http-var-option" onclick="httpVarInsert('${{date+time:YYYY-MM-DD HH:mm:ss}}')"><strong>ISO</strong><span>2026-06-22 15:04:05</span></button>
+</div></div>
+</div>
+<div id="httpVarWizardTime" class="http-var-wizard">
+<div class="http-var-row"><label>Choose a time format</label>
+<div class="http-var-option-list">
+<button type="button" class="http-var-option" onclick="httpVarInsert('${{time}}')"><strong>Default</strong><span>03:04 PM</span></button>
+<button type="button" class="http-var-option" onclick="httpVarInsert('${{time:hh:mm A}}')"><strong>12-Hour</strong><span>03:04 PM</span></button>
+<button type="button" class="http-var-option" onclick="httpVarInsert('${{time:hh:mm:ss A}}')"><strong>12-Hour With Seconds</strong><span>03:04:05 PM</span></button>
+<button type="button" class="http-var-option" onclick="httpVarInsert('${{time:HH:mm}}')"><strong>24-Hour</strong><span>15:04</span></button>
+<button type="button" class="http-var-option" onclick="httpVarInsert('${{time:HH:mm:ss}}')"><strong>24-Hour With Seconds</strong><span>15:04:05</span></button>
+</div></div>
+</div>
+<div id="httpVarWizardSender" class="http-var-wizard">
+<div class="http-var-row"><label>Choose sender information</label>
+<div class="http-var-option-list">
+<button type="button" class="http-var-option" onclick="httpVarInsert('${{sender}}')"><strong>Default</strong><span>Name and number when available</span></button>
+<button type="button" class="http-var-option" onclick="httpVarInsert('${{sender:[CNAM] [CID]}}')"><strong>Name + Number</strong><span>Caller name followed by caller ID number</span></button>
+<button type="button" class="http-var-option" onclick="httpVarInsert('${{sender:[CNAM]}}')"><strong>Name Only</strong><span>Caller or sender name only</span></button>
+<button type="button" class="http-var-option" onclick="httpVarInsert('${{sender:[CID]}}')"><strong>Number Only</strong><span>Caller ID number only</span></button>
+<button type="button" class="http-var-option" onclick="httpVarInsert('${{sender:[USERNAME]}}')"><strong>Username Only</strong><span>Web or API username only</span></button>
+</div></div>
+</div>
+</div>
+</div>
+<style>
+.http-var-wrap {{ position: relative; }}
+.http-var-wrap .control {{ padding-right: 42px; }}
+.http-var-badge {{ position: absolute; top: 50%; right: 10px; transform: translateY(-50%); width: 24px; height: 24px; border: none; border-radius: 0; background: transparent; color: rgba(25, 118, 210, 0.78); font-size: 0.95em; font-weight: 700; font-family: "Times New Roman", serif; cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0; z-index: 2; pointer-events: auto; }}
+.http-var-badge:hover {{ background: transparent; color: rgba(25, 118, 210, 1); }}
+.http-var-wrap-long .http-var-badge {{ top: auto; bottom: 10px; right: 10px; transform: none; }}
+.http-var-modal-backdrop {{ display: none; position: fixed; inset: 0; background: rgba(0, 0, 0, 0.45); z-index: 1600; }}
+.http-var-modal-backdrop.open {{ display: block; }}
+.http-var-modal {{ display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: min(760px, calc(100vw - 32px)); max-height: calc(100vh - 40px); overflow-y: auto; background: #FFF; border-radius: 14px; box-shadow: 0 18px 50px rgba(0, 0, 0, 0.28); z-index: 1650; font-family: "Tahoma", sans-serif; }}
+.http-var-modal.open {{ display: block; }}
+.http-var-modal-header {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 20px; border-bottom: 1px solid #EEE; }}
+.http-var-modal-header h2 {{ margin: 0; font-size: 1.2em; font-weight: 500; }}
+.http-var-modal-header-actions {{ display: flex; align-items: center; gap: 8px; }}
+.http-var-modal-close, .http-var-modal-back {{ border: none; background: transparent; color: #666; font-size: 1.4em; cursor: pointer; line-height: 1; padding: 4px 6px; }}
+.http-var-modal-close:hover, .http-var-modal-back:hover {{ background: transparent; color: #111; }}
+.http-var-modal-back {{ display: none; font-size: 0.95em; font-weight: 600; }}
+.http-var-modal-back.visible {{ display: inline-flex; align-items: center; }}
+.http-var-modal-body {{ padding: 20px; }}
+.http-var-list {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }}
+.http-var-choice {{ width: 100%; border: 1px solid #DDE6F1; border-radius: 12px; background: #F8FBFF; color: #0F3F77; padding: 18px 16px; text-align: left; font-size: 1em; font-weight: 600; cursor: pointer; font-family: "Tahoma", sans-serif; }}
+.http-var-choice:hover {{ background: #EDF5FF; border-color: #BCD2EC; }}
+.http-var-wizard {{ display: none; }}
+.http-var-wizard.open {{ display: block; }}
+.http-var-row {{ margin-bottom: 16px; }}
+.http-var-row:last-child {{ margin-bottom: 0; }}
+.http-var-row label {{ display: block; margin-bottom: 6px; font-weight: 500; }}
+.http-var-option-list {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }}
+.http-var-option {{ width: 100%; border: 1px solid #DDE6F1; border-radius: 12px; background: #FAFCFF; color: #1F2937; padding: 14px; text-align: left; cursor: pointer; font-family: "Tahoma", sans-serif; }}
+.http-var-option:hover {{ background: #F0F7FF; border-color: #BCD2EC; }}
+.http-var-option strong {{ display: block; font-size: 1em; font-weight: 600; margin-bottom: 4px; color: #0F3F77; font-family: "Tahoma", sans-serif; }}
+.http-var-option span {{ display: block; font-size: 0.92em; color: #5B6470; font-family: "Tahoma", sans-serif; }}
+.http-var-modal button, .http-var-modal input, .http-var-modal textarea, .http-var-modal select {{ font-family: "Tahoma", sans-serif; }}
+@media(prefers-color-scheme:dark){{
+.http-var-badge {{ background: transparent; color: rgba(187, 134, 252, 0.82); }}
+.http-var-badge:hover {{ background: transparent; color: rgba(187, 134, 252, 1); }}
+.http-var-modal {{ background: #1E1E1E; }}
+.http-var-modal-header {{ border-bottom-color: #333; }}
+.http-var-modal-close, .http-var-modal-back {{ color: #AAA; }}
+.http-var-modal-close:hover, .http-var-modal-back:hover {{ background: transparent; color: #FFF; }}
+.http-var-choice {{ background: #252525; border-color: #3A3A3A; color: #E5E7EB; }}
+.http-var-choice:hover {{ background: #2E2E2E; border-color: #4A4A4A; }}
+.http-var-option {{ background: #252525; border-color: #3A3A3A; color: #E5E7EB; }}
+.http-var-option:hover {{ background: #2E2E2E; border-color: #4A4A4A; }}
+.http-var-option strong {{ color: #EAF2FF; }}
+.http-var-option span {{ color: #BFC6CF; }}
+.http-var-row label {{ color: #E0E0E0; }}
+}}
+</style>
+<script>
+var httpVarTargetField = null;
+var httpAuthType = document.getElementById('httpAuthType');
+var httpAuthUserFields = document.getElementById('httpAuthUserFields');
+var httpAuthApiKeyFields = document.getElementById('httpAuthApiKeyFields');
+var httpHeaderRows = document.getElementById('httpHeaderRows');
+function syncHttpAuthFields() {{
+  var authType = (httpAuthType.value || 'none').toLowerCase();
+  httpAuthUserFields.style.display = authType === 'basic' || authType === 'digest' ? 'grid' : 'none';
+  httpAuthApiKeyFields.style.display = authType === 'apikey' ? 'grid' : 'none';
+}}
+function openHttpVarPicker(fieldId) {{
+  httpVarTargetField = document.getElementById(fieldId);
+  document.getElementById('httpVarBackdrop').classList.add('open');
+  document.getElementById('httpVarModal').classList.add('open');
+  document.documentElement.style.overflow = 'hidden';
+  if (window.parent && window.parent !== window) {{
+    window.parent.postMessage({{ type: 'ops-frame-height-lock' }}, window.location.origin);
+  }}
+  httpVarShowList();
+}}
+function closeHttpVarPicker() {{
+  document.getElementById('httpVarBackdrop').classList.remove('open');
+  document.getElementById('httpVarModal').classList.remove('open');
+  document.documentElement.style.overflow = '';
+  if (window.parent && window.parent !== window) {{
+    window.parent.postMessage({{ type: 'ops-frame-height-unlock' }}, window.location.origin);
+  }}
+  httpVarTargetField = null;
+}}
+function httpVarShowList() {{
+  document.getElementById('httpVarList').style.display = 'grid';
+  var wizards = document.querySelectorAll('.http-var-wizard');
+  for (var i = 0; i < wizards.length; i++) wizards[i].classList.remove('open');
+  document.getElementById('httpVarBack').classList.remove('visible');
+  document.getElementById('httpVarTitle').textContent = 'Insert Variable';
+}}
+function httpVarWizard(key) {{
+  document.getElementById('httpVarList').style.display = 'none';
+  var wizards = document.querySelectorAll('.http-var-wizard');
+  for (var i = 0; i < wizards.length; i++) wizards[i].classList.remove('open');
+  var titles = {{'shortmessage':'Short Message','longmessage':'Long Message','date':'Date','datetime':'Date + Time','time':'Time','sender':'Sender'}};
+  document.getElementById('httpVarTitle').textContent = titles[key] || 'Insert Variable';
+  var id = 'httpVarWizard' + key.charAt(0).toUpperCase() + key.slice(1);
+  var wizard = document.getElementById(id);
+  if (wizard) wizard.classList.add('open');
+  document.getElementById('httpVarBack').classList.add('visible');
+}}
+function httpVarInsert(snippet) {{
+  if (!httpVarTargetField) {{ closeHttpVarPicker(); return; }}
+  var field = httpVarTargetField;
+  var val = field.value || '';
+  var start = typeof field.selectionStart === 'number' ? field.selectionStart : val.length;
+  var end = typeof field.selectionEnd === 'number' ? field.selectionEnd : val.length;
+  field.value = val.slice(0, start) + snippet + val.slice(end);
+  var caret = start + snippet.length;
+  if (typeof field.setSelectionRange === 'function') field.setSelectionRange(caret, caret);
+  field.focus();
+  closeHttpVarPicker();
+}}
+function removeHttpHeaderRow(button) {{
+  var row = button.closest('.http-header-row');
+  if (row) row.remove();
+  if (!httpHeaderRows.children.length) addHttpHeaderRow();
+}}
+function addHttpHeaderRow(name, value) {{
+  name = name || ''; value = value || '';
+  var wrapper = document.createElement('div');
+  wrapper.className = 'http-header-row';
+  wrapper.style.display = 'grid';
+  wrapper.style.gridTemplateColumns = 'minmax(0,1fr) minmax(0,2fr) auto';
+  wrapper.style.gap = '10px';
+  wrapper.style.alignItems = 'end';
+  var uid = 'hdrval_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
+  wrapper.innerHTML = '<div class="row"><label>Header Name</label><input class="control" name="header_name" placeholder="ex: Content-Type"></div><div class="row"><label>Header Value</label><div class="http-var-wrap"><input class="control" id="' + uid + '" name="header_value" placeholder="ex: application/json"><button type="button" class="http-var-badge" onclick="openHttpVarPicker(\\\'' + uid + '\\\')" title="Insert Variable">&#36;&#123;x&#125;</button></div></div><button class="danger" type="button">Remove</button>';
+  wrapper.querySelector('input[name="header_name"]').value = name;
+  wrapper.querySelector('#' + uid).value = value;
+  wrapper.querySelector('button.danger').addEventListener('click', function() {{ removeHttpHeaderRow(this); }});
+  httpHeaderRows.appendChild(wrapper);
+}}
+document.getElementById('addHttpHeaderRow').addEventListener('click', function() {{ addHttpHeaderRow(); }});
+httpAuthType.addEventListener('change', syncHttpAuthFields);
+syncHttpAuthFields();
+document.addEventListener('keydown', function(e) {{ if (e.key === 'Escape') closeHttpVarPicker(); }});
+</script>"""
+
+
+
+
+def http_request_space_value(text, space_format="%20"):
+    raw_text = str(text or "")
+    token = str(space_format or "%20").strip().lower() or "%20"
+    if token == "_":
+        return raw_text.replace(" ", "_")
+    if token == "+":
+        return raw_text.replace(" ", "+")
+    if token == "nospace":
+        return raw_text.replace(" ", "")
+    return raw_text.replace(" ", "%20")
+
+
+def http_request_color_value(value):
+    raw = re.sub(r"[^0-9a-fA-F]", "", str(value or "").strip().lstrip("#"))
+    if len(raw) == 3:
+        raw = "".join(ch * 2 for ch in raw)
+    if len(raw) >= 6:
+        raw = raw[:6]
+    return raw.upper() if len(raw) == 6 else ""
+
+
+def http_request_expand_variables_with_cursor(text, metadata, cursor, space_format="%20"):
+    raw_text = str(text or "")
+    if not raw_text:
+        return raw_text
+    payload = metadata if isinstance(metadata, dict) else {}
+    issued = payload.get("issued")
+    if not isinstance(issued, datetime):
+        issued = datetime.now()
+
+    def replace(match):
+        key = str(match.group(1) or "").strip().lower()
+        option = str(match.group(2) or "").strip()
+        if key in {"shortmessage", "longmessage"}:
+            return http_request_space_value(payload.get(key) or "", option or space_format)
+        if key == "color":
+            return http_request_color_value(payload.get("color"))
+        return match.group(0)
+
+    replaced = HTTP_REQUEST_VARIABLE_RE.sub(replace, raw_text)
+    return expand_message_variables(
+        replaced,
+        cursor,
+        sender=str(payload.get("sender") or "").strip(),
+        sender_context=payload,
+        now=issued,
+    )
+
+
+def http_request_expand_variables(text, metadata, space_format="%20"):
+    raw_text = str(text or "")
+    if not raw_text:
+        return raw_text
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            return http_request_expand_variables_with_cursor(raw_text, metadata or {}, cur, space_format=space_format)
+    finally:
+        conn.close()
+
+
+class BuiltinHttpRequestWeb:
+    def forms(self):
+        return {
+            "request": {"label": HTTP_REQUEST_NAME, "description": HTTP_REQUEST_DESCRIPTION},
+        }
+
+    def render_form(self, form_type, request, conn_factory, page, user):
+        ensure_httprequest_schema()
+        if form_type not in self.forms():
+            return page("Endpoint Form", "<h1>Endpoint form not found</h1>", "endpoints", user, status=404)
+        error = ""
+        values = http_request_form_values(request.form if request.method == "POST" else None)
+        if request.method == "POST":
+            try:
+                clean = http_request_clean_values(values)
+                sip_execute(
+                    f"INSERT INTO `{HTTP_REQUEST_TABLE}` (`name`, `method`, `url`, `body`, `auth_type`, `auth_username`, `auth_password`, `auth_header_name`, `auth_header_value`, `headers_json`, `timeout`, `include_audio_only`) "
+                    f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (
+                        clean["name"],
+                        clean["method"],
+                        clean["url"],
+                        clean["body"],
+                        clean["auth_type"],
+                        clean["auth_username"],
+                        clean["auth_password"],
+                        clean["auth_header_name"],
+                        clean["auth_header_value"],
+                        json.dumps(clean["headers"]),
+                        clean["timeout"],
+                        clean["include_audio_only"],
+                    ),
+                )
+                return page("Endpoint Saved", "<script>window.top.location.href='/admin/manage-endpoints'</script><p>Endpoint saved.</p>", "endpoints", user)
+            except ValueError as exc:
+                error = str(exc)
+        body = http_request_form_html(values, error, "Add HTTP Request")
+        return page(HTTP_REQUEST_NAME, sip_form_frame(body), "endpoints", user)
+
+    def render_action(self, action, endpoint_id, request, conn_factory, page, user):
+        ensure_httprequest_schema()
+        kind, _, row_id = str(endpoint_id or "").partition("-")
+        if action not in {"edit", "delete"} or kind != "request" or not row_id.isdigit():
+            return page("Endpoint Action", "<h1>Invalid endpoint action</h1>", "endpoints", user, status=400)
+        row = http_request_row(row_id)
+        if not row:
+            return page("Endpoint Action", "<h1>Endpoint not found</h1>", "endpoints", user, status=404)
+        error = ""
+        if request.method == "POST":
+            if action == "delete":
+                sip_execute(f"DELETE FROM `{HTTP_REQUEST_TABLE}` WHERE id=%s", (row_id,))
+                return page("Endpoint Saved", "<script>window.top.location.href='/admin/manage-endpoints'</script><p>Endpoint saved.</p>", "endpoints", user)
+            values = http_request_form_values(request.form, row)
+            try:
+                clean = http_request_clean_values(values)
+                sip_execute(
+                    f"UPDATE `{HTTP_REQUEST_TABLE}` SET `name`=%s, `method`=%s, `url`=%s, `body`=%s, `auth_type`=%s, `auth_username`=%s, `auth_password`=%s, `auth_header_name`=%s, `auth_header_value`=%s, `headers_json`=%s, `timeout`=%s, `include_audio_only`=%s WHERE id=%s",
+                    (
+                        clean["name"],
+                        clean["method"],
+                        clean["url"],
+                        clean["body"],
+                        clean["auth_type"],
+                        clean["auth_username"],
+                        clean["auth_password"],
+                        clean["auth_header_name"],
+                        clean["auth_header_value"],
+                        json.dumps(clean["headers"]),
+                        clean["timeout"],
+                        clean["include_audio_only"],
+                        row_id,
+                    ),
+                )
+                return page("Endpoint Saved", "<script>window.top.location.href='/admin/manage-endpoints'</script><p>Endpoint saved.</p>", "endpoints", user)
+            except ValueError as exc:
+                error = str(exc)
+                row.update(values)
+        if action == "delete":
+            error_html = f'<div class="error">{h(error)}</div>' if error else ""
+            body = f"""{error_html}<form method="post" class="grid surface">
+<p class="meta">Delete {h(row.get("name") or endpoint_id)}?</p>
+<button class="danger" type="submit">Delete Endpoint</button></form>"""
+        else:
+            body = http_request_form_html(http_request_form_values(None, row), error, "Save HTTP Request")
+        return page("Endpoint Action", sip_form_frame(body), "endpoints", user)
+
+    def render_settings(self, request, conn_factory, page, user):
+        return page(HTTP_REQUEST_NAME, "<p>No additional settings are required for HTTP Request.</p>", "endpoints", user)
+
+
+class BuiltinHttpRequestModule:
+    def get_endpoint_status(self):
+        return get_http_request_endpoint_status()
+
+    def handle_dispatch(self, action, stream_id, msg_id, sub_targets, metadata=None):
+        if action in {"prepare_audio", "prepare_livepage"}:
+            mark_ready(HTTP_REQUEST_MODULE, stream_id)
+        # Always ignore live pages
+        if action == "prepare_livepage":
+            return
+        if action not in {"prepare_audio", "sendmsg"}:
+            return
+        rows = http_request_rows_for_targets(sub_targets)
+        if not rows:
+            if action == "prepare_audio":
+                mark_ready(HTTP_REQUEST_MODULE, stream_id)
+            return
+        threading.Thread(
+            target=self.dispatch_requests,
+            args=(stream_id, msg_id, rows, dict(metadata or {})),
+            daemon=True,
+        ).start()
+
+    def dispatch_requests(self, stream_id, msg_id, rows, metadata):
+        msg_type = str(metadata.get("type") or "").strip()
+        msg_type_lower = msg_type.lower()
+        if msg_type_lower in {"page", "liveaudio"}:
+            mark_ready(HTTP_REQUEST_MODULE, stream_id)
+            return
+        # Detect bells: AudioMessage type with no visual text — always skip
+        has_text = bool(str(metadata.get("shortmessage") or "").strip() or str(metadata.get("longmessage") or "").strip())
+        if msg_type_lower == "audiomessage" and not has_text:
+            return
+        # Check if this is an audio-only message (no visual/text component)
+        is_audio_only = msg_type_lower in ("audio", "audiomessage") or (
+            is_audio_type(msg_type) and not has_text
+        )
+        any_failed = False
+        conn = None
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                for row in rows:
+                    # Skip audio-only messages if the endpoint has include_audio_only disabled
+                    iao = row.get("include_audio_only")
+                    if is_audio_only and not int(iao if iao is not None else 1):
+                        continue
+                    try:
+                        self.send_request(row, metadata, cur)
+                        log(f"http request sent endpoint={row.get('id')} stream={stream_id} msg={msg_id}")
+                    except Exception as exc:
+                        any_failed = True
+                        log(f"http request failed endpoint={row.get('id')} stream={stream_id} msg={msg_id}: {exc}")
+        except Exception as exc:
+            any_failed = True
+            log(f"http request dispatch error stream={stream_id} msg={msg_id}: {exc}")
+        finally:
+            if conn is not None:
+                conn.close()
+        if any_failed:
+            mark_failed(HTTP_REQUEST_MODULE, stream_id)
+
+    def send_request(self, row, metadata, cursor):
+        method = http_request_clean_method(row.get("method") or "POST")
+        url = http_request_expand_variables_with_cursor(row.get("url"), metadata or {}, cursor)
+        if not str(url or "").strip():
+            raise ValueError("URL is empty after variable expansion.")
+        headers = {"User-Agent": "OpenPagingServer"}
+        for item in sip_clean_headers(row.get("headers_json")):
+            name = http_request_expand_variables_with_cursor(item.get("name"), metadata or {}, cursor, space_format="_").strip()
+            value = http_request_expand_variables_with_cursor(item.get("value"), metadata or {}, cursor)
+            if not name or ":" in name or "\r" in name or "\n" in name:
+                continue
+            if "\r" in value or "\n" in value:
+                continue
+            headers[name] = value
+        auth_type = http_request_clean_auth_type(row.get("auth_type") or "none")
+        if auth_type == "apikey":
+            api_header_name = http_request_expand_variables_with_cursor(row.get("auth_header_name"), metadata or {}, cursor, space_format="_").strip()
+            api_header_value = http_request_expand_variables_with_cursor(row.get("auth_header_value"), metadata or {}, cursor)
+            if api_header_name and ":" not in api_header_name and "\r" not in api_header_name and "\n" not in api_header_name and "\r" not in api_header_value and "\n" not in api_header_value:
+                headers[api_header_name] = api_header_value
+        body = http_request_expand_variables_with_cursor(row.get("body"), metadata or {}, cursor)
+        body_bytes = body.encode("utf-8") if body != "" else None
+        timeout = http_request_clean_timeout(row.get("timeout"))
+        request_obj = urllib.request.Request(url, data=body_bytes, headers=headers, method=method)
+        if auth_type == "basic":
+            credentials = f"{str(row.get('auth_username') or '')}:{str(row.get('auth_password') or '')}"
+            token = base64.b64encode(credentials.encode("utf-8")).decode("ascii")
+            request_obj.add_header("Authorization", f"Basic {token}")
+            opener = urllib.request.build_opener()
+        elif auth_type == "digest":
+            password_mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+            password_mgr.add_password(
+                None,
+                url,
+                str(row.get("auth_username") or ""),
+                str(row.get("auth_password") or ""),
+            )
+            opener = urllib.request.build_opener(urllib.request.HTTPDigestAuthHandler(password_mgr))
+        else:
+            opener = urllib.request.build_opener()
+        try:
+            with opener.open(request_obj, timeout=timeout) as response:
+                status_code = int(getattr(response, "status", 0) or response.getcode() or 0)
+                if status_code >= 400:
+                    raise RuntimeError(f"HTTP {status_code}")
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"HTTP {exc.code} {exc.reason}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(str(getattr(exc, "reason", exc) or exc)) from exc
+        except TimeoutError as exc:
+            raise RuntimeError("request timed out") from exc
+        except OSError as exc:
+            raise RuntimeError(str(exc) or "request failed") from exc
+
+    def receive_audio(self, chunk, stream_id):
+        pass
+
+    def end_stream(self, stream_id):
+        pass
+
+    def shutdown(self):
+        pass
+
+
+SERVICE_MONITOR_PRIORITIES = ("Low", "Normal", "High", "Emergency")
+SERVICE_MONITOR_SUCCESS_REDIRECT = (
+    "<script>window.top.location.href='/admin/manage-endpoints'</script><p>Endpoint saved.</p>"
+)
+
+
+def service_monitor_default_tts_token(text):
+    """Encode a TTS token using the highest-priority local voice, else Google English."""
+    try:
+        from tts import available_tts_voices, encode_tts_token
+    except Exception:
+        return None
+    try:
+        voices = available_tts_voices()
+    except Exception:
+        voices = []
+    chosen = None
+    for voice in voices:
+        if str(voice.get("engine") or "").strip().lower() in ("swift", "festival", "piper"):
+            chosen = voice
+            break
+    if chosen is None:
+        for preferred in ("en", "en-us", "en-gb"):
+            for voice in voices:
+                if str(voice.get("engine") or "").strip().lower() == "google" and str(voice.get("voice") or "").strip().lower() == preferred:
+                    chosen = voice
+                    break
+            if chosen is not None:
+                break
+    if chosen is None:
+        for voice in voices:
+            if str(voice.get("engine") or "").strip().lower() == "google":
+                chosen = voice
+                break
+    if chosen is None:
+        return None
+    try:
+        return encode_tts_token({"engine": chosen.get("engine"), "voice": chosen.get("voice"), "text": text})
+    except Exception:
+        return None
+
+
+def service_monitor_default_audio_entries(tts_text, candidates):
+    entries = []
+    try:
+        from srv.web import app as webapp
+
+        available = set(webapp.audio_files())
+        for name in candidates:
+            if name in available:
+                entries.append(name)
+                break
+    except Exception:
+        pass
+    token = service_monitor_default_tts_token(tts_text)
+    if token:
+        entries.extend([token] * 5)
+    return entries
+
+
+def service_monitor_default_message(direction):
+    ts = "${date+time:MM/DD/YYYY HH:mm:ss}"
+    if direction == "down":
+        short = "${monitorname} is down at " + ts
+        longmsg = "${monitorname} went down at " + ts + ". Please investigate immediately.\n\n${status}"
+        tts_text = "Attention! ${monitorname} went down at " + ts + ". Please investigate immediately."
+        color = "D11010"
+        priority = "High"
+        audio = service_monitor_default_audio_entries(tts_text, SERVICE_MONITOR_DOWN_AUDIO_CANDIDATES)
+        expires = "onup"
+    else:
+        short = "${monitorname} is up at " + ts
+        longmsg = "${monitorname} is back up at " + ts + ".\n\n${status}"
+        tts_text = "${monitorname} is back up at " + ts + "."
+        color = "10D113"
+        priority = "Normal"
+        audio = service_monitor_default_audio_entries(tts_text, SERVICE_MONITOR_UP_AUDIO_CANDIDATES)
+        expires = "0m"
+    return {
+        "shortmessage": short,
+        "longmessage": longmsg,
+        "icon": "",
+        "color": color,
+        "audio": audio,
+        "priority": priority,
+        "vendor_specific": "",
+        "expires": expires,
+        "send_all": "0",
+        "groups": [],
+    }
+
+
+def service_monitor_draft_defaults():
+    return {
+        "name": "",
+        "monitor_type": "ping",
+        "check_interval": str(SERVICE_MONITOR_DEFAULT_INTERVAL),
+        "retries": str(SERVICE_MONITOR_DEFAULT_RETRIES),
+        "wait_for_up": str(SERVICE_MONITOR_DEFAULT_WAIT_FOR_UP),
+        "disabled": "0",
+        "host": "",
+        "port": "",
+        "http_url": "",
+        "http_fail_codes": list(SERVICE_MONITOR_HTTP_DEFAULT_FAIL),
+        "uk_base_url": "",
+        "uk_api_key": "",
+        "uk_monitor": "",
+        "down_enabled": "0",
+        "up_enabled": "0",
+        "down": service_monitor_default_message("down"),
+        "up": service_monitor_default_message("up"),
+    }
+
+
+def service_monitor_message_from_row(row, direction):
+    return {
+        "shortmessage": str(row.get(f"{direction}_shortmessage") or ""),
+        "longmessage": str(row.get(f"{direction}_longmessage") or ""),
+        "icon": str(row.get(f"{direction}_icon") or ""),
+        "color": str(row.get(f"{direction}_color") or ""),
+        "audio": [a for a in str(row.get(f"{direction}_audio") or "").split(":") if a],
+        "priority": str(row.get(f"{direction}_priority") or "Normal"),
+        "vendor_specific": str(row.get(f"{direction}_vendor_specific") or ""),
+        "expires": str(row.get(f"{direction}_expires") or "manual"),
+        "send_all": "1" if int(row.get(f"{direction}_send_all") or 0) else "0",
+        "groups": [g for g in str(row.get(f"{direction}_groups") or "").split(".") if g],
+    }
+
+
+def service_monitor_draft_from_row(row):
+    draft = service_monitor_draft_defaults()
+    draft["name"] = str(row.get("name") or "")
+    draft["monitor_type"] = str(row.get("monitor_type") or "ping")
+    draft["check_interval"] = str(row.get("check_interval") or SERVICE_MONITOR_DEFAULT_INTERVAL)
+    draft["retries"] = str(row.get("retries") if row.get("retries") is not None else SERVICE_MONITOR_DEFAULT_RETRIES)
+    draft["wait_for_up"] = str(row.get("wait_for_up") if row.get("wait_for_up") is not None else SERVICE_MONITOR_DEFAULT_WAIT_FOR_UP)
+    draft["disabled"] = "1" if int(row.get("disabled") or 0) else "0"
+    draft["host"] = str(row.get("host") or "")
+    draft["port"] = str(row.get("port")) if int(row.get("port") or 0) else ""
+    draft["http_url"] = str(row.get("http_url") or "")
+    draft["http_fail_codes"] = service_monitor_parse_fail_codes(row.get("http_fail_codes")) or list(
+        SERVICE_MONITOR_HTTP_DEFAULT_FAIL
+    )
+    draft["uk_base_url"] = str(row.get("uk_base_url") or "")
+    draft["uk_api_key"] = str(row.get("uk_api_key") or "")
+    draft["uk_monitor"] = str(row.get("uk_monitor") or "")
+    for direction in ("down", "up"):
+        draft[f"{direction}_enabled"] = "1" if int(row.get(f"{direction}_enabled") or 0) else "0"
+        draft[direction] = service_monitor_message_from_row(row, direction)
+    return draft
+
+
+def service_monitor_collect_config(draft, form):
+    draft["name"] = str(form.get("name") or "").strip()
+    draft["monitor_type"] = str(form.get("monitor_type") or "ping").strip().lower()
+    draft["check_interval"] = str(form.get("check_interval") or "").strip()
+    draft["retries"] = str(form.get("retries") or "").strip()
+    draft["wait_for_up"] = str(form.get("wait_for_up") or "").strip()
+    draft["disabled"] = "1" if form.get("disabled") else "0"
+    draft["host"] = str(form.get("host") or "").strip()
+    draft["port"] = str(form.get("port") or "").strip()
+    draft["http_url"] = str(form.get("http_url") or "").strip()
+    draft["http_fail_codes"] = service_monitor_parse_fail_codes(form.getlist("http_fail_codes"))
+    draft["uk_base_url"] = str(form.get("uk_base_url") or "").strip()
+    new_key = str(form.get("uk_api_key") or "").strip()
+    if new_key:
+        draft["uk_api_key"] = new_key
+    draft["uk_monitor"] = str(form.get("uk_monitor") or "").strip()
+    draft["down_enabled"] = "1" if form.get("down_enabled") else "0"
+    draft["up_enabled"] = "1" if form.get("up_enabled") else "0"
+    return draft
+
+
+def service_monitor_collect_message(form):
+    from srv.web.pages.messages.form_common import (
+        message_expiration_from_form,
+        message_multiline_text,
+        resolve_message_icon_value,
+        vendor_specific_from_form,
+    )
+
+    return {
+        "shortmessage": str(form.get("shortmessage") or ""),
+        "longmessage": message_multiline_text(form.get("longmessage") or ""),
+        "icon": resolve_message_icon_value(form.get("icon") or ""),
+        "color": str(form.get("color") or "").strip().lstrip("#").upper(),
+        "audio": [v.strip() for v in form.getlist("audio_files[]") if v.strip()],
+        "priority": str(form.get("priority") or "Normal"),
+        "vendor_specific": vendor_specific_from_form(form),
+        "expires": message_expiration_from_form(form),
+        "send_all": "1" if form.get("send_all") else "0",
+        "groups": [str(g).strip() for g in form.getlist("groups[]") if str(g).strip()],
+    }
+
+
+def service_monitor_row_values_from_draft(draft):
+    name = str(draft.get("name") or "").strip()
+    if not name:
+        raise ValueError("Enter a name for this monitor.")
+    monitor_type = service_monitor_clean_type(draft.get("monitor_type"))
+    interval = service_monitor_clean_interval(draft.get("check_interval"))
+    retries = service_monitor_clean_retries(draft.get("retries"))
+    wait_for_up = service_monitor_clean_wait_for_up(draft.get("wait_for_up"))
+    disabled = 1 if str(draft.get("disabled")) == "1" else 0
+    host = str(draft.get("host") or "").strip()
+    port = 0
+    http_url = ""
+    http_fail = []
+    uk_base = ""
+    uk_key = str(draft.get("uk_api_key") or "")
+    uk_mon = ""
+    if monitor_type == "ping":
+        if not host:
+            raise ValueError("Enter a host to ping.")
+    elif monitor_type == "tcp":
+        if not host:
+            raise ValueError("Enter a host to probe.")
+        port = service_monitor_clean_port(draft.get("port"))
+    elif monitor_type == "sip":
+        if not host:
+            raise ValueError("Enter a SIP host.")
+        port = service_monitor_clean_port(draft.get("port") or 5060)
+    elif monitor_type == "http":
+        http_url = str(draft.get("http_url") or "").strip()
+        if not http_url:
+            raise ValueError("Enter a URL to check.")
+        http_fail = service_monitor_parse_fail_codes(draft.get("http_fail_codes")) or list(
+            SERVICE_MONITOR_HTTP_DEFAULT_FAIL
+        )
+    elif monitor_type == "uptimekuma":
+        uk_base = str(draft.get("uk_base_url") or "").strip()
+        if not uk_base:
+            raise ValueError("Enter the Uptime Kuma base URL.")
+        if not uk_key:
+            raise ValueError("Enter the Uptime Kuma API key.")
+        uk_mon = str(draft.get("uk_monitor") or "").strip()
+        if not uk_mon:
+            raise ValueError("Select an Uptime Kuma monitor.")
+    values = {
+        "name": name,
+        "monitor_type": monitor_type,
+        "check_interval": interval,
+        "retries": retries,
+        "wait_for_up": wait_for_up,
+        "disabled": disabled,
+        "host": host,
+        "port": port,
+        "http_url": http_url,
+        "http_fail_codes": json.dumps(http_fail),
+        "uk_base_url": uk_base,
+        "uk_api_key": uk_key,
+        "uk_monitor": uk_mon,
+    }
+    for direction in ("down", "up"):
+        enabled = 1 if str(draft.get(f"{direction}_enabled")) == "1" else 0
+        msg = draft.get(direction) or {}
+        send_all = False
+        groups = []
+        if enabled:
+            has_text = bool(
+                str(msg.get("shortmessage") or "").strip() or str(msg.get("longmessage") or "").strip()
+            )
+            has_audio = bool(msg.get("audio"))
+            if not has_text and not has_audio:
+                raise ValueError(f"Add a message or audio for the monitor {direction} notification.")
+            send_all = str(msg.get("send_all")) == "1"
+            groups = list(msg.get("groups") or [])
+            if not send_all and not groups:
+                raise ValueError(f"Choose recipients for the monitor {direction} notification.")
+        else:
+            msg = {}
+        values[f"{direction}_enabled"] = enabled
+        values[f"{direction}_send_all"] = 1 if (enabled and send_all) else 0
+        values[f"{direction}_groups"] = ".".join(groups)
+        values[f"{direction}_shortmessage"] = str(msg.get("shortmessage") or "")
+        values[f"{direction}_longmessage"] = str(msg.get("longmessage") or "")
+        values[f"{direction}_icon"] = str(msg.get("icon") or "")
+        values[f"{direction}_color"] = str(msg.get("color") or "")
+        values[f"{direction}_audio"] = ":".join(msg.get("audio") or [])
+        values[f"{direction}_priority"] = str(msg.get("priority") or "Normal")
+        values[f"{direction}_vendor_specific"] = str(msg.get("vendor_specific") or "")
+        values[f"{direction}_expires"] = str(msg.get("expires") or "manual")
+    return values
+
+
+def service_monitor_insert(values):
+    ensure_servicemonitor_schema()
+    cols = list(values.keys())
+    sip_execute(
+        f"INSERT INTO `{SERVICE_MONITOR_TABLE}` ({', '.join('`' + c + '`' for c in cols)}, `last_state`) "
+        f"VALUES ({', '.join(['%s'] * len(cols))}, 'unchecked')",
+        tuple(values[c] for c in cols),
+    )
+
+
+def service_monitor_update(row_id, values):
+    ensure_servicemonitor_schema()
+    cols = list(values.keys())
+    sets = ", ".join(f"`{c}`=%s" for c in cols)
+    sip_execute(
+        f"UPDATE `{SERVICE_MONITOR_TABLE}` SET {sets}, `last_state`='unchecked', `last_checked`=NULL, `last_error`=NULL, `fail_count`=0 WHERE id=%s",
+        tuple(values[c] for c in cols) + (row_id,),
+    )
+
+
+def service_monitor_message_summary(draft, direction):
+    msg = draft.get(direction) or {}
+    has_text = bool(str(msg.get("shortmessage") or "").strip() or str(msg.get("longmessage") or "").strip())
+    has_audio = bool(msg.get("audio"))
+    if not has_text and not has_audio:
+        return "No message configured yet."
+    if str(msg.get("send_all")) == "1":
+        who = "All recipients"
+    else:
+        count = len(msg.get("groups") or [])
+        who = f"{count} group(s)" if count else "No recipients selected"
+    return f"Message ready \u2014 {who}."
+
+
+SERVICE_MONITOR_CONFIG_SCRIPT = """
+<style>
+.sm-section{border:1px solid #e6e8eb;border-radius:6px;padding:12px;display:grid;gap:10px}
+.sm-msg{display:block}
+.sm-editor-frame{width:100%;border:1px solid #e6e8eb;border-radius:6px;background:#fff;display:block;min-height:220px}
+@media(prefers-color-scheme:dark){.sm-section{border-color:#333}.sm-editor-frame{border-color:#333;background:#171717}}
+html.sm-modal-active,html.sm-modal-active body{background:transparent !important;overflow:hidden !important;}
+html.sm-modal-active body>*{visibility:hidden !important;}
+html.sm-modal-active .sm-editor-frame.sm-active{visibility:visible !important;}
+</style>
+<script>
+(function(){
+  var typeSel = document.getElementById('smType');
+  function show(sel, on){ document.querySelectorAll(sel).forEach(function(el){ el.style.display = on ? '' : 'none'; }); }
+  function syncType(){
+    var t = typeSel.value;
+    show('.sm-host', t==='ping'||t==='tcp'||t==='sip');
+    show('.sm-port', t==='tcp'||t==='sip');
+    show('.sm-http', t==='http');
+    show('.sm-uk', t==='uptimekuma');
+  }
+  typeSel.addEventListener('change', syncType);
+  syncType();
+  function syncMsg(cbId, blockId){
+    var cb = document.getElementById(cbId), block = document.getElementById(blockId);
+    if (cb && block) block.style.display = cb.checked ? '' : 'none';
+  }
+  var de = document.getElementById('smDownEnabled'), ue = document.getElementById('smUpEnabled');
+  if (de) de.addEventListener('change', function(){ syncMsg('smDownEnabled','smDownBlock'); });
+  if (ue) ue.addEventListener('change', function(){ syncMsg('smUpEnabled','smUpBlock'); });
+  syncMsg('smDownEnabled','smDownBlock');
+  syncMsg('smUpEnabled','smUpBlock');
+  var loadBtn = document.getElementById('smUkLoad');
+  if (loadBtn) loadBtn.addEventListener('click', function(){
+    var status = document.getElementById('smUkStatus');
+    var base = document.getElementById('smUkBase').value;
+    var key = document.getElementById('smUkKey').value;
+    var epEl = document.querySelector('input[name="endpoint_id"]');
+    status.textContent = 'Loading...';
+    var body = new URLSearchParams();
+    body.append('base_url', base);
+    body.append('api_key', key);
+    if (epEl) body.append('endpoint_id', epEl.value);
+    fetch('/admin/servicemonitor-kuma-monitors', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body: body.toString(), credentials:'same-origin'})
+      .then(function(r){ return r.json(); })
+      .then(function(data){
+        if (!data.ok){ status.textContent = data.error || 'Failed to load monitors.'; return; }
+        var sel = document.getElementById('smUkMonitor');
+        var current = sel.value;
+        sel.innerHTML = '';
+        if (!data.monitors.length){ status.textContent = 'No monitors found.'; }
+        else { status.textContent = data.monitors.length + ' monitor(s) loaded.'; }
+        data.monitors.forEach(function(name){
+          var opt = document.createElement('option');
+          opt.value = name; opt.textContent = name;
+          if (name === current) opt.selected = true;
+          sel.appendChild(opt);
+        });
+      })
+      .catch(function(){ status.textContent = 'Could not reach Uptime Kuma.'; });
+  });
+  // Relay editor iframe heights so each inline editor sizes to its content.
+  window.addEventListener('message', function(ev){
+    var d = ev.data;
+    if (!d) return;
+    if (d.type === 'sm-modal-overlay'){
+      var frames2 = document.querySelectorAll('.sm-editor-frame');
+      for (var j=0;j<frames2.length;j++){
+        if (frames2[j].contentWindow === ev.source){
+          var f = frames2[j];
+          if (d.open){
+            if (f.getAttribute('data-sm-prev') === null){
+              f.setAttribute('data-sm-prev', f.getAttribute('style') || '');
+            }
+            document.documentElement.classList.add('sm-modal-active');
+            f.classList.add('sm-active');
+            // Use viewport units so the frame re-measures automatically as each
+            // ancestor iframe expands (the overlay relay runs inner->outer, so a
+            // pixel snapshot taken here would capture the pre-expansion size).
+            f.style.position='fixed'; f.style.top='0'; f.style.left='0';
+            f.style.width='100vw'; f.style.height='100vh';
+            f.style.right='auto'; f.style.bottom='auto'; f.style.margin='0';
+            f.style.border='0'; f.style.borderRadius='0';
+            f.style.background='transparent'; f.style.minHeight='0';
+            f.style.zIndex='2147483000';
+          } else {
+            f.setAttribute('style', f.getAttribute('data-sm-prev') || '');
+            f.removeAttribute('data-sm-prev');
+            f.classList.remove('sm-active');
+            document.documentElement.classList.remove('sm-modal-active');
+          }
+          break;
+        }
+      }
+      try { window.parent.postMessage({type:'sm-modal-overlay', open: d.open}, '*'); } catch(e){}
+      return;
+    }
+    if (d.type !== 'ops-frame-height') return;
+    var frames = document.querySelectorAll('.sm-editor-frame');
+    for (var i=0;i<frames.length;i++){
+      if (frames[i].contentWindow === ev.source){
+        if (frames[i].classList.contains('sm-active')) break;
+        frames[i].style.height = (Number(d.height) + 4) + 'px';
+        break;
+      }
+    }
+  });
+  // On save, flush visible editors (persist any unsaved keystrokes) before submit.
+  var form = document.getElementById('smForm');
+  var submitting = false;
+  function visibleEditorFrames(){
+    return Array.prototype.filter.call(document.querySelectorAll('.sm-editor-frame'), function(f){
+      var block = f.closest('.sm-msg');
+      return block && block.style.display !== 'none';
+    });
+  }
+  function flushEditors(done){
+    var frames = visibleEditorFrames();
+    var i = 0;
+    function next(){
+      if (i >= frames.length){ done(); return; }
+      var f = frames[i++];
+      var acked = false;
+      function settle(){ if (acked) return; acked = true; clearTimeout(timer); window.removeEventListener('message', onMsg); next(); }
+      function onMsg(ev){
+        if (!ev.data || ev.data.type !== 'sm-flushed') return;
+        if (ev.source && f.contentWindow && ev.source !== f.contentWindow) return;
+        settle();
+      }
+      var timer = setTimeout(settle, 2500);
+      window.addEventListener('message', onMsg);
+      try { f.contentWindow.postMessage({type:'sm-flush'}, window.location.origin); }
+      catch (e) { settle(); }
+    }
+    next();
+  }
+  if (form) form.addEventListener('submit', function(ev){
+    if (submitting) return;
+    ev.preventDefault();
+    flushEditors(function(){ submitting = true; form.submit(); });
+  });
+})();
+</script>
+"""
+
+
+def service_monitor_config_html(mode, endpoint_id, token, draft, error):
+    error_html = f'<div class="error">{h(error)}</div>' if error else ""
+    monitor_type = str(draft.get("monitor_type") or "ping")
+    type_options = "".join(
+        f'<option value="{h(t)}"{" selected" if monitor_type == t else ""}>{h(SERVICE_MONITOR_TYPE_LABELS[t])}</option>'
+        for t in SERVICE_MONITOR_TYPES
+    )
+    fail_selected = {str(x) for x in (draft.get("http_fail_codes") or [])}
+    fail_choices = [
+        ("noresponse", "No response (connection failed / timeout)"),
+        ("4xx", "All 4xx client errors"),
+        ("5xx", "All 5xx server errors"),
+    ] + [(str(c), f"HTTP {c}") for c in SERVICE_MONITOR_HTTP_CODE_CHOICES]
+    fail_rows = "".join(
+        f'<label class="md-checkbox-container"><input type="checkbox" name="http_fail_codes" value="{h(value)}"'
+        f'{" checked" if value in fail_selected else ""}><span class="md-checkmark"></span>'
+        f'<span class="md-checkbox-text">{h(label)}</span></label>'
+        for value, label in fail_choices
+    )
+    interval = h(draft.get("check_interval") or SERVICE_MONITOR_DEFAULT_INTERVAL)
+    retries = h(draft.get("retries") if draft.get("retries") not in (None, "") else SERVICE_MONITOR_DEFAULT_RETRIES)
+    wait_for_up = h(draft.get("wait_for_up") if draft.get("wait_for_up") not in (None, "") else SERVICE_MONITOR_DEFAULT_WAIT_FOR_UP)
+    disabled_checked = " checked" if str(draft.get("disabled")) == "1" else ""
+    uk_monitor = str(draft.get("uk_monitor") or "")
+    uk_monitor_option = f'<option value="{h(uk_monitor)}" selected>{h(uk_monitor)}</option>' if uk_monitor else ""
+    down_checked = " checked" if str(draft.get("down_enabled")) == "1" else ""
+    up_checked = " checked" if str(draft.get("up_enabled")) == "1" else ""
+    if mode == "edit":
+        editor_base = (
+            f"/admin/endpoint-action-frame?module=servicemonitor&amp;action=edit"
+            f"&amp;id={h(endpoint_id)}&amp;view=editor"
+        )
+    else:
+        editor_base = (
+            f"/admin/endpoint-form-frame?module=servicemonitor&amp;type=monitor"
+            f"&amp;view=editor&amp;token={h(token)}"
+        )
+    submit_label = "Save Monitor" if mode == "edit" else "Add Service Monitor"
+    api_key_note = "Leave blank to keep the current key." if (mode == "edit" and draft.get("uk_api_key")) else ""
+    endpoint_hidden = f'<input type="hidden" name="endpoint_id" value="{h(endpoint_id)}">' if endpoint_id else ""
+    body = f"""{error_html}<form method="post" class="grid form-surface" id="smForm">
+<input type="hidden" name="token" value="{h(token)}">
+{endpoint_hidden}
+<div class="row"><label>Name <span style="color:#C62828">*</span></label><input class="control" name="name" value="{h(draft.get("name"))}" required></div>
+<div class="row"><label>Monitor Type</label><select class="control short-control" name="monitor_type" id="smType">{type_options}</select></div>
+<div class="row sm-field sm-host" id="smHostRow"><label>Host</label><input class="control" name="host" id="smHost" value="{h(draft.get("host"))}" placeholder="ex: 192.168.1.10 or host.example.com"></div>
+<div class="row sm-field sm-port" id="smPortRow"><label>Port</label><input class="control short-control" name="port" id="smPort" value="{h(draft.get("port"))}" inputmode="numeric" placeholder="ex: 5060"></div>
+<div class="row sm-field sm-http" id="smUrlRow"><label>URL</label><input class="control" name="http_url" id="smUrl" value="{h(draft.get("http_url"))}" placeholder="ex: https://example.com/health"></div>
+<div class="row sm-field sm-http" id="smFailRow"><label>Failure conditions</label><details class="dropdown-checklist"><summary>Select failure responses</summary><div class="dropdown-panel">{fail_rows}</div></details><span class="hint">The service is down when a check matches any selected condition.</span></div>
+<div class="row sm-field sm-uk" id="smUkBaseRow"><label>Uptime Kuma URL</label><input class="control" name="uk_base_url" id="smUkBase" value="{h(draft.get("uk_base_url"))}" placeholder="ex: https://kuma.example.com"></div>
+<div class="row sm-field sm-uk" id="smUkKeyRow"><label>API Key</label><input class="control" type="password" name="uk_api_key" id="smUkKey" value="" placeholder="Uptime Kuma API key" autocomplete="new-password"><span class="hint">{h(api_key_note)}</span></div>
+<div class="row sm-field sm-uk" id="smUkLoadRow"><button type="button" class="button" id="smUkLoad">Load monitors</button> <span class="hint" id="smUkStatus"></span></div>
+<div class="row sm-field sm-uk" id="smUkMonitorRow"><label>Monitor</label><select class="control" name="uk_monitor" id="smUkMonitor">{uk_monitor_option}</select></div>
+<div class="row"><label>Check interval (seconds)</label><input class="control short-control" type="number" name="check_interval" value="{interval}" min="{SERVICE_MONITOR_MIN_INTERVAL}" max="{SERVICE_MONITOR_MAX_INTERVAL}" required></div>
+<div class="row"><label>Retries</label><input class="control short-control" type="number" name="retries" value="{retries}" min="{SERVICE_MONITOR_MIN_RETRIES}" max="{SERVICE_MONITOR_MAX_RETRIES}" required><span class="hint">Grace period before marking the monitor offline (0\u2013{SERVICE_MONITOR_MAX_RETRIES} failed checks).</span></div>
+<div class="row"><label>Wait for Up (seconds)</label><input class="control short-control" type="number" name="wait_for_up" value="{wait_for_up}" min="{SERVICE_MONITOR_MIN_WAIT_FOR_UP}" max="{SERVICE_MONITOR_MAX_WAIT_FOR_UP}" required><span class="hint">Wait this long after recovery and re-check before sending an up alert (0 = immediate).</span></div>
+<label class="md-checkbox-container"><input type="checkbox" name="disabled" value="1"{disabled_checked}><span class="md-checkmark"></span><span class="md-checkbox-text">Disabled \u2014 pause checking and alerts for this monitor</span></label>
+<div class="sm-section">
+<label class="md-checkbox-container"><input type="checkbox" name="down_enabled" value="1" id="smDownEnabled"{down_checked}><span class="md-checkmark"></span><span class="md-checkbox-text">Monitor down message</span></label>
+<div class="sm-msg" id="smDownBlock"><iframe class="sm-editor-frame" data-dir="down" title="Monitor down message" src="{editor_base}&amp;direction=down" scrolling="no"></iframe></div>
+</div>
+<div class="sm-section">
+<label class="md-checkbox-container"><input type="checkbox" name="up_enabled" value="1" id="smUpEnabled"{up_checked}><span class="md-checkmark"></span><span class="md-checkbox-text">Monitor up message</span></label>
+<div class="sm-msg" id="smUpBlock"><iframe class="sm-editor-frame" data-dir="up" title="Monitor up message" src="{editor_base}&amp;direction=up" scrolling="no"></iframe></div>
+</div>
+<button class="button" type="submit" name="action" value="save">{h(submit_label)}</button>
+</form>
+"""
+    return body + SERVICE_MONITOR_CONFIG_SCRIPT
+
+
+def service_monitor_message_editor_html(direction, token, draft, user, error):
+    from srv.web import app as webapp
+    from srv.web.pages.messages.form_common import (
+        MESSAGE_FORM_SCRIPT,
+        MESSAGE_FORM_STYLE,
+        audio_transfer_html,
+        message_expiration_field_html,
+        message_icon_field_html,
+        message_variable_field_html,
+        message_variable_guide_html,
+        vendor_specific_editor_html,
+    )
+
+    msg = draft.get(direction) or {}
+    short = str(msg.get("shortmessage") or "")
+    longmsg = str(msg.get("longmessage") or "")
+    icon = str(msg.get("icon") or "")
+    color = str(msg.get("color") or "")
+    audio_sel = list(msg.get("audio") or [])
+    priority = str(msg.get("priority") or "Normal")
+    expires = str(msg.get("expires") or "manual")
+    vendor = str(msg.get("vendor_specific") or "")
+    send_all = str(msg.get("send_all")) == "1"
+    sel_groups = {str(g) for g in (msg.get("groups") or [])}
+    try:
+        group_rows = webapp.filter_group_rows_for_user(
+            user, webapp.query_all("SELECT id, name FROM `groups` ORDER BY name ASC, id ASC")
+        )
+    except Exception:
+        group_rows = []
+    rows_html = ""
+    for group in group_rows:
+        gid = str(group.get("id") or "").strip()
+        if not gid:
+            continue
+        rows_html += (
+            f'<label class="md-checkbox-container"><input type="checkbox" name="groups[]" value="{h(gid)}" '
+            f'class="group-checkbox"{" disabled" if send_all else ""}{" checked" if gid in sel_groups else ""}>'
+            f'<span class="md-checkmark"></span><span class="text">{h(group.get("name") or gid)}</span></label>'
+        )
+    if not rows_html:
+        rows_html = '<p class="help-text">No groups are available.</p>'
+    try:
+        expiration_messages = webapp.query_all(
+            "SELECT messageid, name FROM messages ORDER BY name ASC, messageid ASC"
+        )
+    except Exception:
+        expiration_messages = []
+    transfer = audio_transfer_html(webapp.audio_files(), audio_sel)
+    vendor_html = vendor_specific_editor_html(current_vendor_specific=vendor, context={"mode": "message_custom"})
+    color_default = "#" + color if re.fullmatch(r"[A-Fa-f0-9]{6}", color or "") else "#000000"
+    variable_fields = message_variable_field_html(
+        "shortmessage",
+        "Short Message",
+        f'<input type="text" name="shortmessage" id="shortmessage" class="form-control" value="{h(short)}">',
+        "",
+    ) + message_variable_field_html(
+        "longmessage",
+        "Long Message",
+        f'<textarea name="longmessage" id="longmessage" class="form-control textarea-long" rows="7" wrap="soft">{h(longmsg)}</textarea>',
+        "",
+    )
+    error_html = f'<div class="error">{h(error)}</div>' if error else ""
+    direction_js = json.dumps(direction)
+    priority_options = "".join(
+        f'<option value="{h(p)}"{" selected" if priority == p else ""}>{h(p)}</option>'
+        for p in SERVICE_MONITOR_PRIORITIES
+    )
+    return f"""<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet"/>
+<style>{MESSAGE_FORM_STYLE}
+body,html{{overflow:visible;height:auto;}}
+.btn-send{{background:#2E7D32;color:#FFF;border:none;padding:10px 16px;border-radius:6px;font-size:14px;cursor:pointer;}}
+.btn-cancel{{background:none;border:none;color:#777;cursor:pointer;font-size:14px;text-decoration:underline;}}
+.custom-form-actions{{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:10px;}}
+/* Modal pass-through: while a picker is open, make this editor iframe a
+   transparent window that shows only the modal + backdrop, so the popup
+   appears centred over the whole app page (like the Messages tab) with the
+   page dimmed behind it rather than being clipped inside the iframe. */
+html.sm-modal-active,html.sm-modal-active body{{background:transparent !important;overflow:hidden !important;}}
+html.sm-modal-active body>*{{visibility:hidden !important;}}
+html.sm-modal-active .message-variable-modal.open,
+html.sm-modal-active .message-variable-modal-backdrop.open,
+html.sm-modal-active .audio-block-modal.open,
+html.sm-modal-active .audio-block-modal-backdrop.open,
+html.sm-modal-active .message-icon-picker-modal.open,
+html.sm-modal-active .message-icon-picker-backdrop.open{{visibility:visible !important;}}
+</style>
+<div style="padding:16px;box-sizing:border-box;">
+<div class="info-card">
+{error_html}
+<form method="post" id="smMsgForm">
+<input type="hidden" name="token" value="{h(token)}">
+<input type="hidden" name="direction" value="{h(direction)}">
+<div class="form-group">
+<label class="main-label">Recipients</label>
+<div class="checkbox-row">
+<label class="md-checkbox-container"><input type="checkbox" name="send_all" id="send_all" value="1" onchange="toggleRecipients()"{" checked" if send_all else ""}><span class="md-checkmark"></span><span class="text" style="font-weight:bold;color:#1976D2;">All Recipients</span></label>
+{rows_html}
+</div>
+</div>
+<div id="audio-fields" class="form-group">
+<label class="main-label">Audio</label>
+{transfer}
+</div>
+<div id="visual-fields">
+{variable_fields}
+{message_icon_field_html(icon)}
+<div class="form-group"><label class="main-label">Color</label>
+<div class="color-picker-container">
+<input type="color" id="colorPicker" value="{h(color_default)}" class="color-picker-input">
+<input type="text" name="color" id="colorHex" class="form-control" style="width:150px;" placeholder="000000" maxlength="6" value="{h(color)}">
+</div></div>
+</div>
+{message_expiration_field_html(expiration_messages, expires, include_on_up=(direction == "down"))}
+<div class="form-group"><label class="main-label" for="priority">Priority</label>
+<select name="priority" id="priority" class="form-control">{priority_options}</select></div>
+{vendor_html}
+</form>
+</div>
+{message_variable_guide_html('<button type="button" class="message-variable-choice" onclick="openVariableWizard(&#39;monitorname&#39;)">Monitor Name</button><button type="button" id="messageVariableStatusChoice" class="message-variable-choice" onclick="openVariableWizard(&#39;status&#39;)">Status</button>')}
+</div>
+<script>{MESSAGE_FORM_SCRIPT}
+function toggleRecipients(){{
+  var all = document.getElementById('send_all').checked;
+  document.querySelectorAll('.group-checkbox').forEach(function(cb){{ cb.disabled = all; if (all) cb.checked = false; }});
+}}
+toggleRecipients();
+(function(){{
+  var DIR = {direction_js};
+  var form = document.getElementById('smMsgForm');
+  if (!form) return;
+  function saveNow(){{
+    var fd = new FormData(form);
+    fd.set('action', 'autosave_message_' + DIR);
+    return fetch(window.location.href, {{method:'POST', body: fd, credentials:'same-origin'}});
+  }}
+  // Persist only when the parent requests a flush (on Save). This avoids a
+  // POST per keystroke, which would otherwise exhaust the web POST rate limit
+  // and cause the final Save to be rejected.
+  window.addEventListener('message', function(ev){{
+    if (!ev.data || ev.data.type !== 'sm-flush') return;
+    function ack(){{ if (window.parent && window.parent !== window) window.parent.postMessage({{type:'sm-flushed', direction: DIR}}, window.location.origin); }}
+    saveNow().then(ack, ack);
+  }});
+}})();
+(function(){{
+  // Hoist editor modals to the top page: when any modal opens inside this
+  // content-sized iframe, notify ancestors so the frame chain expands to the
+  // top viewport (position:fixed modals otherwise render off-screen).
+  var SELECTORS = ['.message-variable-modal','.message-variable-modal-backdrop','.audio-block-modal','.audio-block-modal-backdrop','.message-icon-picker-modal','.message-icon-picker-backdrop'];
+  var query = SELECTORS.map(function(s){{ return s + '.open'; }}).join(',');
+  var lastOpen = false;
+  function check(){{
+    var open = !!document.querySelector(query);
+    if (open === lastOpen) return;
+    lastOpen = open;
+    try {{ document.documentElement.classList.toggle('sm-modal-active', open); }} catch(e){{}}
+    try {{ window.parent.postMessage({{type:'sm-modal-overlay', open: open}}, '*'); }} catch(e){{}}
+  }}
+  var obs = new MutationObserver(check);
+  obs.observe(document.documentElement, {{attributes:true, subtree:true, attributeFilter:['class']}});
+}})();
+</script>"""
+
+
+class BuiltinServiceMonitorWeb:
+    def forms(self):
+        return {
+            "monitor": {"label": SERVICE_MONITOR_NAME, "description": SERVICE_MONITOR_DESCRIPTION},
+        }
+
+    def _handle(self, mode, endpoint_id, request, page, user):
+        ensure_servicemonitor_schema()
+        row = None
+        row_id = None
+        if mode == "edit":
+            kind, _, row_id = str(endpoint_id or "").partition("-")
+            if kind != "monitor" or not row_id.isdigit():
+                return page("Endpoint Action", "<h1>Invalid endpoint action</h1>", "endpoints", user, status=400)
+            row = service_monitor_row(row_id)
+            if not row:
+                return page("Endpoint Action", "<h1>Endpoint not found</h1>", "endpoints", user, status=404)
+            token = f"edit-monitor-{row_id}"
+        view = str(request.args.get("view") or "").strip().lower()
+        direction = str(request.args.get("direction") or "down").strip().lower()
+        if direction not in ("down", "up"):
+            direction = "down"
+        if request.method == "GET":
+            if view == "editor":
+                if mode == "new":
+                    token = str(request.args.get("token") or "").strip() or uuid.uuid4().hex
+                    draft = service_monitor_load_draft(token)
+                    if draft is None:
+                        draft = service_monitor_draft_defaults()
+                        service_monitor_save_draft(token, draft)
+                else:
+                    draft = service_monitor_load_draft(token)
+                    if draft is None:
+                        draft = service_monitor_draft_from_row(row)
+                        service_monitor_save_draft(token, draft)
+                body = service_monitor_message_editor_html(direction, token, draft, user, "")
+                return page(SERVICE_MONITOR_NAME, body, "endpoints", user)
+            if mode == "edit":
+                draft = service_monitor_draft_from_row(row)
+            else:
+                token = uuid.uuid4().hex
+                draft = service_monitor_draft_defaults()
+            service_monitor_save_draft(token, draft)
+            body = service_monitor_config_html(mode, endpoint_id, token, draft, "")
+            return page(SERVICE_MONITOR_NAME, sip_form_frame(body), "endpoints", user)
+        form = request.form
+        if mode == "new":
+            token = str(form.get("token") or "").strip() or uuid.uuid4().hex
+        draft = service_monitor_load_draft(token)
+        if draft is None:
+            draft = service_monitor_draft_from_row(row) if mode == "edit" else service_monitor_draft_defaults()
+        action = str(form.get("action") or "save").strip()
+        if action in ("autosave_message_down", "autosave_message_up"):
+            msg_dir = "down" if action.endswith("down") else "up"
+            draft[msg_dir] = service_monitor_collect_message(form)
+            service_monitor_save_draft(token, draft)
+            return page(SERVICE_MONITOR_NAME, "ok", "endpoints", user)
+        service_monitor_collect_config(draft, form)
+        service_monitor_save_draft(token, draft)
+        try:
+            values = service_monitor_row_values_from_draft(draft)
+        except ValueError as exc:
+            body = service_monitor_config_html(mode, endpoint_id, token, draft, str(exc))
+            return page(SERVICE_MONITOR_NAME, sip_form_frame(body), "endpoints", user)
+        if mode == "edit":
+            service_monitor_update(row_id, values)
+        else:
+            service_monitor_insert(values)
+        service_monitor_delete_draft(token)
+        return page("Endpoint Saved", SERVICE_MONITOR_SUCCESS_REDIRECT, "endpoints", user)
+
+    def render_form(self, form_type, request, conn_factory, page, user):
+        ensure_servicemonitor_schema()
+        if form_type not in self.forms():
+            return page("Endpoint Form", "<h1>Endpoint form not found</h1>", "endpoints", user, status=404)
+        return self._handle("new", None, request, page, user)
+
+    def render_action(self, action, endpoint_id, request, conn_factory, page, user):
+        ensure_servicemonitor_schema()
+        kind, _, row_id = str(endpoint_id or "").partition("-")
+        if action not in {"edit", "delete"} or kind != "monitor" or not row_id.isdigit():
+            return page("Endpoint Action", "<h1>Invalid endpoint action</h1>", "endpoints", user, status=400)
+        row = service_monitor_row(row_id)
+        if not row:
+            return page("Endpoint Action", "<h1>Endpoint not found</h1>", "endpoints", user, status=404)
+        if action == "delete":
+            if request.method == "POST":
+                sip_execute(f"DELETE FROM `{SERVICE_MONITOR_TABLE}` WHERE id=%s", (row_id,))
+                service_monitor_delete_draft(f"edit-monitor-{row_id}")
+                return page("Endpoint Saved", SERVICE_MONITOR_SUCCESS_REDIRECT, "endpoints", user)
+            body = (
+                '<form method="post" class="grid surface">'
+                f'<p class="meta">Delete {h(row.get("name") or endpoint_id)}?</p>'
+                '<button class="danger" type="submit">Delete Endpoint</button></form>'
+            )
+            return page("Endpoint Action", sip_form_frame(body), "endpoints", user)
+        return self._handle("edit", endpoint_id, request, page, user)
+
+    def render_settings(self, request, conn_factory, page, user):
+        return page(
+            SERVICE_MONITOR_NAME,
+            "<p>No additional settings are required for Service Monitor.</p>",
+            "endpoints",
+            user,
+        )
+
+
+def service_monitor_all_group_rows():
+    try:
+        return sip_query_all("SELECT `id`, `name` FROM `groups` ORDER BY `name` ASC, `id` ASC")
+    except Exception as exc:
+        log(f"service monitor group list error: {exc}")
+        return []
+
+
+def service_monitor_all_groups_value():
+    ids = [str(row.get("id") or "").strip() for row in service_monitor_all_group_rows() if str(row.get("id") or "").strip()]
+    return ".".join(ids)
+
+
+class BuiltinServiceMonitorModule:
+    def __init__(self):
+        self.stop_event = threading.Event()
+        self.inflight = set()
+        self.inflight_lock = threading.Lock()
+        # Monitors that have been confirmed ONLINE at least once in THIS process.
+        # A "went down" alert is only ever sent for a monitor in this set, so a
+        # stale DB last_state, a skipped boot reset, retries=0, or a flaky first
+        # probe can never fire a false "server is down" broadcast on startup.
+        self.seen_online = set()
+        self.seen_online_lock = threading.Lock()
+        self.boot_monotonic = time.monotonic()
+        try:
+            ensure_servicemonitor_schema()
+            # On boot every monitor is "Unchecked" until it has been probed once.
+            sip_execute(
+                f"UPDATE `{SERVICE_MONITOR_TABLE}` SET `last_state`='unchecked', `last_checked`=NULL, `fail_count`=0"
+            )
+        except Exception as exc:
+            log(f"service monitor init error: {exc}")
+        self._clear_stale_monitor_broadcasts()
+        self.thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self.thread.start()
+
+    def _clear_stale_monitor_broadcasts(self):
+        # Neutralise any Service Monitor broadcast left in the active store by a
+        # previous run. The broadcast watcher re-delivers every record whose
+        # delivery is '' or 'pending', and a monitor down message (manual / "on
+        # monitor up" expiration) never time-expires — so without this a stale
+        # "went down" message is re-broadcast on EVERY server restart. On boot
+        # the poll loop hasn't run yet, so any monitor-sender broadcast still
+        # sitting here is stale and must be stopped + expired. Fresh alerts are
+        # re-created by the poll loop as needed.
+        try:
+            from broadcasts import list_active_broadcasts, mark_active_broadcast_delivery
+
+            removed = 0
+            for record in list_active_broadcasts(limit=5000):
+                if str(record.get("sender") or "").strip() != SERVICE_MONITOR_NAME:
+                    continue
+                rid = str(record.get("id") or "").strip()
+                if not rid:
+                    continue
+                request_active_broadcast_stop(rid)
+                mark_active_broadcast_delivery(rid, "expired")
+                removed += 1
+            try:
+                sip_execute(f"UPDATE `{SERVICE_MONITOR_TABLE}` SET `down_broadcast_id`=NULL")
+            except Exception as exc:
+                log(f"service monitor boot down-broadcast clear error: {exc}")
+            if removed:
+                log(f"service monitor boot cleanup removed {removed} stale monitor broadcast(s)")
+        except Exception as exc:
+            log(f"service monitor boot cleanup error: {exc}")
+
+    def get_endpoint_status(self):
+        return get_service_monitor_endpoint_status()
+
+    def handle_dispatch(self, action, stream_id, msg_id, sub_targets, metadata=None):
+        # Service Monitor is an input-only module; it never receives broadcasts.
+        if action in {"prepare_audio", "prepare_livepage"}:
+            mark_ready(SERVICE_MONITOR_MODULE, stream_id)
+
+    def _poll_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                self._tick()
+            except Exception as exc:
+                log(f"service monitor poll error: {exc}")
+            self.stop_event.wait(2.0)
+
+    def _tick(self):
+        try:
+            rows = service_monitor_rows()
+        except Exception as exc:
+            log(f"service monitor rows error: {exc}")
+            return
+        now = datetime.now()
+        for row in rows:
+            if int(row.get("disabled") or 0):
+                continue
+            row_id = str(row.get("id"))
+            interval = int(row.get("check_interval") or SERVICE_MONITOR_DEFAULT_INTERVAL)
+            last_checked = row.get("last_checked")
+            due = True
+            if last_checked:
+                try:
+                    lc = last_checked if isinstance(last_checked, datetime) else datetime.fromisoformat(str(last_checked))
+                    due = (now - lc).total_seconds() >= interval
+                except Exception:
+                    due = True
+            if not due:
+                continue
+            with self.inflight_lock:
+                if row_id in self.inflight:
+                    continue
+                self.inflight.add(row_id)
+            threading.Thread(target=self._run_check, args=(dict(row),), daemon=True).start()
+
+    def _store_state(self, row_id, state, checked_at, detail, fail_count):
+        try:
+            sip_execute(
+                f"UPDATE `{SERVICE_MONITOR_TABLE}` SET `last_state`=%s, `last_checked`=%s, "
+                f"`last_error`=%s, `fail_count`=%s WHERE id=%s",
+                (state, checked_at, str(detail or "")[:2000], int(fail_count), row_id),
+            )
+        except Exception as exc:
+            log(f"service monitor state update error id={row_id}: {exc}")
+
+    def _store_down_broadcast(self, row_id, broadcast_id):
+        try:
+            sip_execute(
+                f"UPDATE `{SERVICE_MONITOR_TABLE}` SET `down_broadcast_id`=%s WHERE id=%s",
+                (str(broadcast_id) if broadcast_id else None, row_id),
+            )
+        except Exception as exc:
+            log(f"service monitor down-broadcast store error id={row_id}: {exc}")
+
+    def _maybe_expire_down_broadcast(self, row):
+        # When the down message's expiration is "On monitor up", tear down the
+        # active down broadcast now that the monitor has recovered. If it is
+        # still mid-broadcast we must first STOP the live playback (so the down
+        # audio/message is cut off on the endpoints), then expire the record,
+        # and only after that does the caller send the "up" message.
+        row_id = str(row.get("id"))
+        broadcast_id = str(row.get("down_broadcast_id") or "").strip()
+        expires = str(row.get("down_expires") or "")
+        tokens = {t.strip().lower() for t in expires.split("|") if t.strip()}
+        if broadcast_id and "onup" in tokens:
+            try:
+                from broadcasts import list_active_broadcasts, mark_active_broadcast_delivery
+
+                related_ids = [broadcast_id]
+                for record in list_active_broadcasts(limit=5000):
+                    if str(record.get("source_broadcast_id") or "").strip() == broadcast_id:
+                        child_id = str(record.get("id") or "").strip()
+                        if child_id and child_id not in related_ids:
+                            related_ids.append(child_id)
+                # 1) Signal the live delivery loops to stop feeding audio. They
+                #    poll active_broadcast_stop_requested (~every 0.5s) and break.
+                for token in related_ids:
+                    request_active_broadcast_stop(token)
+                # 2) Wait (bounded) for any in-progress delivery of these ids to
+                #    actually finish before removing the records. We must NOT
+                #    expire first: expiring deletes the stop-control row, which
+                #    would clear the stop flag before the delivery loop ever
+                #    observed it, so the down audio would keep playing to the end.
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline:
+                    with broadcast_delivery_lock:
+                        still_running = any(t in broadcast_delivery_ids for t in related_ids)
+                    if not still_running:
+                        break
+                    time.sleep(0.1)
+                # 3) Now that playback has stopped, expire (remove) the records.
+                for token in related_ids:
+                    mark_active_broadcast_delivery(token, "expired")
+                log(f"service monitor down message stopped+auto-expired id={row_id} broadcast={broadcast_id}")
+            except Exception as exc:
+                log(f"service monitor down-broadcast expire error id={row_id}: {exc}")
+        if broadcast_id:
+            self._store_down_broadcast(row_id, None)
+
+    def _run_check(self, row):
+        row_id = str(row.get("id"))
+        try:
+            old_state = str(row.get("last_state") or "unchecked").strip().lower()
+            fail_count = int(row.get("fail_count") or 0)
+            retries = int(row.get("retries") or 0)
+            wait_for_up = int(row.get("wait_for_up") or 0)
+            try:
+                is_up, detail, down_state = service_monitor_check_row(row)
+            except Exception as exc:
+                is_up, detail, down_state = False, str(exc) or "Probe error", "offline"
+            now = datetime.now()
+            detail_text = str(detail or "")[:2000]
+
+            if is_up:
+                # Recovery debounce: if we were down and a Wait for Up window is set,
+                # wait it out and re-probe. Only recover if the service is still up.
+                if old_state in ("offline", "kuma_down") and wait_for_up > 0:
+                    self.stop_event.wait(wait_for_up)
+                    if self.stop_event.is_set():
+                        return
+                    try:
+                        is_up2, detail2, _down2 = service_monitor_check_row(row)
+                    except Exception as exc:
+                        is_up2, detail2, _down2 = False, str(exc) or "Probe error", "offline"
+                    if not is_up2:
+                        # Flapped back down during the wait: stay down, no messages.
+                        self._store_state(row_id, old_state, datetime.now(), str(detail2 or detail_text), fail_count)
+                        return
+                    detail_text = str(detail2 or detail_text)[:2000]
+                self._store_state(row_id, "online", datetime.now(), detail_text, 0)
+                with self.seen_online_lock:
+                    self.seen_online.add(row_id)
+                if old_state in ("offline", "kuma_down"):
+                    fresh = service_monitor_row(row_id) or row
+                    # Only announce recovery if we actually announced the
+                    # outage. A monitor can reach "offline" silently on boot
+                    # (the startup race that turns unchecked -> offline without
+                    # an alert); firing "back up" there would be a false
+                    # recovery broadcast on every startup.
+                    had_down_alert = bool(str(fresh.get("down_broadcast_id") or "").strip())
+                    self._maybe_expire_down_broadcast(fresh)
+                    if had_down_alert and not int(fresh.get("disabled") or 0):
+                        self.send_monitor_message(fresh, "up", detail_text)
+                return
+
+            # Probe failed.
+            fail_count += 1
+            # Startup warmup: absorb failures for a short window after boot
+            # without latching offline or alerting. We hold the CURRENT state
+            # (never advancing an online/unchecked monitor to offline), so the
+            # down "edge" is preserved — a real outage that begins during the
+            # window still alerts once the window elapses.
+            if old_state in ("online", "unchecked") and (time.monotonic() - self.boot_monotonic) < SERVICE_MONITOR_STARTUP_GRACE_SECONDS:
+                self._store_state(row_id, old_state, now, detail_text, fail_count)
+                return
+            if fail_count <= retries and old_state in ("online", "unchecked"):
+                # Still inside the retries grace period — hold the current state, no alert.
+                self._store_state(row_id, old_state, now, detail_text, fail_count)
+                return
+            new_state = down_state or "offline"
+            already_down = old_state in ("offline", "kuma_down")
+            self._store_state(row_id, new_state, now, detail_text, fail_count)
+            # Fire the "went down" alert exactly once, on the TRANSITION into a
+            # down state (edge-triggered) — never again while it stays down, or
+            # every failed check would re-alert forever.
+            #
+            # It is additionally gated on the monitor having been confirmed
+            # ONLINE at least once in THIS process (seen_online). That gate can't
+            # be fooled by a stale DB last_state carried over from a previous
+            # run, a skipped boot reset, retries=0, or a flaky first probe while
+            # the server is still starting up — all of which otherwise blast a
+            # false "server is down" broadcast on startup.
+            if already_down:
+                return
+            with self.seen_online_lock:
+                confirmed_online = row_id in self.seen_online
+            if confirmed_online:
+                fresh = service_monitor_row(row_id) or row
+                if not int(fresh.get("disabled") or 0):
+                    broadcast_id = self.send_monitor_message(fresh, "down", detail_text)
+                    self._store_down_broadcast(row_id, broadcast_id)
+        finally:
+            with self.inflight_lock:
+                self.inflight.discard(row_id)
+
+    def send_monitor_message(self, row, direction, status_message=""):
+        if not int(row.get(f"{direction}_enabled") or 0):
+            return
+        shortmessage = str(row.get(f"{direction}_shortmessage") or "")
+        longmessage = str(row.get(f"{direction}_longmessage") or "")
+        audio_value = str(row.get(f"{direction}_audio") or "")
+        has_text = bool(shortmessage.strip() or longmessage.strip())
+        has_audio = bool(audio_value.strip())
+        if not has_text and not has_audio:
+            log(f"service monitor {direction} message skipped id={row.get('id')}: no content")
+            return
+        if int(row.get(f"{direction}_send_all") or 0):
+            groups_value = service_monitor_all_groups_value()
+        else:
+            groups_value = str(row.get(f"{direction}_groups") or "").strip()
+        if not groups_value or groups_value == "0":
+            log(f"service monitor {direction} message skipped id={row.get('id')}: no recipients")
+            return
+        msg_type = "text+audio" if (has_text and has_audio) else ("audio" if has_audio else "text")
+        monitor_name = str(row.get("name") or SERVICE_MONITOR_NAME)
+        status_text = str(status_message or "").strip()
+        if not status_text:
+            status_text = "Service is responding." if direction == "up" else "Service is not responding."
+        values = {
+            "name": monitor_name,
+            "shortmessage": shortmessage if has_text else "",
+            "longmessage": longmessage if has_text else "",
+            "icon": str(row.get(f"{direction}_icon") or "") if has_text else "",
+            "color": str(row.get(f"{direction}_color") or "") if has_text else "",
+            "audio": audio_value,
+            "priority": str(row.get(f"{direction}_priority") or "Normal"),
+            "expires": str(row.get(f"{direction}_expires") or "manual"),
+            "type": msg_type,
+            "sender": SERVICE_MONITOR_NAME,
+            "vendor_specific": str(row.get(f"{direction}_vendor_specific") or ""),
+            "monitorname": monitor_name,
+            "status": status_text,
+        }
+        try:
+            ensure_message_vendor_schema()
+            from broadcasts import (
+                create_custom_broadcast,
+                expire_any_message_rule_broadcasts,
+                expire_message_rule_broadcasts,
+            )
+
+            conn = get_db_connection()
+            try:
+                with conn.cursor() as cur:
+                    groups = validate_group_value(cur, groups_value)
+                    broadcast_id, expires_rule = create_custom_broadcast(
+                        cur, values, groups=groups, sender=SERVICE_MONITOR_NAME
+                    )
+                    if str(values.get("priority") or "").strip().lower() != "emergency":
+                        expire_message_rule_broadcasts(cur, expires_rule, [broadcast_id], trigger_groups=groups)
+                        expire_any_message_rule_broadcasts(cur, [broadcast_id], trigger_groups=groups)
+                conn.commit()
+                log(f"service monitor {direction} message sent id={row.get('id')} broadcast={broadcast_id}")
+                return broadcast_id
+            finally:
+                conn.close()
+        except Exception as exc:
+            log(f"service monitor {direction} message send error id={row.get('id')}: {exc}")
+        return None
+
+    def receive_audio(self, chunk, stream_id):
+        pass
+
+    def end_stream(self, stream_id):
+        pass
+
+    def shutdown(self):
+        self.stop_event.set()
+
+
 def ensure_builtin_modules_loaded():
-    global siptrunks_runtime, multicast_rtp_runtime
+    global siptrunks_runtime, multicast_rtp_runtime, http_request_runtime, service_monitor_runtime
     if siptrunks_runtime is None:
         siptrunks_runtime = BuiltinSipTrunksRuntime()
     with loaded_modules_lock:
@@ -4167,6 +8437,16 @@ def ensure_builtin_modules_loaded():
     with loaded_modules_lock:
         loaded_modules[MULTICAST_RTP_MODULE] = multicast_rtp_runtime
         module_load_errors.pop(MULTICAST_RTP_MODULE, None)
+    if http_request_runtime is None:
+        http_request_runtime = BuiltinHttpRequestModule()
+    with loaded_modules_lock:
+        loaded_modules[HTTP_REQUEST_MODULE] = http_request_runtime
+        module_load_errors.pop(HTTP_REQUEST_MODULE, None)
+    if service_monitor_runtime is None:
+        service_monitor_runtime = BuiltinServiceMonitorModule()
+    with loaded_modules_lock:
+        loaded_modules[SERVICE_MONITOR_MODULE] = service_monitor_runtime
+        module_load_errors.pop(SERVICE_MONITOR_MODULE, None)
 
 
 def load_endpoint_web_module(module, missing_ok=False):
@@ -4174,6 +8454,10 @@ def load_endpoint_web_module(module, missing_ok=False):
         return BuiltinSipTrunksWeb()
     if module == MULTICAST_RTP_MODULE:
         return BuiltinMulticastRTPWeb()
+    if module == HTTP_REQUEST_MODULE:
+        return BuiltinHttpRequestWeb()
+    if module == SERVICE_MONITOR_MODULE:
+        return BuiltinServiceMonitorWeb()
     if not safe_module_name(module):
         if missing_ok:
             return None
@@ -4202,10 +8486,28 @@ def load_endpoint_web_module(module, missing_ok=False):
 def endpoint_module_web_root(module):
     if module == "siptrunks":
         return None
+    if module == HTTP_REQUEST_MODULE:
+        return None
     package = discover_endpoint_packages(extract_if_trusted=True).get(module)
     if not package or not package.get("trusted"):
         return None
     return Path(package.get("web_path") or "")
+
+
+def normalize_target_entry(target):
+    if isinstance(target, (list, tuple)):
+        return [str(item or "").strip() for item in target if str(item or "").strip()]
+    text = str(target or "").strip()
+    if not text:
+        return []
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = ast.literal_eval(text)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, (list, tuple)):
+            return [str(item or "").strip() for item in parsed if str(item or "").strip()]
+    return [text]
 
 
 def is_8k_ulaw(file_path):
@@ -4502,6 +8804,10 @@ def module_info_type(module_name):
         return "Input+Output"
     if module_name == MULTICAST_RTP_MODULE:
         return "Output"
+    if module_name == HTTP_REQUEST_MODULE:
+        return "Output"
+    if module_name == SERVICE_MONITOR_MODULE:
+        return "Input"
     discovered = discover_modules()
     entry = discovered.get(module_name)
     if entry is None:
@@ -4541,6 +8847,8 @@ def output_module_names():
     names = []
     for module_name, mod in modules_snapshot:
         if module_name == MULTICAST_RTP_MODULE and multicast_rtp_endpoint_count() <= 0:
+            continue
+        if module_name == HTTP_REQUEST_MODULE and http_request_endpoint_count() <= 0:
             continue
         if module_is_output_capable(module_name, mod):
             names.append(module_name)
@@ -5185,7 +9493,7 @@ def sync_modules():
     with loaded_modules_lock:
         loaded_names = list(loaded_modules.keys())
     for module_dir in loaded_names:
-        if module_dir in {"siptrunks", MULTICAST_RTP_MODULE}:
+        if module_dir in {"siptrunks", MULTICAST_RTP_MODULE, HTTP_REQUEST_MODULE, SERVICE_MONITOR_MODULE}:
             continue
         if module_dir not in enabled:
             try:
@@ -5222,22 +9530,23 @@ def normalize_targets(targets):
     page_debug(
         f"normalize_targets_start raw={targets} loaded={module_names} discovered={sorted(discovered.keys())}"
     )
-    for target in targets:
-        target = target.strip()
-        if not target:
-            continue
-        if "/" in target:
-            module_name, sub_target = target.split("/", 1)
-            module_name = resolve_module_name(module_name, discovered)
-            if module_name in loaded_modules and module_is_output_capable(module_name):
+    for raw_target in targets:
+        for target in normalize_target_entry(raw_target):
+            target = target.strip()
+            if not target:
+                continue
+            if "/" in target:
+                module_name, sub_target = target.split("/", 1)
+                module_name = resolve_module_name(module_name, discovered)
+                if module_name in loaded_modules and module_is_output_capable(module_name):
+                    target_map.setdefault(module_name, [])
+                    if sub_target not in target_map[module_name]:
+                        target_map[module_name].append(sub_target)
+                continue
+            for module_name in output_module_names():
                 target_map.setdefault(module_name, [])
-                if sub_target not in target_map[module_name]:
-                    target_map[module_name].append(sub_target)
-            continue
-        for module_name in output_module_names():
-            target_map.setdefault(module_name, [])
-            if target not in target_map[module_name]:
-                target_map[module_name].append(target)
+                if target not in target_map[module_name]:
+                    target_map[module_name].append(target)
     log(f"normalize_targets raw={targets} mapped={target_map}")
     page_debug(f"normalize_targets_done raw={targets} mapped={target_map}")
     return target_map
@@ -5485,11 +9794,22 @@ def handle_stream_prepare(conn, parts, action_name):
         f"handle_stream_prepare_ready action={action_name} stream={stream_id} ready={ready} "
         f"ready_modules={sorted(state.ready_modules)} failed_modules={sorted(state.failed_modules)} pending={sorted(state.pending_modules)}"
     )
+    failed_modules = sorted(state.failed_modules)
     if not ready or not state.ready_modules:
         pop_stream_state(stream_id)
-        page_debug(f"handle_stream_prepare_timeout action={action_name} stream={stream_id} ready_modules={sorted(state.ready_modules)}")
+        page_debug(
+            f"handle_stream_prepare_error action={action_name} stream={stream_id} "
+            f"ready_modules={sorted(state.ready_modules)} failed_modules={failed_modules} "
+            f"pending={sorted(state.pending_modules)}"
+        )
         conn.sendall(b"ERROR\n")
         return
+    if failed_modules:
+        page_debug(
+            f"handle_stream_prepare_partial action={action_name} stream={stream_id} "
+            f"ready_modules={sorted(state.ready_modules)} failed_modules={failed_modules} "
+            f"pending={sorted(state.pending_modules)}"
+        )
     conn.sendall(b"OK\n")
     page_debug(f"handle_stream_prepare_ok action={action_name} stream={stream_id}")
     def deliver_frame(frame):
@@ -5568,6 +9888,10 @@ def deliver_broadcast(stream_id, broadcast_id):
         "vendor_specific": broadcast.get("vendor_specific") or "",
         "expires": broadcast.get("expires"),
         "expires_rule": broadcast.get("expires_rule") or "",
+        "issued": broadcast.get("issued"),
+        "shortmessage": broadcast.get("shortmessage") or "",
+        "longmessage": broadcast.get("longmessage") or "",
+        "color": broadcast.get("color") or "",
     }
     if is_audio_type(msg_type):
         gen = audio_frames(audio_files)

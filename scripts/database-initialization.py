@@ -586,6 +586,8 @@ def seed_defaults(cursor, webserver_http_port, insecure_sip_port):
         ("sip_external_ipv4", "", "Manual SIP external IPv4 address"),
         ("sip_rtp_port_start", "40000", "SIP RTP port range start"),
         ("sip_rtp_port_end", "50000", "SIP RTP port range end"),
+        ("sip_codecs_order", "PCMU,G722,PCMA,OPUS", "SIP codec priority order"),
+        ("sip_codecs_enabled", "PCMU,G722", "Enabled SIP codecs"),
         ("sip_intrusion_prevention", "1", "WARNING!!! Disabling this setting WILL compromise the security of this server, especially if the SIP port is exposed to WAN. There's usually no reason to disable this in production. The Open Paging Server project is NOT responsible for any financial loss caused by abuse of telephone service by malicious bots. CONTINUE AT YOUR OWN RISK!!!"),
         ("sip_block_scanners", "1", "WARNING!!! Disabling this setting WILL compromise the security of this server, especially if the SIP port is exposed to WAN. There's usually no reason to disable this in production. The Open Paging Server project is NOT responsible for any financial loss caused by abuse of telephone service by malicious bots. CONTINUE AT YOUR OWN RISK!!!"),
         ("login_banner_enabled", "1", "Enable or disable the login page banner (0/1)"),

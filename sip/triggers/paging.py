@@ -8,6 +8,11 @@ import threading
 import time
 from pathlib import Path
 
+try:
+    from sip.codec import encode_sip_rtp_payload, decode_sip_rtp_payload
+except ImportError:
+    from codec import encode_sip_rtp_payload, decode_sip_rtp_payload
+
 trigger_name = "page"
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -114,10 +119,49 @@ class SipLivePageSession(livepaged.LivePageSession):
         self.rtp_keepalive_payload = None
         self.setup_failed = False
         self._preflight_done = False
+        self.codec_name = "PCMU"
+        self.codec_info = {"payload_type": 0, "samples_per_frame": 160}
+        self.codec_encoder = None
+        self.codec_decoder = None
         page_debug(
             f"session_init stream={self.stream_id} remote={remote_ip}:{remote_port} "
             f"group={self.group_id!r} sender={self.sender!r} local_port={self.local_port}"
         )
+
+    def encode_outbound_payload(self, payload):
+        codec_name = str(getattr(self, "codec_name", "PCMU") or "PCMU").upper()
+        if codec_name == "PCMU":
+            return bytes(payload or b"")[:160].ljust(160, b"\xff")
+        try:
+            encoded, encoder = encode_sip_rtp_payload(
+                codec_name,
+                bytes(payload or b"")[:160].ljust(160, b"\xff"),
+                encoder_state=getattr(self, "codec_encoder", None),
+            )
+            self.codec_encoder = encoder
+            return encoded
+        except Exception as exc:
+            page_debug(f"rtp_encode_error stream={self.stream_id} codec={codec_name} error={exc}")
+            return b""
+
+    def inbound_payload_type(self):
+        return int(self.codec_info.get("payload_type", 0))
+
+    def decode_inbound_payload(self, payload):
+        codec_name = str(getattr(self, "codec_name", "PCMU") or "PCMU").upper()
+        if codec_name == "PCMU":
+            return payload
+        try:
+            decoded, decoder = decode_sip_rtp_payload(
+                codec_name,
+                payload,
+                decoder_state=getattr(self, "codec_decoder", None),
+            )
+            self.codec_decoder = decoder
+            return decoded
+        except Exception as exc:
+            page_debug(f"rtp_decode_error stream={self.stream_id} codec={codec_name} error={exc}")
+            return b""
 
     def poll_rtp_source(self, max_packets=4):
         if self.local_sock is None:
@@ -147,7 +191,10 @@ class SipLivePageSession(livepaged.LivePageSession):
     def send_rtp(self, payload, poll_source=True):
         if getattr(self, "rtp_paused", False):
             return
-        packet = make_rtp_packet(self.seq, self.ts, payload, pt=0)
+        encoded = self.encode_outbound_payload(payload)
+        if not encoded:
+            return
+        packet = make_rtp_packet(self.seq, self.ts, encoded, pt=int(self.codec_info.get("payload_type", 0)))
         try:
             if self.local_sock is not None:
                 if poll_source:
@@ -156,7 +203,8 @@ class SipLivePageSession(livepaged.LivePageSession):
                 self.rtp_packets_sent += 1
                 if self.rtp_packets_sent <= 3 or self.rtp_packets_sent % 50 == 0:
                     page_debug(
-                        f"rtp_send stream={self.stream_id} packet={self.rtp_packets_sent} "
+                        f"rtp_send stream={self.stream_id} codec={self.codec_name} pt={self.codec_info.get('payload_type', 0)} "
+                        f"payload_bytes={len(encoded)} packet={self.rtp_packets_sent} "
                         f"local={socket_name(self.local_sock)} remote={self.remote_ip}:{self.remote_port} bytes={len(packet)}"
                     )
             else:
@@ -172,7 +220,7 @@ class SipLivePageSession(livepaged.LivePageSession):
                     f"error={exc.__class__.__name__}: {exc}"
                 )
         self.seq = (self.seq + 1) & 0xFFFF
-        self.ts = (self.ts + 160) & 0xFFFFFFFF
+        self.ts = (self.ts + int(self.codec_info.get("samples_per_frame", 160))) & 0xFFFFFFFF
 
     def play_progress_tone(self, tone="reorder", duration=4.0):
         frame_factory = get_busy_frame if str(tone).lower() == "busy" else get_reorder_frame
@@ -307,7 +355,9 @@ class SipLivePageSession(livepaged.LivePageSession):
                 self.learn_rtp_source(addr, packet)
             except Exception:
                 pass
-            current = livepaged.parse_rtp_payload(packet)
+            current = livepaged.parse_rtp_payload(packet, self.inbound_payload_type())
+            if current:
+                current = self.decode_inbound_payload(current)
             if current:
                 payload = current
         return payload
@@ -340,7 +390,9 @@ class SipLivePageSession(livepaged.LivePageSession):
                 self.learn_rtp_source(addr, packet)
             except Exception:
                 pass
-            payload = livepaged.parse_rtp_payload(packet)
+            payload = livepaged.parse_rtp_payload(packet, self.inbound_payload_type())
+            if payload:
+                payload = self.decode_inbound_payload(payload)
             if payload:
                 self.forward_live_payload(payload)
 

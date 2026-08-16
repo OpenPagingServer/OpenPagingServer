@@ -108,3 +108,66 @@ def update_trunk_status_by_user(username, status):
             return cur.rowcount
     finally:
         conn.close()
+
+def update_trunk_connection_by_user(username, connected_server, connected_transport):
+    wanted = str(username or "").strip()
+    if not wanted:
+        return 0
+    conn = connect_db()
+    try:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    f"UPDATE `{TRUNK_TABLE}` SET connected_server=%s, connected_transport=%s "
+                    f"WHERE auth='USERPASS' AND username=%s",
+                    (
+                        str(connected_server or "").strip(),
+                        str(connected_transport or "").strip(),
+                        wanted,
+                    ),
+                )
+                return cur.rowcount
+            except Exception:
+                return 0
+    finally:
+        conn.close()
+
+def update_trunk_connection_by_ip(ipaddr, connected_server, connected_transport):
+    wanted = str(ipaddr or "").strip()
+    if not wanted:
+        return 0
+    conn = connect_db()
+    try:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    f"UPDATE `{TRUNK_TABLE}` SET connected_server=%s, connected_transport=%s "
+                    f"WHERE auth='IP' AND ipaddr=%s",
+                    (
+                        str(connected_server or "").strip(),
+                        str(connected_transport or "").strip(),
+                        wanted,
+                    ),
+                )
+                if cur.rowcount:
+                    return cur.rowcount
+                cur.execute(f"SELECT id, ipaddr FROM `{TRUNK_TABLE}` WHERE auth='IP'")
+                matches = []
+                for row in cur.fetchall():
+                    trunk_id, trunk_ip = row[0], row[1]
+                    if trunk_ip and trunk_ip not in ("0.0.0.0", "0.0.0.0/0") and ip_match(wanted, trunk_ip):
+                        matches.append(trunk_id)
+                for trunk_id in matches:
+                    cur.execute(
+                        f"UPDATE `{TRUNK_TABLE}` SET connected_server=%s, connected_transport=%s WHERE id=%s",
+                        (
+                            str(connected_server or "").strip(),
+                            str(connected_transport or "").strip(),
+                            trunk_id,
+                        ),
+                    )
+                return len(matches)
+            except Exception:
+                return 0
+    finally:
+        conn.close()

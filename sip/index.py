@@ -17,6 +17,7 @@ import hashlib
 import select
 import queue
 import tempfile
+import subprocess
 import urllib.error
 import urllib.request
 import ipaddress
@@ -25,6 +26,10 @@ from pathlib import Path
 
 import pymysql
 from dotenv import load_dotenv
+try:
+    from .codec import SIP_CODEC_PAYLOADS, encode_sip_rtp_payload, normalize_sip_codec_name
+except ImportError:
+    from codec import SIP_CODEC_PAYLOADS, encode_sip_rtp_payload, normalize_sip_codec_name
 
 try:
     import bcrypt
@@ -41,6 +46,26 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import auth
 from audio_utils import generate_wav, chain_generators
 from rtp import RTPSession
+
+
+def _auth_update_trunk_connection_by_user(username, connected_server, connected_transport):
+    fn = getattr(auth, "update_trunk_connection_by_user", None)
+    if not callable(fn):
+        return 0
+    try:
+        return fn(username, connected_server, connected_transport)
+    except Exception:
+        return 0
+
+
+def _auth_update_trunk_connection_by_ip(ipaddr, connected_server, connected_transport):
+    fn = getattr(auth, "update_trunk_connection_by_ip", None)
+    if not callable(fn):
+        return 0
+    try:
+        return fn(ipaddr, connected_server, connected_transport)
+    except Exception:
+        return 0
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
@@ -66,6 +91,8 @@ SIP_INTRUSION_ATTEMPT_LIMIT = 5
 SIP_INTRUSION_WINDOW_SECONDS = 5 * 60
 SIP_INTRUSION_BLOCK_SECONDS = 48 * 60 * 60
 SIP_INTRUSION_STORAGE_PATH = "/var/spool/openpagingserver/.sipbannedips"
+SIP_CODEC_DEFAULT_ORDER = ("PCMU", "G722", "PCMA", "OPUS", "G7221C", "G726-32")
+SIP_CODEC_DEFAULT_ENABLED = {"PCMU", "G722"}
 
 
 def sip_abuse_override_enabled():
@@ -74,6 +101,29 @@ def sip_abuse_override_enabled():
 def sip_debug(message):
     if DEBUG:
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] DEBUG sip {message}", flush=True)
+
+
+def parse_sip_codec_order_setting(value):
+    requested = [normalize_sip_codec_name(token) for token in str(value or "").split(",")]
+    ordered = []
+    seen = set()
+    for token in requested:
+        if token and token not in seen:
+            ordered.append(token)
+            seen.add(token)
+    for token in SIP_CODEC_DEFAULT_ORDER:
+        if token not in seen:
+            ordered.append(token)
+            seen.add(token)
+    return ordered
+
+
+def parse_sip_enabled_codecs_setting(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return set(SIP_CODEC_DEFAULT_ENABLED)
+    enabled = {token for token in (normalize_sip_codec_name(part) for part in raw.split(",")) if token}
+    return enabled or set(SIP_CODEC_DEFAULT_ENABLED)
 
 def sip_sockname(sock):
     try:
@@ -540,6 +590,9 @@ class OutboundSipCall:
         self.rtp_ssrc = random.randrange(0, 4294967296)
         self.rtp_packets_sent = 0
         self.rtp_packets_received = 0
+        self.negotiated_codec = "PCMU"
+        self.rtp_encoder = None
+        self.rtp_encoder_codec = ""
 
     def wait_answer(self, timeout=None):
         return self.answered_event.wait(timeout)
@@ -1274,17 +1327,36 @@ class SipServer:
         )
 
     def fetch_trunk_row(self, trunk_id):
+        raw_trunk_id = trunk_id
+        trunk_id_text = str(trunk_id or "").strip()
+        trunk_id_int = safe_int(trunk_id_text, 0)
         conn = self.connect_db()
         try:
             with conn.cursor(pymysql.cursors.DictCursor) as cur:
                 select_columns = self.sip_trunk_select_columns()
-                cur.execute(
-                    f"SELECT {select_columns} FROM `sip-trunks` WHERE `id`=%s LIMIT 1",
-                    (trunk_id,),
-                )
+                if trunk_id_int > 0:
+                    cur.execute(
+                        f"SELECT {select_columns} FROM `sip-trunks` WHERE `id`=%s LIMIT 1",
+                        (trunk_id_int,),
+                    )
+                else:
+                    cur.execute(
+                        f"SELECT {select_columns} FROM `sip-trunks` WHERE `id`=%s LIMIT 1",
+                        (trunk_id_text,),
+                    )
                 row = cur.fetchone()
+                if not row and trunk_id_text:
+                    cur.execute(
+                        f"SELECT {select_columns} FROM `sip-trunks` WHERE CAST(`id` AS CHAR)=%s LIMIT 1",
+                        (trunk_id_text,),
+                    )
+                    row = cur.fetchone()
         finally:
             conn.close()
+        sip_debug(
+            f"fetch_trunk_row requested={raw_trunk_id!r} normalized={trunk_id_text!r} "
+            f"numeric={trunk_id_int} found={'yes' if row else 'no'}"
+        )
         if row and self.is_outbound_trunk_row(row):
             row["servers"] = [clean for clean in (self.clean_trunk_server(item) for item in self.parse_servers_json(row.get("servers_json"))[:8]) if clean]
         return row
@@ -1425,6 +1497,20 @@ class SipServer:
                 return str(conn_ip), actual_port, local_media_ip
         return local_sip_ip, local_sip_port, local_media_ip
 
+    def inbound_response_address(self, source_ip, transport="udp", conn=None, nat_mode=None):
+        mode = clean_nat_mode(nat_mode if nat_mode is not None else self.sip_nat_mode(), "auto")
+        advertised_ip = self.advertised_ip_for(source_ip, nat_mode=mode)
+        advertised_port = self.active_port or 5060
+        transport = str(transport or "udp").strip().lower()
+        if transport in {"tcp", "tls"} and conn is not None:
+            try:
+                conn_ip, conn_port = conn.getsockname()[:2]
+                if conn_ip:
+                    return str(conn_ip), safe_int(conn_port, advertised_port)
+            except Exception:
+                pass
+        return advertised_ip, advertised_port
+
     def parse_via_public_mapping(self, via_value):
         raw = str(via_value or "").strip()
         if not raw:
@@ -1487,14 +1573,17 @@ class SipServer:
     def trunk_user_agent(self, headers):
         return self.get_first(headers, "User-Agent") or self.get_first(headers, "Server") or "Unknown"
 
-    def mark_authorized_trunk_seen(self, method, ipaddr, headers):
+    def mark_authorized_trunk_seen(self, method, ipaddr, headers, transport="udp"):
         user_agent = self.trunk_user_agent(headers)
+        conn_transport = str(transport or "udp").strip().lower() or "udp"
         if auth.auth_ip(ipaddr):
             auth.update_trunk_status_by_ip(ipaddr, f"Online, '{user_agent}'")
+            _auth_update_trunk_connection_by_ip(ipaddr, ipaddr, conn_transport)
             return
         username = self.extract_username_from_auth(headers)
         if username and self.ip_allowed(method, ipaddr, headers=headers):
             auth.update_trunk_status_by_user(username, f"{ipaddr}, '{user_agent}'")
+            _auth_update_trunk_connection_by_user(username, ipaddr, conn_transport)
 
     def sip_trunk_hold_behavior(self, ipaddr, headers):
         behavior_columns = ("holdbehabior", "hold-behavipr", "holdbehavior", "holdbehaviour", "hold-behavior")
@@ -1746,6 +1835,24 @@ class SipServer:
             transport = match.group(1).lower()
         return host, port, transport
 
+    def response_target_for_request(self, headers, source_ip, source_port, transport="udp", conn=None):
+        contact = self.get_first(headers, "Contact")
+        host, port, contact_transport = self.parse_sip_target(
+            contact,
+            fallback_ip=source_ip,
+            fallback_port=source_port,
+            fallback_transport=transport,
+        )
+        chosen_transport = str(contact_transport or transport or "udp").strip().lower()
+        if chosen_transport in {"tcp", "tls"} and conn is not None:
+            try:
+                conn_ip, conn_port = conn.getsockname()[:2]
+                if conn_ip:
+                    return str(conn_ip), safe_int(conn_port, source_port or self.active_port or 5060), chosen_transport
+            except Exception:
+                pass
+        return self.normalize_sdp_media_ip(host or source_ip, source_ip, nat_mode=self.sip_nat_mode()), safe_int(port, source_port or self.active_port or 5060), chosen_transport
+
     def parse_via_sent_by(self, via_value):
         raw = str(via_value or "").strip()
         parts = raw.split(None, 2)
@@ -1865,6 +1972,8 @@ class SipServer:
         media_port = None
         has_video = False
         current_media = ""
+        audio_payloads = []
+        payload_codecs = {}
         for line in body.splitlines():
             line = line.strip()
             if line.startswith("c=IN IP4 "):
@@ -1880,13 +1989,54 @@ class SipServer:
                         media_port = int(parts[1])
                     except:
                         media_port = None
+                if len(parts) >= 4:
+                    audio_payloads = [part.strip() for part in parts[3:] if str(part).strip()]
+            elif current_media == "audio" and line.lower().startswith("a=rtpmap:"):
+                payload_map = line[9:].strip()
+                payload_token, _, codec_value = payload_map.partition(" ")
+                codec_name = ""
+                if codec_value:
+                    normalized = codec_value.strip().upper()
+                    if normalized.startswith("PCMU/8000"):
+                        codec_name = "PCMU"
+                    elif normalized.startswith("PCMA/8000"):
+                        codec_name = "PCMA"
+                    elif normalized.startswith("G722/8000") or normalized.startswith("G722/16000"):
+                        codec_name = "G722"
+                    elif normalized.startswith("OPUS/48000"):
+                        codec_name = "OPUS"
+                    elif normalized.startswith("G7221/32000"):
+                        codec_name = "G7221C"
+                    elif normalized.startswith("G726-32/8000"):
+                        codec_name = "G726-32"
+                payload_type = str(payload_token or "").strip()
+                if payload_type and codec_name:
+                    payload_codecs[payload_type] = codec_name
             elif line.startswith("m=video "):
                 current_media = "video"
                 has_video = True
             elif line.startswith("m="):
                 current_media = "other"
         media_ip = audio_ip or session_ip or str(fallback_ip or "").strip()
-        return self.normalize_sdp_media_ip(media_ip, fallback_ip, nat_mode=nat_mode), media_port, has_video
+        offered_codecs = []
+        for payload in audio_payloads:
+            if payload in payload_codecs:
+                offered_codecs.append(payload_codecs[payload])
+                continue
+            if payload == "0":
+                offered_codecs.append("PCMU")
+                continue
+            if payload == "8":
+                offered_codecs.append("PCMA")
+                continue
+            if payload == "9":
+                offered_codecs.append("G722")
+                continue
+            if payload == "2":
+                offered_codecs.append("G726-32")
+                continue
+        negotiated_codec = self.negotiate_sip_codec(offered_codecs)
+        return self.normalize_sdp_media_ip(media_ip, fallback_ip, nat_mode=nat_mode), media_port, has_video, negotiated_codec
 
     def sdp_audio_connection_ip(self, body):
         session_ip = ""
@@ -1984,6 +2134,27 @@ class SipServer:
         except Exception:
             pass
 
+    def set_session_codec(self, session, codec_name):
+        codec = normalize_sip_codec_name(codec_name) or "PCMU"
+        try:
+            session.codec_name = codec
+            codec_info = dict(SIP_CODEC_PAYLOADS[codec])
+            if codec == "OPUS":
+                codec_info["samples_per_frame"] = 960
+            if codec == "G722":
+                codec_info["sample_rate_wire"] = 16000
+            session.codec_info = {
+                "payload_type": int(codec_info["payload_type"]),
+                "samples_per_frame": int(codec_info["samples_per_frame"]),
+                "sample_rate_wire": int(codec_info.get("sample_rate_wire", codec_info["samples_per_frame"])),
+            }
+            sip_debug(
+                f"session codec set session={session.__class__.__name__} codec={codec} "
+                f"payload_type={session.codec_info['payload_type']} samples_per_frame={session.codec_info['samples_per_frame']}"
+            )
+        except Exception:
+            pass
+
     def prepare_inbound_session(self, session):
         if session is None:
             return
@@ -2022,8 +2193,9 @@ class SipServer:
         ssrc = random.randrange(0, 4294967296)
         payload = b"\xff" * 160
         sent = 0
+        payload_type = int(SIP_CODEC_PAYLOADS.get(str(getattr(session, "codec_name", "PCMU") or "PCMU").upper(), {}).get("payload_type", 0))
         for _ in range(frames):
-            packet = struct.pack("!BBHII", 0x80, 0x00, sequence, timestamp, ssrc) + payload
+            packet = struct.pack("!BBHII", 0x80, payload_type & 0x7F, sequence, timestamp, ssrc) + payload
             try:
                 sock.sendto(packet, (target_ip, target_port))
             except Exception as exc:
@@ -2035,7 +2207,7 @@ class SipServer:
                 break
             sent += 1
             sequence = (sequence + 1) & 0xFFFF
-            timestamp = (timestamp + 160) & 0xFFFFFFFF
+            timestamp = (timestamp + int(SIP_CODEC_PAYLOADS.get(str(getattr(session, "codec_name", "PCMU") or "PCMU").upper(), {}).get("samples_per_frame", 160))) & 0xFFFFFFFF
         if sent:
             call["media_path_primed"] = True
             sip_debug(
@@ -2051,6 +2223,7 @@ class SipServer:
         if session is None:
             return
         self.prepare_inbound_session(session)
+        self.set_session_codec(session, call.get("codec") or "PCMU")
         if not call.get("started"):
             call["started"] = True
             sip_debug(
@@ -2060,7 +2233,9 @@ class SipServer:
                 f"{getattr(session, 'remote_port', getattr(session, 'target_port', ''))} "
                 f"latching={bool(getattr(session, 'rtp_latching_enabled', False))}"
             )
-            session.start()
+            starter = getattr(session, "start", None)
+            if callable(starter):
+                starter()
         if run_on_start and call.get("on_start") and not call.get("on_start_ran"):
             try:
                 call["on_start"]()
@@ -2166,15 +2341,84 @@ class SipServer:
             return match.group(1)
         return from_header.split(";", 1)[0].strip()
 
-    def build_invite_sdp(self, local_ip, local_port, disable_video=False, direction="sendrecv"):
+    def sip_codec_preferences(self):
+        # Cache briefly so SDP parsing never blocks INVITE handling on DB round-trips.
+        now = time.monotonic()
+        cached = getattr(self, "_codec_prefs_cache", None)
+        if cached and now - cached[0] < 10.0:
+            return list(cached[1])
+        try:
+            order_raw = self.read_setting("sip_codecs_order")
+            enabled_raw = self.read_setting("sip_codecs_enabled")
+        except Exception:
+            order_raw = enabled_raw = ""
+        order = parse_sip_codec_order_setting(order_raw or "")
+        enabled = parse_sip_enabled_codecs_setting(enabled_raw or "")
+        preferred = [codec for codec in order if codec in enabled] or ["PCMU"]
+        self._codec_prefs_cache = (now, list(preferred))
+        sip_debug(
+            f"codec preferences source=systemsettings order_raw={order_raw!r} enabled_raw={enabled_raw!r} "
+            f"order={order} enabled={sorted(enabled)} preferred={preferred}"
+        )
+        return preferred
+
+    def negotiate_sip_codec(self, offered_codecs):
+        offered = []
+        seen = set()
+        for codec in offered_codecs or []:
+            normalized = normalize_sip_codec_name(codec)
+            if normalized and normalized not in seen:
+                offered.append(normalized)
+                seen.add(normalized)
+        if not offered:
+            sip_debug("codec negotiate offered=[] selected=PCMU reason=no_offered_codecs")
+            return "PCMU"
+        preferred = self.sip_codec_preferences()
+        for codec in preferred:
+            if codec in seen:
+                sip_debug(f"codec negotiate offered={offered} preferred={preferred} selected={codec}")
+                return codec
+        selected = "PCMU" if "PCMU" in seen else offered[0]
+        sip_debug(
+            f"codec negotiate offered={offered} preferred={preferred} selected={selected} reason=no_preferred_match"
+        )
+        return selected
+
+    def build_invite_sdp(self, local_ip, local_port, disable_video=False, direction="sendrecv", codec_names=None):
+        preferred_codecs = []
+        if codec_names is None:
+            preferred_codecs = self.sip_codec_preferences()
+        else:
+            for codec in codec_names:
+                normalized = normalize_sip_codec_name(codec)
+                if normalized and normalized not in preferred_codecs:
+                    preferred_codecs.append(normalized)
+            if not preferred_codecs:
+                preferred_codecs = self.sip_codec_preferences()
+        payloads = []
+        rtpmap_lines = []
+        for codec in preferred_codecs:
+            info = SIP_CODEC_PAYLOADS.get(codec)
+            if not info:
+                continue
+            payloads.append(str(info["payload_type"]))
+            rtpmap_lines.append(f"a=rtpmap:{info['payload_type']} {info['rtpmap']}\r\n")
+            if codec == "OPUS":
+                rtpmap_lines.append(f"a=fmtp:{info['payload_type']} minptime=20;useinbandfec=0;stereo=0;sprop-stereo=0\r\n")
+            elif info.get("fmtp"):
+                rtpmap_lines.append(f"a=fmtp:{info['payload_type']} {info['fmtp']}\r\n")
+        if not payloads:
+            payloads = ["0"]
+            rtpmap_lines = ["a=rtpmap:0 PCMU/8000\r\n"]
+        payloads.append("101")
         sdp = (
             "v=0\r\n"
             + f"o=OpenPagingServer 1 1 IN IP4 {local_ip}\r\n"
             + "s=OpenPagingServer\r\n"
             + f"c=IN IP4 {local_ip}\r\n"
             + "t=0 0\r\n"
-            + f"m=audio {local_port} RTP/AVP 0 101\r\n"
-            + "a=rtpmap:0 PCMU/8000\r\n"
+            + f"m=audio {local_port} RTP/AVP {' '.join(payloads)}\r\n"
+            + "".join(rtpmap_lines)
             + "a=rtpmap:101 telephone-event/8000\r\n"
             + "a=fmtp:101 0-15\r\n"
         )
@@ -2183,6 +2427,9 @@ class SipServer:
         if disable_video:
             sdp += "m=video 0 RTP/AVP 31\r\n"
         return sdp
+
+    def encode_sip_rtp_payload(self, codec_name, payload, encoder_state=None):
+        return encode_sip_rtp_payload(codec_name, payload, encoder_state=encoder_state)
 
     def client_transaction_key(self, call_id, cseq):
         return str(call_id or "").strip(), str(cseq or "").strip()
@@ -2786,10 +3033,19 @@ class SipServer:
         if not getattr(call, "remote_media_ip", "") or not safe_int(getattr(call, "remote_media_port", 0), 0):
             return False
         frame = bytes(payload or (b"\xff" * 160))
+        codec_name = normalize_sip_codec_name(getattr(call, "negotiated_codec", "PCMU")) or "PCMU"
+        codec_info = SIP_CODEC_PAYLOADS[codec_name]
+        try:
+            frame, call.rtp_encoder = self.encode_sip_rtp_payload(codec_name, frame, encoder_state=getattr(call, "rtp_encoder", None))
+        except Exception as exc:
+            sip_debug(f"outbound rtp encode failed call={getattr(call, 'call_id', '')} codec={codec_name} error={exc}")
+            return False
+        if not frame:
+            return False
         packet = struct.pack(
             "!BBHII",
             0x80,
-            0x00,
+            int(codec_info["payload_type"]) & 0x7F,
             int(call.rtp_sequence) & 0xFFFF,
             int(call.rtp_timestamp) & 0xFFFFFFFF,
             int(call.rtp_ssrc) & 0xFFFFFFFF,
@@ -2811,7 +3067,7 @@ class SipServer:
                 f"remote={call.remote_media_ip}:{int(call.remote_media_port)} bytes={len(packet)}"
             )
         call.rtp_sequence = (int(call.rtp_sequence) + 1) & 0xFFFF
-        call.rtp_timestamp = (int(call.rtp_timestamp) + 160) & 0xFFFFFFFF
+        call.rtp_timestamp = (int(call.rtp_timestamp) + int(codec_info["samples_per_frame"])) & 0xFFFFFFFF
         return True
 
     def apply_outbound_invite_response(self, call, response, state=None):
@@ -2832,10 +3088,11 @@ class SipServer:
         if source_port > 0:
             call.remote_sip_port = source_port
         if body:
-            remote_media_ip, remote_media_port, _ = self.parse_sdp_offer(body, call.remote_sip_ip)
+            remote_media_ip, remote_media_port, _, negotiated_codec = self.parse_sdp_offer(body, call.remote_sip_ip)
             if remote_media_port:
                 call.remote_media_ip = remote_media_ip
                 call.remote_media_port = remote_media_port
+                call.negotiated_codec = negotiated_codec
                 call.rtp_latching_enabled = True
                 sip_debug(
                     f"outbound rtp target call={getattr(call, 'call_id', '')} "
@@ -3235,10 +3492,31 @@ class SipServer:
             return response, responses
         return None, responses
 
+    def inbound_auth_host_from_status(self, status):
+        raw = str(status or "").strip()
+        if not raw or "," not in raw:
+            return ""
+        candidate = raw.split(",", 1)[0].strip()
+        low = candidate.lower()
+        if not candidate or low.startswith("online") or low.startswith("offline") or low.startswith("error"):
+            return ""
+        return candidate
+
     def choose_outbound_route(self, trunk):
         auth_type = str(trunk.get("auth") or "").upper()
         trunk_type = str(trunk.get("trunk_type") or "").upper()
+        servers = trunk.get("servers") or []
+        if not servers:
+            servers = [clean for clean in (self.clean_trunk_server(item) for item in self.parse_servers_json(trunk.get("servers_json"))[:8]) if clean]
+            if servers:
+                trunk["servers"] = servers
         if not self.is_outbound_trunk_row(trunk) and (auth_type == "IP" or trunk_type == "IP" or trunk_type == "INBOUND_AUTH" or auth_type == "USERPASS"):
+            host = str(trunk.get("connected_server") or "").strip()
+            transport = str(trunk.get("connected_transport") or "udp").strip().lower() or "udp"
+            if not host:
+                host = self.inbound_auth_host_from_status(trunk.get("status"))
+            if host:
+                return {"host": host, "port": 5061 if transport == "tls" else 5060, "transport": transport}, None
             host = str(trunk.get("ipaddr") or "").strip()
             if not host or host == "0.0.0.0":
                 return None, None
@@ -3247,14 +3525,23 @@ class SipServer:
             state = self.outbound_trunks.get(str(trunk.get("id")))
         if state and state.get("active_route"):
             return dict(state["active_route"]), state
-        for server_row in trunk.get("servers") or []:
+        for server_row in servers:
             routes = self.resolve_trunk_server_routes(server_row)
             if routes:
                 return dict(routes[0]), state
         return None, state
 
-    def place_outbound_call(self, trunk_id, number, caller_id_number="", caller_id_name="", alert_info_value="", custom_headers=None, answer_timeout=45):
+    def place_outbound_call(self, trunk_id, number, caller_id_number="", caller_id_name="", alert_info_value="", custom_headers=None, answer_timeout=45, trunk_fallback=None):
         trunk = self.fetch_trunk_row(trunk_id)
+        if not trunk and isinstance(trunk_fallback, dict):
+            trunk = dict(trunk_fallback)
+            trunk["id"] = str(trunk.get("id") or trunk_id).strip()
+            if self.is_outbound_trunk_row(trunk):
+                trunk["servers"] = [clean for clean in (self.clean_trunk_server(item) for item in self.parse_servers_json(trunk.get("servers_json"))[:8]) if clean]
+            sip_debug(
+                f"place_outbound_call using_fallback trunk_id={trunk.get('id')} "
+                f"auth={trunk.get('auth')} trunk_type={trunk.get('trunk_type')}"
+            )
         if not trunk:
             raise RuntimeError("SIP trunk not found")
         route, state = self.choose_outbound_route(trunk)
@@ -3348,9 +3635,17 @@ class SipServer:
                             self.send_trunk_payload(state, route, cancel)
                         else:
                             self.send_trunk_payload({"id": trunk.get("id"), "conn": None, "send_lock": threading.Lock()}, route, cancel)
+                    sip_debug(
+                        f"outbound invite timeout call={call.call_id} trunk={trunk.get('id')} "
+                        f"number={number} route={route.get('host')}:{route.get('port')} provisional={call.invite_provisional}"
+                    )
                     return self.fail_outbound_call(call, "Answer timed out")
                 status_code = safe_int(response.get("status_code"), 0)
                 self.apply_outbound_invite_response(call, response, state=state)
+                sip_debug(
+                    f"outbound invite response call={call.call_id} trunk={trunk.get('id')} "
+                    f"number={number} status={status_code} route={route.get('host')}:{route.get('port')}"
+                )
                 if status_code >= 200:
                     self.send_outbound_ack(call, response=response)
                 if status_code in {401, 407} and attempt == 0:
@@ -3369,6 +3664,11 @@ class SipServer:
                     self.prime_outbound_media_path(call)
                     call.media_path_primed = True
                 call.mark_answered()
+                sip_debug(
+                    f"outbound invite answered call={call.call_id} trunk={trunk.get('id')} "
+                    f"number={number} codec={getattr(call, 'negotiated_codec', 'PCMU')} "
+                    f"remote_media={call.remote_media_ip}:{call.remote_media_port}"
+                )
                 return call
             return self.fail_outbound_call(call, "Authentication failed")
         except Exception:
@@ -3452,6 +3752,23 @@ class SipServer:
             "Content-Length: 0"
         ])
         return "\r\n".join(lines) + "\r\n\r\n"
+
+    def send_provisional_response(self, headers, status, source_ip, source_port, transport="udp", conn=None, local_ip=None, local_port=None):
+        try:
+            response = self.build_response(
+                headers,
+                status,
+                local_ip=local_ip,
+                local_port=local_port,
+                transport=transport,
+            )
+            data = response.encode("utf-8")
+            if transport in {"tcp", "tls"} and conn is not None:
+                conn.sendall(data)
+            elif self.udp_sock is not None:
+                self.udp_sock.sendto(data, (source_ip, int(source_port)))
+        except Exception:
+            pass
 
     def send_packet_to_call(self, call, packet):
         data = packet.encode("utf-8")
@@ -3702,7 +4019,7 @@ class SipServer:
 
         hold = self.sdp_offer_is_hold(body) if body else False
         hold_behavior = self.sip_trunk_hold_behavior(source_ip, headers) if hold else "passrtp"
-        remote_media_ip, remote_media_port, has_video = self.parse_sdp_offer(body, source_ip, nat_mode=nat_mode) if body else (None, None, False)
+        remote_media_ip, remote_media_port, has_video, negotiated_codec = self.parse_sdp_offer(body, source_ip, nat_mode=nat_mode) if body else (None, None, False, "PCMU")
         rtp_latching_enabled = self.sdp_media_needs_latching(body, source_ip, nat_mode=nat_mode) if body else False
 
         with self.lock:
@@ -3731,9 +4048,11 @@ class SipServer:
                 call["remote_media_ip"] = remote_media_ip
                 call["remote_media_port"] = remote_media_port
                 call["has_video"] = has_video
+                call["codec"] = negotiated_codec
                 call["rtp_latching_enabled"] = rtp_latching_enabled
                 self.set_session_media_target(session, remote_media_ip, remote_media_port)
                 self.set_session_rtp_latching(session, rtp_latching_enabled)
+                self.set_session_codec(session, negotiated_codec)
             elif body and has_video:
                 call["has_video"] = True
 
@@ -3760,7 +4079,13 @@ class SipServer:
             disable_video = call.get("has_video", False)
             local_tag = call.get("local_tag")
 
-        sdp = self.build_invite_sdp(local_ip, local_port, disable_video=disable_video, direction=answer_direction)
+        sdp = self.build_invite_sdp(
+            local_ip,
+            local_port,
+            disable_video=disable_video,
+            direction=answer_direction,
+            codec_names=[negotiated_codec],
+        )
         response = self.build_response(
             headers,
             "200 OK",
@@ -3789,7 +4114,7 @@ class SipServer:
             nonce = uuid.uuid4().hex
             return self.build_response(headers, "401 Unauthorized", extra_headers=[f'WWW-Authenticate: Digest realm="OpenPagingServer", nonce="{nonce}", algorithm=MD5, qop="auth"'])
         if not trusted:
-            self.mark_authorized_trunk_seen(method, source_ip, headers)
+            self.mark_authorized_trunk_seen(method, source_ip, headers, transport=transport)
         nat_mode = self.sip_nat_mode()
         user = self.request_user_from_uri(uri)
         
@@ -3809,7 +4134,7 @@ class SipServer:
         else:
             passcode_str = str(passcode).strip() if passcode is not None else ""
             if passcode_str:
-                remote_media_ip, remote_media_port, has_video = self.parse_sdp_offer(body, source_ip, nat_mode=nat_mode)
+                remote_media_ip, remote_media_port, has_video, negotiated_codec = self.parse_sdp_offer(body, source_ip, nat_mode=nat_mode)
                 rtp_latching_enabled = self.sdp_media_needs_latching(body, source_ip, nat_mode=nat_mode)
                 if not remote_media_port:
                     return self.build_response(headers, "400 Bad Request")
@@ -3841,6 +4166,7 @@ class SipServer:
                 except SipCongestionError as exc:
                     return self.build_503(headers, local_ip=local_sip_ip, local_port=local_sip_port, transport=transport, call_tag=local_tag, reason_text=str(exc))
                 self.set_session_rtp_latching(session, rtp_latching_enabled)
+                self.set_session_codec(session, negotiated_codec)
                 local_media_ip, local_media_port = self.inbound_media_address_for_source(
                     self.session_media_socket(session),
                     remote_media_ip,
@@ -3880,10 +4206,16 @@ class SipServer:
                         "trigger": trigger,
                         "user": user,
                         "nat_mode": nat_mode,
+                        "codec": negotiated_codec,
                     }
                     self.calls[call_id] = call
                 self.prime_inbound_media_path(call)
-                sdp = self.build_invite_sdp(local_media_ip, local_media_port, disable_video=has_video)
+                sdp = self.build_invite_sdp(
+                    local_media_ip,
+                    local_media_port,
+                    disable_video=has_video,
+                    codec_names=[negotiated_codec],
+                )
                 return self.build_response(headers, "200 OK", body=sdp, local_ip=local_sip_ip, local_port=local_sip_port, transport=transport, call_tag=local_tag)
 
             session_class, generator, on_start, early_media_status = self.build_trigger_result(trigger, user, headers)
@@ -3891,7 +4223,7 @@ class SipServer:
         if session_class is None:
             session_class = RTPSession
 
-        remote_media_ip, remote_media_port, has_video = self.parse_sdp_offer(body, source_ip, nat_mode=nat_mode)
+        remote_media_ip, remote_media_port, has_video, negotiated_codec = self.parse_sdp_offer(body, source_ip, nat_mode=nat_mode)
         rtp_latching_enabled = self.sdp_media_needs_latching(body, source_ip, nat_mode=nat_mode)
         if not remote_media_port:
             return self.build_response(headers, "400 Bad Request")
@@ -3903,6 +4235,7 @@ class SipServer:
         except SipCongestionError as exc:
             return self.build_503(headers, local_ip=local_sip_ip, local_port=local_sip_port, transport=transport, reason_text=str(exc))
         self.set_session_rtp_latching(session, rtp_latching_enabled)
+        self.set_session_codec(session, negotiated_codec)
         local_media_ip, local_media_port = self.inbound_media_address_for_source(
             self.session_media_socket(session),
             remote_media_ip,
@@ -3965,6 +4298,7 @@ class SipServer:
                     "trigger": trigger,
                     "user": user,
                     "nat_mode": nat_mode,
+                    "codec": negotiated_codec,
                 }
                 self.calls[call_id] = call
 
@@ -3976,7 +4310,12 @@ class SipServer:
         if prime_call is not None:
             self.prime_inbound_media_path(prime_call)
 
-        sdp = self.build_invite_sdp(call["local_ip"], call["local_port"], disable_video=call["has_video"])
+        sdp = self.build_invite_sdp(
+            call["local_ip"],
+            call["local_port"],
+            disable_video=call["has_video"],
+            codec_names=[call.get("codec")],
+        )
         status = "183 Session Progress" if call["early_media_status"] else "200 OK"
         return self.build_response(
             headers,
@@ -4050,7 +4389,7 @@ class SipServer:
             return None
             
         if method == "OPTIONS":
-            self.mark_authorized_trunk_seen("OPTIONS", addr[0], headers)
+            self.mark_authorized_trunk_seen("OPTIONS", addr[0], headers, transport=transport)
             response = self.build_response(headers, "200 OK")
         elif method == "REGISTER":
             if self.ip_allowed("REGISTER", addr[0], headers=headers):
@@ -4079,10 +4418,12 @@ class SipServer:
                         with self.lock:
                             self.registrations[username] = time.time() + expires_int
                         auth.update_trunk_status_by_user(username, f"{addr[0]}, '{user_agent}'")
+                        _auth_update_trunk_connection_by_user(username, addr[0], transport)
                     else:
                         with self.lock:
                             self.registrations.pop(username, None)
                         auth.update_trunk_status_by_user(username, "Offline")
+                        _auth_update_trunk_connection_by_user(username, "", "")
             else:
                 if self.note_unauthorized_attempt(addr[0], "REGISTER", conn=conn):
                     response = None
@@ -4105,16 +4446,21 @@ class SipServer:
                 if record_routes:
                     outbound_call.record_routes = record_routes
                 if body:
-                    remote_media_ip, remote_media_port, _ = self.parse_sdp_offer(body, outbound_call.remote_sip_ip)
+                    remote_media_ip, remote_media_port, _, negotiated_codec = self.parse_sdp_offer(body, outbound_call.remote_sip_ip)
                     if remote_media_port:
                         outbound_call.remote_media_ip = remote_media_ip
                         outbound_call.remote_media_port = remote_media_port
+                        outbound_call.negotiated_codec = negotiated_codec
                         outbound_call.rtp_latching_enabled = True
                         sip_debug(
                             f"outbound rtp target call={getattr(outbound_call, 'call_id', '')} "
                             f"remote={remote_media_ip}:{remote_media_port} local={sip_sockname(outbound_call.rtp_socket)}"
                         )
-                sdp = self.build_invite_sdp(outbound_call.advertised_media_ip, outbound_call.advertised_media_port)
+                sdp = self.build_invite_sdp(
+                    outbound_call.advertised_media_ip,
+                    outbound_call.advertised_media_port,
+                    codec_names=[outbound_call.negotiated_codec],
+                )
                 response = self.build_response(
                     headers,
                     "200 OK",
@@ -4226,8 +4572,12 @@ class SipServer:
                 traceback.print_exc()
 
     def tcp_message(self, conn):
-        conn.settimeout(2.0)
         buffer_key = id(conn)
+        try:
+            conn.settimeout(2.0)
+        except OSError:
+            self.tcp_buffers.pop(buffer_key, None)
+            return b""
         data = self.tcp_buffers.get(buffer_key, b"")
         while len(data) < 65535:
             data = data.lstrip(b"\r\n")
@@ -4384,6 +4734,7 @@ class SipServer:
                         del self.registrations[user]
             for user in expired_users:
                 auth.update_trunk_status_by_user(user, "Offline")
+                _auth_update_trunk_connection_by_user(user, "", "")
 
             timed_out_pings = []
             with self.lock:

@@ -4704,6 +4704,8 @@ def endpoint_module_state_map(modules=None):
 def builtin_endpoint_modules():
     sip_web_mod, sip_web_error = safe_load_endpoint_web_module("siptrunks", trusted=True)
     multicast_web_mod, multicast_web_error = safe_load_endpoint_web_module(endpoints.MULTICAST_RTP_MODULE, trusted=True)
+    http_request_web_mod, http_request_web_error = safe_load_endpoint_web_module(endpoints.HTTP_REQUEST_MODULE, trusted=True)
+    service_monitor_web_mod, service_monitor_web_error = safe_load_endpoint_web_module(endpoints.SERVICE_MONITOR_MODULE, trusted=True)
     return {
         "siptrunks": {
             "module": "siptrunks",
@@ -4740,6 +4742,42 @@ def builtin_endpoint_modules():
             "web_load_error": multicast_web_error,
             "has_settings_page": False,
             "has_forms": bool(getattr(multicast_web_mod, "forms", None)) if multicast_web_mod else False,
+        },
+        endpoints.HTTP_REQUEST_MODULE: {
+            "module": endpoints.HTTP_REQUEST_MODULE,
+            "name": endpoints.HTTP_REQUEST_NAME,
+            "description": endpoints.HTTP_REQUEST_DESCRIPTION,
+            "developer": "Open Paging Server",
+            "input_type": "Output",
+            "version": endpoints.OPS_VERSION,
+            "enabled": True,
+            "loaded": True,
+            "trusted": True,
+            "can_load": True,
+            "system_builtin": True,
+            "input_capable": False,
+            "output_capable": True,
+            "web_load_error": http_request_web_error,
+            "has_settings_page": False,
+            "has_forms": bool(getattr(http_request_web_mod, "forms", None)) if http_request_web_mod else False,
+        },
+        endpoints.SERVICE_MONITOR_MODULE: {
+            "module": endpoints.SERVICE_MONITOR_MODULE,
+            "name": endpoints.SERVICE_MONITOR_NAME,
+            "description": endpoints.SERVICE_MONITOR_DESCRIPTION,
+            "developer": "Open Paging Server",
+            "input_type": "Input",
+            "version": endpoints.OPS_VERSION,
+            "enabled": True,
+            "loaded": True,
+            "trusted": True,
+            "can_load": True,
+            "system_builtin": True,
+            "input_capable": True,
+            "output_capable": False,
+            "web_load_error": service_monitor_web_error,
+            "has_settings_page": False,
+            "has_forms": bool(getattr(service_monitor_web_mod, "forms", None)) if service_monitor_web_mod else False,
         },
     }
 
@@ -5909,6 +5947,29 @@ def new_endpoint_configure():
 @alias("/admin/endpoint-form-frame", methods=["GET", "POST"])
 def endpoint_form_frame():
     return dispatch_web_page("admin/endpoint-form-frame")
+
+
+@alias("/admin/servicemonitor-kuma-monitors", methods=["POST"])
+def servicemonitor_kuma_monitors():
+    user = require_admin()
+    if not isinstance(user, dict):
+        return jsonify({"ok": False, "error": "Not authorized"}), 403
+    base_url = str(request.form.get("base_url") or "").strip()
+    api_key = str(request.form.get("api_key") or "").strip()
+    if not api_key:
+        endpoint_id = str(request.form.get("endpoint_id") or "").strip()
+        kind, _, row_id = endpoint_id.partition("-")
+        if kind == "monitor" and row_id.isdigit():
+            row = endpoints.service_monitor_row(row_id)
+            if row:
+                api_key = str(row.get("uk_api_key") or "")
+                if not base_url:
+                    base_url = str(row.get("uk_base_url") or "")
+    try:
+        monitors = endpoints.service_monitor_list_kuma_monitors(base_url, api_key)
+        return jsonify({"ok": True, "monitors": monitors})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc) or "Could not reach Uptime Kuma."})
 
 
 @alias("/admin/endpoint-action-page", methods=["GET", "POST"])

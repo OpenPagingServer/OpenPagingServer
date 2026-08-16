@@ -8,6 +8,9 @@ from srv.web.pages.admin.settings.common import settings_page
 
 SIP_RTP_DEFAULT_PORT_START = "40000"
 SIP_RTP_DEFAULT_PORT_END = "50000"
+SIP_CODEC_OPTIONS = ("PCMU", "PCMA", "G722", "G726-32", "OPUS", "G7221C")
+SIP_CODEC_DEFAULT_ORDER = ("PCMU", "G722", "PCMA", "OPUS")
+SIP_CODEC_DEFAULT_ENABLED = {"PCMU", "G722"}
 SIP_BLOCK_SCANNERS_SETTING = "sip_block_scanners"
 SIP_INTRUSION_PREVENTION_SETTING = "sip_intrusion_prevention"
 SIP_SECURITY_FALSE_VALUES = {"0", "false", "off", "disable", "disabled", "no"}
@@ -107,6 +110,62 @@ def ensure_sip_security_settings(data):
         if not str(data.get(key, "") or "").strip():
             save_setting(key, value, description)
             data[key] = value
+
+
+def normalize_sip_codec_token(value):
+    token = str(value or "").strip().upper()
+    return token if token in SIP_CODEC_OPTIONS else ""
+
+
+def parse_sip_codec_order(value):
+    raw_tokens = [normalize_sip_codec_token(token) for token in str(value or "").split(",")]
+    ordered = []
+    seen = set()
+    for token in raw_tokens:
+        if token and token not in seen:
+            ordered.append(token)
+            seen.add(token)
+    if not ordered:
+        return list(SIP_CODEC_DEFAULT_ORDER)
+    for token in SIP_CODEC_OPTIONS:
+        if token not in seen:
+            ordered.append(token)
+            seen.add(token)
+    return ordered
+
+
+def parse_sip_codec_enabled(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return set(SIP_CODEC_DEFAULT_ENABLED)
+    enabled = {token for token in (normalize_sip_codec_token(part) for part in raw.split(",")) if token}
+    return enabled or set(SIP_CODEC_DEFAULT_ENABLED)
+
+
+def stored_sip_codec_order(value):
+    ordered = []
+    seen = set()
+    for token in str(value or "").split(","):
+        normalized = normalize_sip_codec_token(token)
+        if normalized and normalized not in seen:
+            ordered.append(normalized)
+            seen.add(normalized)
+    return ordered
+
+
+def ensure_sip_codec_settings(data):
+    stored_order_raw = str(data.get("sip_codecs_order", "") or "").strip()
+    stored_enabled_raw = str(data.get("sip_codecs_enabled", "") or "").strip()
+    if not stored_order_raw and not stored_enabled_raw:
+        order_value = ",".join(SIP_CODEC_DEFAULT_ORDER)
+        enabled_value = ",".join(codec for codec in SIP_CODEC_OPTIONS if codec in SIP_CODEC_DEFAULT_ENABLED)
+        save_setting("sip_codecs_order", order_value, "SIP codec priority order")
+        save_setting("sip_codecs_enabled", enabled_value, "Enabled SIP codecs")
+        data["sip_codecs_order"] = order_value
+        data["sip_codecs_enabled"] = enabled_value
+        return
+    data["sip_codecs_order"] = stored_order_raw or ",".join(parse_sip_codec_order(stored_order_raw))
+    data["sip_codecs_enabled"] = stored_enabled_raw or ",".join(codec for codec in SIP_CODEC_OPTIONS if codec in parse_sip_codec_enabled(stored_enabled_raw))
 
 
 def sip_security_client_ip():
@@ -225,6 +284,10 @@ def sip_settings_body(ctx, data, detected_external_ipv4, user, unlock_page_token
     udp_disabled = "" if udp_checked else " disabled"
     nat_enabled = clean_sip_nat_support_mode(data.get("sip_nat_support", "1")) != "no"
     nat_checked = " checked" if nat_enabled else ""
+    sip_codec_order = stored_sip_codec_order(data.get("sip_codecs_order", ""))
+    if not sip_codec_order:
+        sip_codec_order = list(parse_sip_codec_order(data.get("sip_codecs_order", "")))
+    sip_codec_enabled = parse_sip_codec_enabled(data.get("sip_codecs_enabled", ""))
     external_mode = str(data.get("sip_external_ipv4_mode", "auto") or "auto").strip().lower()
     if external_mode not in {"auto", "manual"}:
         external_mode = "auto"
@@ -257,6 +320,18 @@ def sip_settings_body(ctx, data, detected_external_ipv4, user, unlock_page_token
     docker_port_disabled = " disabled" if docker_mode else ""
     docker_port_style = ' style="background:rgba(0,0,0,0.05); color:#777;"' if docker_mode else ""
     docker_port_notice = '<div style="display:flex; align-items:center; gap:6px; margin-top:4px;"><svg width="16" height="16" viewBox="0 0 24 24" fill="#1976D2"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg><span style="color:#1976D2; font-size:0.85em;">Change port by editing .env in Docker</span></div>' if docker_mode else ""
+    codec_items_html = "".join(
+        f"""
+                    <div class="sip-codec-item" draggable="true" data-codec="{h(codec)}">
+                        <span class="sip-codec-drag" aria-hidden="true">&#9776;</span>
+                        <label class="sip-codec-label">
+                            <input type="checkbox" class="sip-codec-checkbox" data-codec="{h(codec)}"{" checked" if codec in sip_codec_enabled else ""}>
+                            <span>{h(codec)}</span>
+                        </label>
+                    </div>
+        """
+        for codec in sip_codec_order
+    )
     return f"""
     <style>
     .switch.locked {{
@@ -399,6 +474,41 @@ def sip_settings_body(ctx, data, detected_external_ipv4, user, unlock_page_token
         font-size:0.9em;
         margin-top:10px;
     }}
+    .sip-codec-section {{
+        padding:16px 0 0 0;
+    }}
+    .sip-codec-list {{
+        display:flex;
+        flex-direction:column;
+        gap:10px;
+        margin-top:12px;
+    }}
+    .sip-codec-item {{
+        display:flex;
+        align-items:center;
+        gap:12px;
+        padding:10px 12px;
+        border:1px solid rgba(0,0,0,0.12);
+        border-radius:10px;
+        background:rgba(0,0,0,0.02);
+    }}
+    .sip-codec-item.dragging {{
+        opacity:0.55;
+    }}
+    .sip-codec-drag {{
+        cursor:grab;
+        user-select:none;
+        font-size:18px;
+        line-height:1;
+        color:#777;
+    }}
+    .sip-codec-label {{
+        display:flex;
+        align-items:center;
+        gap:10px;
+        cursor:pointer;
+        width:100%;
+    }}
     @media (max-width:768px) {{
         .sip-sensitive-login-box {{
             max-width:360px;
@@ -450,6 +560,13 @@ def sip_settings_body(ctx, data, detected_external_ipv4, user, unlock_page_token
         .sip-sensitive-error {{
             color:#ffcdd2;
         }}
+        .sip-codec-item {{
+            border-color:rgba(255,255,255,0.12);
+            background:rgba(255,255,255,0.03);
+        }}
+        .sip-codec-drag {{
+            color:#BBB;
+        }}
     }}
     </style>
     <div id="sip" class="tab-content active">
@@ -498,6 +615,18 @@ def sip_settings_body(ctx, data, detected_external_ipv4, user, unlock_page_token
                         <input type="text" name="sip_external_ipv4" id="externalIpv4Field" value="{h(displayed_external_ipv4)}" data-auto-value="{h(detected_external_ipv4)}" data-manual-value="{h(manual_external_ipv4)}" placeholder="203.0.113.10"{" readonly" if external_mode == "auto" else ""} style="{h(external_field_style)}">
                         <span id="externalIpv4Error" class="port-error-text">Please enter a valid publicly routable IPv4 address.</span>
                     </div>
+                </div>
+                <div class="sip-security-divider"></div>
+                <div class="sip-codec-section">
+                    <div class="info-row" style="border-bottom:none; padding-bottom:0; align-items:flex-start;">
+                        <span>
+                            <span class="info-label">Codecs</span>
+                            <span class="info-description">Drag codecs to change priority order. Open Paging Server will negotiate the enabled codecs in this order using standard SIP SDP offers and answers.</span>
+                        </span>
+                    </div>
+                    <div id="sipCodecList" class="sip-codec-list">{codec_items_html}</div>
+                    <input type="hidden" name="sip_codecs_order" id="sipCodecsOrder" value="{h(",".join(sip_codec_order))}">
+                    <input type="hidden" name="sip_codecs_enabled" id="sipCodecsEnabled" value="{h(",".join(codec for codec in sip_codec_order if codec in sip_codec_enabled))}">
                 </div>
                 <div class="sip-security-divider"></div>
                 <div class="info-row" style="border-bottom:none; padding-bottom:0;">
@@ -573,6 +702,9 @@ document.addEventListener('DOMContentLoaded', function() {
     const rtpPortStart = document.getElementById('rtpPortStart');
     const rtpPortEnd = document.getElementById('rtpPortEnd');
     const rtpPortError = document.getElementById('rtpPortError');
+    const sipCodecList = document.getElementById('sipCodecList');
+    const sipCodecsOrder = document.getElementById('sipCodecsOrder');
+    const sipCodecsEnabled = document.getElementById('sipCodecsEnabled');
     const blockScannersToggle = document.getElementById('blockScannersToggle');
     const blockScannersValue = document.getElementById('blockScannersValue');
     const intrusionPreventionToggle = document.getElementById('intrusionPreventionToggle');
@@ -618,6 +750,48 @@ __UNLOCK_RUNTIME_DECLARATIONS__
             if (input.value.length > 5) input.value = input.value.slice(0, 5);
             if (Number.isFinite(numeric) && numeric < minValue) input.value = String(minValue);
         }
+    }
+
+    function syncSipCodecHiddenFields() {
+        if (!sipCodecList || !sipCodecsOrder || !sipCodecsEnabled) return;
+        const items = Array.from(sipCodecList.querySelectorAll('.sip-codec-item'));
+        const order = items.map(item => item.dataset.codec).filter(Boolean);
+        const enabled = items
+            .filter(item => {
+                const checkbox = item.querySelector('.sip-codec-checkbox');
+                return checkbox && checkbox.checked;
+            })
+            .map(item => item.dataset.codec)
+            .filter(Boolean);
+        sipCodecsOrder.value = order.join(',');
+        sipCodecsEnabled.value = enabled.join(',');
+    }
+
+    function installSipCodecDnD() {
+        if (!sipCodecList) return;
+        let dragging = null;
+        sipCodecList.querySelectorAll('.sip-codec-item').forEach(item => {
+            item.addEventListener('dragstart', () => {
+                dragging = item;
+                item.classList.add('dragging');
+            });
+            item.addEventListener('dragend', () => {
+                item.classList.remove('dragging');
+                dragging = null;
+                syncSipCodecHiddenFields();
+            });
+            item.addEventListener('dragover', event => {
+                event.preventDefault();
+                if (!dragging || dragging === item) return;
+                const rect = item.getBoundingClientRect();
+                const before = (event.clientY - rect.top) < (rect.height / 2);
+                sipCodecList.insertBefore(dragging, before ? item : item.nextSibling);
+            });
+        });
+        sipCodecList.querySelectorAll('.sip-codec-checkbox').forEach(input => {
+            input.addEventListener('change', syncSipCodecHiddenFields);
+        });
+        syncSipCodecHiddenFields();
     }
 
     function validatePortInput(input, errorElement, minValue) {
@@ -782,6 +956,7 @@ __UNLOCK_RUNTIME_DECLARATIONS__
     }
 
     async function submitSettings() {
+        syncSipCodecHiddenFields();
         const formData = new FormData(form);
         saveBtn.disabled = true;
         setStatus('Saving...', 'inherit');
@@ -892,6 +1067,7 @@ __UNLOCK_RUNTIME_DECLARATIONS__
 
     bindSensitiveToggle(blockScannersToggle, scannerCanDisable, scannerInitiallyEnabled, blockScannersValue);
     bindSensitiveToggle(intrusionPreventionToggle, intrusionCanDisable, intrusionInitiallyEnabled, intrusionPreventionValue);
+    installSipCodecDnD();
 
     saveBtn.addEventListener('click', async function() {
         if (window.openDemoModePopup && document.querySelector('[data-demo-mode="1"]')) {
@@ -1067,6 +1243,8 @@ def handle_request():
         manual_external_ipv4 = request.form.get("sip_external_ipv4", stored_manual_external_ipv4).strip() if external_mode == "manual" else stored_manual_external_ipv4
         rtp_port_start = request.form.get("sip_rtp_port_start", SIP_RTP_DEFAULT_PORT_START).strip()
         rtp_port_end = request.form.get("sip_rtp_port_end", SIP_RTP_DEFAULT_PORT_END).strip()
+        sip_codecs_order = request.form.get("sip_codecs_order", str(data.get("sip_codecs_order", "") or "")).strip()
+        sip_codecs_enabled = request.form.get("sip_codecs_enabled", str(data.get("sip_codecs_enabled", "") or "")).strip()
         block_scanners = normalize_toggle_value(request.form.get(SIP_BLOCK_SCANNERS_SETTING, data.get(SIP_BLOCK_SCANNERS_SETTING, "1")), default="1")
         intrusion_prevention = normalize_toggle_value(request.form.get(SIP_INTRUSION_PREVENTION_SETTING, data.get(SIP_INTRUSION_PREVENTION_SETTING, "1")), default="1")
         tls_enabled = data.get("enable_secure_sip", "0")
@@ -1126,6 +1304,8 @@ def handle_request():
                     "sip_external_ipv4": manual_external_ipv4,
                     "sip_rtp_port_start": rtp_port_start,
                     "sip_rtp_port_end": rtp_port_end,
+                    "sip_codecs_order": sip_codecs_order,
+                    "sip_codecs_enabled": sip_codecs_enabled,
                     SIP_BLOCK_SCANNERS_SETTING: block_scanners,
                     SIP_INTRUSION_PREVENTION_SETTING: intrusion_prevention,
                 }
@@ -1158,6 +1338,8 @@ def handle_request():
         save_setting("sip_external_ipv4", manual_external_ipv4, "Manual SIP external IPv4 address")
         save_setting("sip_rtp_port_start", rtp_port_start, "SIP RTP port range start")
         save_setting("sip_rtp_port_end", rtp_port_end, "SIP RTP port range end")
+        save_setting("sip_codecs_order", sip_codecs_order, "SIP codec priority order")
+        save_setting("sip_codecs_enabled", sip_codecs_enabled, "Enabled SIP codecs")
         save_setting(SIP_BLOCK_SCANNERS_SETTING, block_scanners, "WARNING!!! Disabling this setting WILL compromise the security of this server, especially if the SIP port is exposed to WAN. There's usually no reason to disable this in production. The Open Paging Server project is NOT responsible for any financial loss caused by abuse of telephone service by malicious bots. CONTINUE AT YOUR OWN RISK!!!")
         save_setting(
             SIP_INTRUSION_PREVENTION_SETTING,

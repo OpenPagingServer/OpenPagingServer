@@ -41,21 +41,59 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 FRAME_SCRIPT = r"""
 (function() {
   const frame = document.getElementById('endpointFrame');
+  var heightLocked = false;
   function applyHeight(height) {
-    if (!frame) return;
+    if (!frame || heightLocked) return;
     const numeric = Number(height);
     if (!Number.isFinite(numeric) || numeric <= 0) return;
     frame.style.height = Math.max(360, Math.ceil(numeric) + 8) + 'px';
   }
   window.addEventListener('message', function(event) {
     if (event.origin !== window.location.origin) return;
-    if (!event.data || event.data.type !== 'ops-frame-height') return;
+    if (!event.data) return;
+    if (event.data.type === 'ops-frame-height-lock') {
+      heightLocked = true;
+      return;
+    }
+    if (event.data.type === 'ops-frame-height-unlock') {
+      heightLocked = false;
+      return;
+    }
+    if (event.data.type === 'sm-modal-overlay') {
+      if (frame) {
+        if (event.data.open) {
+          if (frame.getAttribute('data-sm-prev') === null) {
+            frame.setAttribute('data-sm-prev', frame.getAttribute('style') || '');
+            var host = frame.parentElement;
+            if (host) { host.setAttribute('data-sm-host-h', host.style.height || ''); host.style.height = host.offsetHeight + 'px'; }
+          }
+          heightLocked = true;
+          document.documentElement.style.overflow = 'hidden';
+          frame.style.position = 'fixed';
+          frame.style.top = '0'; frame.style.left = '0';
+          frame.style.width = '100vw'; frame.style.height = '100vh';
+          frame.style.right = 'auto'; frame.style.bottom = 'auto';
+          frame.style.margin = '0'; frame.style.border = '0';
+          frame.style.borderRadius = '0'; frame.style.background = 'transparent';
+          frame.style.zIndex = '2147483000';
+        } else {
+          frame.setAttribute('style', frame.getAttribute('data-sm-prev') || '');
+          frame.removeAttribute('data-sm-prev');
+          document.documentElement.style.overflow = '';
+          var host2 = frame.parentElement;
+          if (host2) { host2.style.height = host2.getAttribute('data-sm-host-h') || ''; host2.removeAttribute('data-sm-host-h'); }
+          heightLocked = false;
+        }
+      }
+      return;
+    }
+    if (event.data.type !== 'ops-frame-height') return;
     applyHeight(event.data.height);
   });
   if (frame) {
     frame.addEventListener('load', function() {
       try {
-        applyHeight(frame.contentWindow.document.documentElement.scrollHeight);
+        applyHeight(frame.contentWindow.document.body.scrollHeight);
       } catch (_error) {
       }
     });
@@ -85,6 +123,6 @@ def handle_request():
         <a class="back-link" href="/admin/new-endpoint"><i class="fa-solid fa-arrow-left"></i> Modules</a>
     </div>
     <div class="frame-shell">
-        <iframe id="endpointFrame" class="form-frame" sandbox="allow-forms allow-same-origin allow-scripts allow-top-navigation" src="{h(frame_src)}" title="{h(module_info.get("name") or module)} endpoint form"></iframe>
+        <iframe id="endpointFrame" class="form-frame" sandbox="allow-forms allow-modals allow-same-origin allow-scripts allow-top-navigation" src="{h(frame_src)}" title="{h(module_info.get("name") or module)} endpoint form"></iframe>
     </div>"""
     return legacy_page(f"Add {module_info.get('name') or module} Endpoint", ctx, "endpoints", CONFIGURE_STYLE, content, FRAME_SCRIPT)

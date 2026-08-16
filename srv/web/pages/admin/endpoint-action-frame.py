@@ -8,12 +8,7 @@ def action_frame_response(title, body, active="endpoints", user=None, status=200
   function sendHeight() {{
     const body = document.body;
     const html = document.documentElement;
-    const height = Math.max(
-      body ? body.scrollHeight : 0,
-      body ? body.offsetHeight : 0,
-      html ? html.scrollHeight : 0,
-      html ? html.offsetHeight : 0
-    );
+    const height = body ? Math.max(body.scrollHeight, body.offsetHeight) : (html ? html.offsetHeight : 0);
     if (window.parent && window.parent !== window) {{
       window.parent.postMessage({{ type: 'ops-frame-height', height: height }}, window.location.origin);
     }}

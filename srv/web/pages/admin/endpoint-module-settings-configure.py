@@ -58,7 +58,7 @@ MODULE_CONFIGURE_FRAME_SCRIPT = r"""
   if (frame) {
     frame.addEventListener('load', function() {
       try {
-        applyHeight(frame.contentWindow.document.documentElement.scrollHeight);
+        applyHeight(frame.contentWindow.document.body.scrollHeight);
       } catch (_error) {
       }
     });
@@ -78,12 +78,7 @@ def module_settings_frame_response(title, body, active="endpoints", user=None, s
   function sendHeight() {{
     var body = document.body;
     var html = document.documentElement;
-    var height = Math.max(
-      body ? body.scrollHeight : 0,
-      body ? body.offsetHeight : 0,
-      html ? html.scrollHeight : 0,
-      html ? html.offsetHeight : 0
-    );
+    var height = body ? Math.max(body.scrollHeight, body.offsetHeight) : (html ? html.offsetHeight : 0);
     if (window.parent && window.parent !== window) {{
       window.parent.postMessage({{ type: 'ops-frame-height', height: height }}, window.location.origin);
     }}
@@ -128,6 +123,6 @@ def handle_request():
         <a class="back-link" href="/admin/endpoint-module-settings"><i class="fa-solid fa-arrow-left"></i> Manage Endpoint Modules</a>
     </div>
     <div class="frame-shell">
-        <iframe id="moduleSettingsFrame" class="settings-frame" sandbox="allow-forms allow-same-origin allow-scripts allow-top-navigation" src="{h(frame_src)}" title="{h(info.get("name") or module)} settings"></iframe>
+        <iframe id="moduleSettingsFrame" class="settings-frame" sandbox="allow-forms allow-modals allow-same-origin allow-scripts allow-top-navigation" src="{h(frame_src)}" title="{h(info.get("name") or module)} settings"></iframe>
     </div>"""
     return legacy_page(f"{info.get('name') or module} Settings", legacy_user_context(user), "endpoints", MODULE_CONFIGURE_STYLE, content, MODULE_CONFIGURE_FRAME_SCRIPT)

@@ -200,13 +200,13 @@ def resolve_group_value(cur, group_id):
     return str(stored_group or raw).strip()
 
 
-def parse_rtp_payload(packet):
+def parse_rtp_payload(packet, payload_type=0):
     if len(packet) < 12:
         return b""
     cc = packet[0] & 0x0F
     ext = (packet[0] & 0x10) >> 4
-    payload_type = packet[1] & 0x7F
-    if payload_type != 0:
+    pt = packet[1] & 0x7F
+    if pt != int(payload_type):
         return b""
     offset = 12 + cc * 4
     if ext:
@@ -217,6 +217,25 @@ def parse_rtp_payload(packet):
     if offset >= len(packet):
         return b""
     return packet[offset:]
+
+
+def normalize_livepage_targets(targets):
+    normalized = []
+    seen = set()
+    for target in targets or []:
+        token = str(target or "").strip()
+        if not token:
+            continue
+        lowered = token.lower()
+        if lowered == "page":
+            continue
+        if lowered.startswith("page/"):
+            token = token.split("/", 1)[1].strip()
+            lowered = token.lower()
+        if token and token not in seen:
+            seen.add(token)
+            normalized.append(token)
+    return normalized
 
 
 def resolve_targets(group_id):
@@ -248,13 +267,10 @@ def resolve_targets(group_id):
 
 def endpoint_targets_only(targets):
     filtered = []
-    for target in targets or []:
-        token = str(target or "").strip()
-        if not token:
+    for target in normalize_livepage_targets(targets):
+        if is_desktop_member_token(target):
             continue
-        if is_desktop_member_token(token):
-            continue
-        filtered.append(token)
+        filtered.append(target)
     return filtered
 
 
@@ -483,6 +499,12 @@ class LivePageSession:
     def before_pre_tone_slot(self, _frame):
         return
 
+    def inbound_payload_type(self):
+        return 0
+
+    def decode_inbound_payload(self, payload):
+        return payload
+
     def forward_live_payload(self, payload):
         data = bytes(payload or b"")
         if not data:
@@ -687,7 +709,10 @@ class LivePageSession:
                         f"local={rtp_socket_name(self.local_sock)} remote={addr[0]}:{addr[1]} bytes={len(packet)}"
                     )
                 self.learn_rtp_source(addr, packet)
-                payload = parse_rtp_payload(packet)
+                payload = parse_rtp_payload(packet, self.inbound_payload_type())
+                if not payload:
+                    continue
+                payload = self.decode_inbound_payload(payload)
                 if not payload:
                     continue
                 try:

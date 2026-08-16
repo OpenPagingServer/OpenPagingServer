@@ -421,7 +421,9 @@ function buildMessageExpirationValue() {
     const specificIds = messageExpirationSpecificCheckboxes().filter(cb => cb.checked).map(cb => cb.value);
     if (!immediate) return '';
     if (immediate.checked) return '0m';
+    const onUp = document.getElementById('messageExpirationOnUp');
     const tokens = [];
+    if (onUp && onUp.checked) tokens.push('onup');
     if (manual && manual.checked) tokens.push('manual');
     if (afterEnabled && afterEnabled.checked) {
         const minutes = Number(afterMinutes ? afterMinutes.value : '');
@@ -442,6 +444,7 @@ function syncMessageExpiration() {
     const whenMessage = document.getElementById('messageExpirationWhenMessage');
     const anyMessage = document.getElementById('messageExpirationAnyMessage');
     const panel = document.getElementById('messageExpirationMessagesPanel');
+    const onUp = document.getElementById('messageExpirationOnUp');
     const specifics = messageExpirationSpecificCheckboxes();
     if (!hidden || !immediate) return true;
     if (immediate.checked) {
@@ -449,10 +452,12 @@ function syncMessageExpiration() {
         if (afterEnabled) afterEnabled.checked = false;
         if (whenMessage) whenMessage.checked = false;
         if (anyMessage) anyMessage.checked = false;
+        if (onUp) onUp.checked = false;
         specifics.forEach(cb => { cb.checked = false; });
-    } else if (manual && afterEnabled && whenMessage && !manual.checked && !afterEnabled.checked && !whenMessage.checked) {
+    } else if (manual && afterEnabled && whenMessage && !manual.checked && !afterEnabled.checked && !whenMessage.checked && !(onUp && onUp.checked)) {
         manual.checked = true;
     }
+    if (onUp) onUp.disabled = immediate.checked;
     if (manual) manual.disabled = immediate.checked;
     if (afterEnabled) afterEnabled.disabled = immediate.checked;
     if (whenMessage) whenMessage.disabled = immediate.checked;
@@ -917,6 +922,8 @@ const variableWizardTitles = {
 };
 function openVariableGuide(fieldId) {
     activeVariableFieldId = fieldId || '';
+    const statusChoice = document.getElementById('messageVariableStatusChoice');
+    if (statusChoice) statusChoice.style.display = (activeVariableFieldId === 'shortmessage') ? 'none' : '';
     const modal = document.getElementById('messageVariableModal');
     const backdrop = document.getElementById('messageVariableBackdrop');
     if (modal) modal.classList.add('open');
@@ -967,6 +974,14 @@ function showVariableList() {
 function openVariableWizard(key) {
     if (key === 'productname') {
         insertVariableSnippet('${productname}');
+        return;
+    }
+    if (key === 'monitorname') {
+        insertVariableSnippet('${monitorname}');
+        return;
+    }
+    if (key === 'status') {
+        insertVariableSnippet('${status}');
         return;
     }
     activeVariableWizardKey = key || '';
@@ -1221,7 +1236,7 @@ def material_radio_group_html(name, options, selected="", onchange="", required=
     return '<div class="md-radio-group">\n' + "\n".join(rows) + "\n                </div>"
 
 
-def message_variable_guide_html():
+def message_variable_guide_html(extra_choices_html=""):
     return f"""
     <div id="messageVariableBackdrop" class="message-variable-modal-backdrop" onclick="closeVariableGuide()"></div>
     <div id="messageVariableModal" class="message-variable-modal" role="dialog" aria-modal="true" aria-labelledby="messageVariableTitle">
@@ -1240,6 +1255,7 @@ def message_variable_guide_html():
                 <button type="button" class="message-variable-choice" onclick="openVariableWizard('sender')">Sender</button>
                 <button type="button" class="message-variable-choice" onclick="openVariableWizard('api')">API</button>
                 <button type="button" class="message-variable-choice" onclick="openVariableWizard('productname')">Product Name</button>
+                {extra_choices_html}
             </div>
 
             <div class="message-variable-wizard" data-variable-key="date">
@@ -1382,13 +1398,25 @@ def message_variable_guide_html():
     </div>"""
 
 
-def message_expiration_field_html(available_messages, current_value="manual"):
+def message_expiration_field_html(available_messages, current_value="manual", include_on_up=False):
     state = message_expiration_state(current_value)
     immediate_checked = " checked" if state["immediate"] else ""
     manual_checked = " checked" if state["manual"] else ""
     after_checked = " checked" if state["after_enabled"] else ""
     when_checked = " checked" if state["when_message"] else ""
     any_checked = " checked" if state["any_message"] else ""
+    on_up_checked = " checked" if state.get("on_up") else ""
+    on_up_disabled = " disabled" if state["immediate"] else ""
+    on_up_html = ""
+    if include_on_up:
+        on_up_html = f"""                    <label class="md-checkbox-container">
+                        <input type="checkbox" id="messageExpirationOnUp" name="expiration_on_up" value="1" onchange="syncMessageExpiration()"{on_up_checked}{on_up_disabled}>
+                        <span class="md-checkmark"></span>
+                        <span class="message-expiration-text">
+                            <span class="message-expiration-title">On monitor up</span>
+                        </span>
+                    </label>
+"""
     message_rows = []
     for row in available_messages or []:
         message_id = str(row.get("messageid") or "").strip()
@@ -1418,6 +1446,7 @@ def message_expiration_field_html(available_messages, current_value="manual"):
                     when_message=state["when_message"],
                     any_message=state["any_message"],
                     message_ids=sorted(state["message_ids"]),
+                    on_up=state.get("on_up") and include_on_up,
                 ))}">
                 <div class="message-expiration-list">
                     <label class="md-checkbox-container">
@@ -1427,7 +1456,7 @@ def message_expiration_field_html(available_messages, current_value="manual"):
                             <span class="message-expiration-title">Immediately</span>
                         </span>
                     </label>
-                    <label class="md-checkbox-container">
+{on_up_html}                    <label class="md-checkbox-container">
                         <input type="checkbox" id="messageExpirationManual" name="expiration_manual" value="1" onchange="syncMessageExpiration()"{manual_checked}>
                         <span class="md-checkmark"></span>
                         <span class="message-expiration-text">
@@ -1484,6 +1513,7 @@ def message_expiration_from_form(form):
         when_message=bool(form.get("expiration_when_message")),
         any_message=bool(form.get("expiration_any_message")),
         message_ids=form.getlist("expiration_message_ids[]"),
+        on_up=bool(form.get("expiration_on_up")),
     )
 
 

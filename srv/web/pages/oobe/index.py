@@ -166,8 +166,17 @@ def handle_request():
                 stage = "welcome"
                 error = "Please create the administrator account first."
             elif oobe_user_count() == 0:
-                execute("SET SESSION sql_mode = IF(FIND_IN_SET('NO_AUTO_VALUE_ON_ZERO', @@sql_mode), @@sql_mode, CONCAT_WS(',', @@sql_mode, 'NO_AUTO_VALUE_ON_ZERO'))")
-                execute("INSERT INTO users (id, username, email, password, salt, role, userperm, adminperm) VALUES (0,%s,%s,%s,%s,'admin','all','all')", (pending_user["username"], pending_user["email"] or None, pending_user["password"], pending_user["salt"]))
+                conn = db()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SET SESSION sql_mode = IF(FIND_IN_SET('NO_AUTO_VALUE_ON_ZERO', @@sql_mode), @@sql_mode, CONCAT_WS(',', @@sql_mode, 'NO_AUTO_VALUE_ON_ZERO'))")
+                        cur.execute(
+                            "INSERT INTO users (id, username, email, password, salt, role, userperm, adminperm) VALUES (0,%s,%s,%s,%s,'admin','all','all')",
+                            (pending_user["username"], pending_user["email"] or None, pending_user["password"], pending_user["salt"]),
+                        )
+                    conn.commit()
+                finally:
+                    conn.close()
                 session.pop("oobe_user", None)
                 try:
                     (BASE_DIR / ".oobe").unlink(missing_ok=True)

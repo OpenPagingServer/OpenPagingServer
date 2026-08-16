@@ -139,6 +139,7 @@ def endpoint_rows(payload):
                     "model": endpoint.get("model") or "",
                     "address": endpoint.get("address") or "",
                     "status": endpoint.get("status") or "",
+                    "status_state": endpoint.get("status_state") or "",
                     "type": endpoint.get("type") or "",
                 }
             )
@@ -210,8 +211,18 @@ def handle_request():
                 meta_line = f"{meta_line} - {address}" if meta_line else address
             status_html = ""
             if status:
-                status_token = status.split(" ", 1)[0].strip("(),")
-                status_class = "status-" + re.sub(r"[^a-z0-9]+", "-", status_token.lower()).strip("-")
+                status_state = str(endpoint.get("status_state") or "").strip().lower()
+                if status_state:
+                    state_class_map = {
+                        "online": "status-online",
+                        "offline": "status-offline",
+                        "unchecked": "status-unchecked",
+                        "disabled": "status-unchecked",
+                    }
+                    status_class = state_class_map.get(status_state, "status-unchecked")
+                else:
+                    status_token = status.split(" ", 1)[0].strip("(),")
+                    status_class = "status-" + re.sub(r"[^a-z0-9]+", "-", status_token.lower()).strip("-")
                 status_text = h(status) + (f" ({h(address)})" if address else "")
                 status_html = f'<div class="endpoint-status">{endpoint_status_indicator(endpoint, status_class)}<span>{status_text}</span></div>'
             edit_href = "javascript:openDemoModePopup('manage-endpoints')" if demo else f"/admin/edit-endpoint?{h(query)}"

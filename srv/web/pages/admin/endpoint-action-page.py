@@ -43,21 +43,58 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 FRAME_SCRIPT = r"""
 (function() {
   const frame = document.getElementById('endpointActionFrame');
+  var heightLocked = false;
   function applyHeight(height) {
-    if (!frame) return;
+    if (!frame || heightLocked) return;
     const numeric = Number(height);
     if (!Number.isFinite(numeric) || numeric <= 0) return;
     frame.style.height = Math.max(320, Math.ceil(numeric) + 8) + 'px';
   }
   window.addEventListener('message', function(event) {
     if (event.origin !== window.location.origin) return;
-    if (!event.data || event.data.type !== 'ops-frame-height') return;
+    if (!event.data) return;
+    if (event.data.type === 'ops-frame-height-lock') {
+      heightLocked = true;
+      return;
+    }
+    if (event.data.type === 'ops-frame-height-unlock') {
+      heightLocked = false;
+      return;
+    }
+    if (event.data.type === 'sm-modal-overlay') {
+      if (frame) {
+        if (event.data.open) {
+          if (frame.getAttribute('data-sm-prev') === null) {
+            frame.setAttribute('data-sm-prev', frame.getAttribute('style') || '');
+            var host = frame.parentElement;
+            if (host) { host.setAttribute('data-sm-host-h', host.style.height || ''); host.style.height = host.offsetHeight + 'px'; }
+          }
+          heightLocked = true;
+          document.documentElement.style.overflow = 'hidden';
+          frame.style.position = 'fixed';
+          frame.style.top = '0'; frame.style.left = '0';
+          frame.style.width = '100vw'; frame.style.height = '100vh';
+          frame.style.right = 'auto'; frame.style.bottom = 'auto';
+          frame.style.margin = '0'; frame.style.border = '0';
+          frame.style.borderRadius = '0'; frame.style.background = 'transparent';
+          frame.style.zIndex = '2147483000';
+        } else {
+          frame.setAttribute('style', frame.getAttribute('data-sm-prev') || '');
+          frame.removeAttribute('data-sm-prev');
+          document.documentElement.style.overflow = '';
+          var host2 = frame.parentElement;
+          if (host2) { host2.style.height = host2.getAttribute('data-sm-host-h') || ''; host2.removeAttribute('data-sm-host-h'); }
+          heightLocked = false;
+        }
+      }
+      return;
+    }
     applyHeight(event.data.height);
   });
   if (frame) {
     frame.addEventListener('load', function() {
       try {
-        applyHeight(frame.contentWindow.document.documentElement.scrollHeight);
+        applyHeight(frame.contentWindow.document.body.scrollHeight);
       } catch (_error) {
       }
     });
@@ -77,12 +114,7 @@ def action_frame_response(title, body, active="endpoints", user=None, status=200
   function sendHeight() {{
     const body = document.body;
     const html = document.documentElement;
-    const height = Math.max(
-      body ? body.scrollHeight : 0,
-      body ? body.offsetHeight : 0,
-      html ? html.scrollHeight : 0,
-      html ? html.offsetHeight : 0
-    );
+    const height = body ? Math.max(body.scrollHeight, body.offsetHeight) : (html ? html.offsetHeight : 0);
     if (window.parent && window.parent !== window) {{
       window.parent.postMessage({{ type: 'ops-frame-height', height: height }}, window.location.origin);
     }}
@@ -144,7 +176,7 @@ def render_endpoint_action_page(action):
         <a class="back-link" href="/admin/manage-endpoints"><i class="fa-solid fa-arrow-left"></i> Endpoints</a>
     </div>
     <div class="frame-shell">
-        <iframe id="endpointActionFrame" class="form-frame" sandbox="allow-forms allow-same-origin allow-scripts allow-top-navigation" src="{h(frame_src)}" title="{h(action_title)}"></iframe>
+        <iframe id="endpointActionFrame" class="form-frame" sandbox="allow-forms allow-modals allow-same-origin allow-scripts allow-top-navigation" src="{h(frame_src)}" title="{h(action_title)}"></iframe>
     </div>"""
     return legacy_page(action_title, legacy_user_context(user), "endpoints", ACTION_STYLE, content, FRAME_SCRIPT)
 

@@ -444,7 +444,7 @@ def message_variable_api_value(option, cache, cursor=None, show_online_docs=None
     return payload
 
 
-def expand_message_variables(text, cursor, sender="", sender_context=None, now=None, api_cache=None, product_name=""):
+def expand_message_variables(text, cursor, sender="", sender_context=None, now=None, api_cache=None, product_name="", extra_vars=None, allow_status=True):
     raw_text = str(text or "")
     if not raw_text:
         return raw_text
@@ -452,6 +452,7 @@ def expand_message_variables(text, cursor, sender="", sender_context=None, now=N
     sender_info = normalize_sender_context(sender=sender, context=sender_context)
     cache = api_cache if api_cache is not None else {}
     product = str(product_name or product_name_value(cursor) or "Open Paging Server")
+    extras = extra_vars or {}
 
     def replace_variable(match):
         key = str(match.group(1) or "").strip().lower()
@@ -468,6 +469,14 @@ def expand_message_variables(text, cursor, sender="", sender_context=None, now=N
             return message_variable_api_value(option, cache, cursor=cursor)
         if key == "productname":
             return product
+        if key == "monitorname":
+            if "monitorname" in extras:
+                return str(extras.get("monitorname") or "")
+            return match.group(0)
+        if key == "status":
+            if "status" in extras:
+                return str(extras.get("status") or "") if allow_status else ""
+            return match.group(0)
         return match.group(0)
 
     return MESSAGE_VARIABLE_RE.sub(replace_variable, raw_text)
@@ -481,6 +490,14 @@ def expand_broadcast_record_variables(cursor, record, source_values=None):
         issued = datetime.now()
     api_cache = {}
     product = product_name_value(cursor)
+    source = source_values or {}
+    extra_vars = None
+    if "monitorname" in source or "status" in source:
+        extra_vars = {}
+        if "monitorname" in source:
+            extra_vars["monitorname"] = str(source.get("monitorname") or "")
+        if "status" in source:
+            extra_vars["status"] = str(source.get("status") or "")
     for key in ("shortmessage", "longmessage"):
         if key in record:
             record[key] = expand_message_variables(
@@ -491,6 +508,8 @@ def expand_broadcast_record_variables(cursor, record, source_values=None):
                 now=issued,
                 api_cache=api_cache,
                 product_name=product,
+                extra_vars=extra_vars,
+                allow_status=(key == "longmessage"),
             )
     if "audio" in record:
         audio_entries = []
@@ -507,6 +526,8 @@ def expand_broadcast_record_variables(cursor, record, source_values=None):
                 now=issued,
                 api_cache=api_cache,
                 product_name=product,
+                extra_vars=extra_vars,
+                allow_status=True,
             )
             audio_entries.append(encode_tts_token(payload))
         record["audio"] = join_audio_entries(audio_entries)
@@ -632,10 +653,13 @@ def serialize_message_expiration(
     when_message=False,
     any_message=False,
     message_ids=None,
+    on_up=False,
 ):
     if immediate:
         return "0m"
     tokens = []
+    if on_up:
+        tokens.append("onup")
     if manual:
         tokens.append("manual")
     if after_enabled:
@@ -673,6 +697,7 @@ def message_expiration_state(value):
         "when_message": False,
         "any_message": False,
         "message_ids": set(),
+        "on_up": False,
     }
     if not normalized:
         state["manual"] = True
@@ -685,6 +710,10 @@ def message_expiration_state(value):
     for token in split_message_expiration_tokens(normalized):
         if token.lower() == "manual":
             state["manual"] = True
+            recognized = True
+            continue
+        if token.lower() == "onup":
+            state["on_up"] = True
             recognized = True
             continue
         minute_match = MESSAGE_EXPIRATION_MINUTES_RE.fullmatch(token)
@@ -704,7 +733,7 @@ def message_expiration_state(value):
     if not recognized:
         state["manual"] = True
         state["normalized"] = "manual"
-    elif not state["manual"] and not state["after_enabled"] and not state["when_message"]:
+    elif not state["manual"] and not state["after_enabled"] and not state["when_message"] and not state["on_up"]:
         state["manual"] = True
     return state
 

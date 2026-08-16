@@ -6,6 +6,11 @@ import time
 import select
 import os
 
+try:
+    from .codec import encode_sip_rtp_payload
+except ImportError:
+    from codec import encode_sip_rtp_payload
+
 DTMF_MAP = {
     0: "0", 1: "1", 2: "2", 3: "3",
     4: "4", 5: "5", 6: "6", 7: "7",
@@ -50,6 +55,9 @@ class RTPSession:
         self.lock = threading.Lock()
         self.sent_packets = 0
         self.received_packets = 0
+        self.codec_name = "PCMU"
+        self.codec_info = {"payload_type": 0, "samples_per_frame": 160}
+        self.codec_encoder = None
 
     def start(self):
         if self.thread is None or not self.thread.is_alive():
@@ -166,8 +174,32 @@ class RTPSession:
                     if append_event:
                         self._append_digit(DTMF_MAP[event])
 
+    def encode_payload(self, payload):
+        codec_name = str(getattr(self, "codec_name", "PCMU") or "PCMU").upper()
+        frame = bytes(payload or b"")[:160].ljust(160, b"\xff")
+        if codec_name == "PCMU":
+            return frame
+        try:
+            encoded, encoder = encode_sip_rtp_payload(
+                codec_name,
+                frame,
+                encoder_state=getattr(self, "codec_encoder", None),
+            )
+            self.codec_encoder = encoder
+            return encoded
+        except Exception as exc:
+            rtp_debug(f"encode failed codec={codec_name} error={exc}")
+            return b""
+
     def build_packet(self, sequence, timestamp, ssrc, payload):
-        return struct.pack("!BBHII", 0x80, 0x00, sequence, timestamp, ssrc) + payload
+        return struct.pack(
+            "!BBHII",
+            0x80,
+            int(getattr(self, "codec_info", {}).get("payload_type", 0)) & 0x7F,
+            sequence,
+            timestamp,
+            ssrc,
+        ) + payload
 
     def run(self):
         sequence = random.randrange(0, 65536)
@@ -212,7 +244,14 @@ class RTPSession:
                             break
 
                 if payload:
-                    packet = self.build_packet(sequence, timestamp, ssrc, payload)
+                    encoded = self.encode_payload(payload)
+                    if not encoded:
+                        next_send += 0.02
+                        sleep_for = next_send - time.monotonic()
+                        if sleep_for > 0:
+                            time.sleep(sleep_for)
+                        continue
+                    packet = self.build_packet(sequence, timestamp, ssrc, encoded)
                     try:
                         self.socket.sendto(packet, (self.target_ip, self.target_port))
                     except:
@@ -221,7 +260,7 @@ class RTPSession:
                     if self.sent_packets <= 3 or self.sent_packets % 50 == 0:
                         rtp_debug(f"send packet={self.sent_packets} local={rtp_sockname(self.socket)} remote={self.target_ip}:{self.target_port} bytes={len(packet)}")
                     sequence = (sequence + 1) & 0xFFFF
-                    timestamp = (timestamp + 160) & 0xFFFFFFFF
+                    timestamp = (timestamp + int(getattr(self, "codec_info", {}).get("samples_per_frame", 160))) & 0xFFFFFFFF
 
                 next_send += 0.02
                 sleep_for = next_send - time.monotonic()

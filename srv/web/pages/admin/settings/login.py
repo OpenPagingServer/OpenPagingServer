@@ -449,7 +449,7 @@ def handle_request():
     )
     provider_options = "".join(
         _select_option_html(provider, value, label)
-        for value, label in (("local", "Local"), ("ldap", "LDAP"), ("oidc", "OIDC"), ("saml", "SAML"))
+        for value, label in (("local", "Local"), ("saml", "SAML"), ("oidc", "OIDC"), ("ldap", "LDAP"))
     )
     failure_options = "".join(
         _select_option_html(identity_data.get("ldap_failure_behavior", "deny"), value, label)
