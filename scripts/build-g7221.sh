@@ -1,11 +1,35 @@
 #!/usr/bin/env bash
-# Build and install libg722_1 (G.722.1 / Annex C "Siren14" encoder+decoder)
-# needed for the G7221C codec. Run on the server (Debian/Ubuntu):
-#   sudo apt-get install -y git build-essential autoconf automake libtool
-#   sudo bash scripts/build-g7221.sh
 set -euo pipefail
 
 SRC_DIR="${1:-/usr/local/src/libg722_1}"
+
+if [ "$(id -u)" -eq 0 ]; then
+    SUDO=""
+else
+    SUDO="sudo"
+fi
+
+install_deps() {
+    if command -v apt-get >/dev/null 2>&1; then
+        $SUDO apt-get update
+        $SUDO apt-get install -y git build-essential autoconf automake libtool
+    elif command -v dnf >/dev/null 2>&1; then
+        $SUDO dnf install -y git gcc make autoconf automake libtool
+    elif command -v yum >/dev/null 2>&1; then
+        $SUDO yum install -y git gcc make autoconf automake libtool
+    elif command -v pacman >/dev/null 2>&1; then
+        $SUDO pacman -Sy --noconfirm git base-devel autoconf automake libtool
+    elif command -v zypper >/dev/null 2>&1; then
+        $SUDO zypper install -y git gcc make autoconf automake libtool
+    elif command -v apk >/dev/null 2>&1; then
+        $SUDO apk add git build-base autoconf automake libtool
+    else
+        echo "No supported package manager found; install git, a C toolchain, autoconf, automake and libtool manually." >&2
+        exit 1
+    fi
+}
+
+install_deps
 
 if [ ! -d "$SRC_DIR/.git" ]; then
     git clone https://github.com/neutrino38/libg722_1 "$SRC_DIR"
@@ -15,8 +39,6 @@ cd "$SRC_DIR"
 [ -x ./configure ] || ./autogen.sh
 ./configure
 
-# The Makefile runs table-generator helper tools (./make_dct4_tables etc.)
-# without building them first; compile them by hand.
 for gen in src/make_*.c; do
     [ -e "$gen" ] || continue
     out="${gen%.c}"
@@ -24,8 +46,8 @@ for gen in src/make_*.c; do
 done
 
 make -j"$(nproc)"
-make install
-ldconfig
+$SUDO make install
+$SUDO ldconfig
 
 python3 - <<'PY'
 import ctypes

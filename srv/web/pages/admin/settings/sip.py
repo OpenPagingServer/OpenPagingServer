@@ -112,6 +112,22 @@ def ensure_sip_security_settings(data):
             data[key] = value
 
 
+def sip_codec_is_available(codec):
+    """G7221C requires libg722_1 (installed via scripts/build-g7221.sh); hide it
+    from the codec picker when the library isn't present so it can't be selected."""
+    if str(codec or "").strip().upper() == "G7221C":
+        try:
+            from sip.codec import g7221_available
+            return bool(g7221_available())
+        except Exception:
+            return False
+    return True
+
+
+def available_sip_codec_options():
+    return tuple(codec for codec in SIP_CODEC_OPTIONS if sip_codec_is_available(codec))
+
+
 def normalize_sip_codec_token(value):
     token = str(value or "").strip().upper()
     return token if token in SIP_CODEC_OPTIONS else ""
@@ -288,6 +304,7 @@ def sip_settings_body(ctx, data, detected_external_ipv4, user, unlock_page_token
     if not sip_codec_order:
         sip_codec_order = list(parse_sip_codec_order(data.get("sip_codecs_order", "")))
     sip_codec_enabled = parse_sip_codec_enabled(data.get("sip_codecs_enabled", ""))
+    sip_codec_order = [codec for codec in sip_codec_order if sip_codec_is_available(codec)]
     external_mode = str(data.get("sip_external_ipv4_mode", "auto") or "auto").strip().lower()
     if external_mode not in {"auto", "manual"}:
         external_mode = "auto"

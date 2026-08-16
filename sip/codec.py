@@ -1,16 +1,7 @@
-"""Synchronous, in-process SIP audio codec encoding.
-
-Input is always 20 ms G.711 u-law frames (160 bytes @ 8 kHz mono). PCMU is a
-pass-through, PCMA is a table translate, and G722/OPUS are encoded in-process
-with PyAV (libav) so no subprocesses or reader threads are involved and
-encode() returns output with minimal latency.
-"""
-
+import ctypes
+import ctypes.util
 import os
 
-# G.722.1C (Siren14) bit rate: 24000, 32000 or 48000. Multicast listeners have
-# no SDP, so this must match the phones' configured G722.1C bit rate
-# (Yealink defaults to 24000).
 try:
     G7221C_BIT_RATE = int(os.getenv("OPS_G7221C_BITRATE", "24000") or 24000)
 except ValueError:
@@ -18,7 +9,7 @@ except ValueError:
 if G7221C_BIT_RATE not in (24000, 32000, 48000):
     G7221C_BIT_RATE = 24000
 G7221C_SAMPLE_RATE = 32000
-G7221C_FRAME_BYTES = G7221C_BIT_RATE // 50 // 8  # bytes / 20 ms
+G7221C_FRAME_BYTES = G7221C_BIT_RATE // 50 // 8
 
 SIP_CODEC_PAYLOADS = {
     "PCMU": {"payload_type": 0, "sample_rate": 8000, "rtpmap": "PCMU/8000", "samples_per_frame": 160},
@@ -29,21 +20,19 @@ SIP_CODEC_PAYLOADS = {
     "G726-32": {"payload_type": 2, "sample_rate": 8000, "rtpmap": "G726-32/8000", "samples_per_frame": 160},
 }
 
-# Bytes of encoded audio produced per 20 ms input frame for constant-bitrate codecs.
-G722_FRAME_BYTES = 160  # 64 kbit/s * 0.02 s / 8
+G722_FRAME_BYTES = 160
 
 
 def normalize_sip_codec_name(value):
     token = str(value or "").strip().upper()
     if token not in SIP_CODEC_PAYLOADS:
-        token = token.replace(".", "")  # accept "G722.1C" for G7221C
+        token = token.replace(".", "")
     if token in ("G726", "G72632"):
         token = "G726-32"
     return token if token in SIP_CODEC_PAYLOADS else ""
 
 
 def _build_ulaw_tables():
-    """Build u-law -> PCM16 and u-law -> A-law lookup tables locally."""
     pcm = [0] * 256
     for i in range(256):
         u = ~i & 0xFF
@@ -133,7 +122,6 @@ def _ulaw_to_pcm16_bytes(ulaw_frame):
 
 
 class _AvEncoder:
-    """Shared PyAV encoder plumbing: resample 8 kHz s16 mono to codec rate."""
 
     def __init__(self, av_codec_name, rate, options=None, bit_rate=None):
         import av
@@ -155,11 +143,9 @@ class _AvEncoder:
         self.resampler = AudioResampler(format="s16", layout="mono", rate=rate)
         self.fifo = AudioFifo()
         self._pts = 0
-        # Codecs like Opus require fixed frame sizes; g722 accepts any.
         self.frame_size = int(ctx.frame_size or 0)
 
     def feed(self, pcm16_8k):
-        """Feed 8 kHz s16 mono PCM bytes; return list of encoded packets (bytes)."""
         av = self._av
         samples = len(pcm16_8k) // 2
         frame = av.AudioFrame(format="s16", layout="mono", samples=samples)
@@ -186,20 +172,18 @@ class _AvEncoder:
 
 
 class _G7221CEncoder:
-    """Resample 8 kHz PCM to 32 kHz and encode with libg722_1 (Siren14)."""
 
     def __init__(self):
         import av
         from av.audio.fifo import AudioFifo
         from av.audio.resampler import AudioResampler
-        from sip.g7221 import G7221Encoder
 
         self._av = av
         self.enc = G7221Encoder(bit_rate=G7221C_BIT_RATE, sample_rate=G7221C_SAMPLE_RATE)
         self.resampler = AudioResampler(format="s16", layout="mono", rate=G7221C_SAMPLE_RATE)
         self.fifo = AudioFifo()
         self._pts = 0
-        self.frame_samples = G7221C_SAMPLE_RATE // 50  # 640
+        self.frame_samples = G7221C_SAMPLE_RATE // 50
 
     def feed(self, pcm16_8k):
         av = self._av
@@ -228,10 +212,8 @@ class _G7221CEncoder:
 
 
 class _G726EncoderShim:
-    """Adapt sip.g726.G726Encoder to the feed() -> [packets] interface."""
 
     def __init__(self):
-        from sip.g726 import G726Encoder
         self.enc = G726Encoder()
 
     def feed(self, pcm16_8k):
@@ -293,7 +275,6 @@ class SipCodecEncoder:
                 del self._g722_buffer[:G722_FRAME_BYTES]
                 return out
             return b""
-        # OPUS/G7221C: one packet per 20 ms frame once the resampler primes.
         self._opus_packets.extend(packets)
         if self._opus_packets:
             return self._opus_packets.pop(0)
@@ -319,7 +300,6 @@ def encode_sip_rtp_payload(codec_name, payload, encoder_state=None):
 
 
 class _AvDecoder:
-    """PyAV decoder: codec payload -> 8 kHz s16 mono PCM."""
 
     def __init__(self, av_codec_name, rate, channels=1):
         import av
@@ -350,12 +330,10 @@ class _AvDecoder:
 
 
 class _G7221CDecoder:
-    """Decode Siren14 with libg722_1 and resample 32 kHz -> 8 kHz PCM."""
 
     def __init__(self):
         import av
         from av.audio.resampler import AudioResampler
-        from sip.g7221 import G7221Decoder
 
         self._av = av
         self.dec = G7221Decoder(bit_rate=G7221C_BIT_RATE, sample_rate=G7221C_SAMPLE_RATE)
@@ -386,10 +364,8 @@ class _G7221CDecoder:
 
 
 class _G726DecoderShim:
-    """Adapt sip.g726.G726Decoder to the feed() -> pcm16 interface."""
 
     def __init__(self):
-        from sip.g726 import G726Decoder
         self.dec = G726Decoder()
 
     def feed(self, payload):
@@ -400,7 +376,6 @@ class _G726DecoderShim:
 
 
 class SipCodecDecoder:
-    """Decode inbound RTP payloads to 8 kHz u-law byte stream."""
 
     def __init__(self, codec_name):
         self.codec_name = normalize_sip_codec_name(codec_name) or "PCMU"
@@ -459,3 +434,443 @@ def decode_sip_rtp_payload(codec_name, payload, decoder_state=None):
                 pass
         decoder = SipCodecDecoder(codec)
     return decoder.decode(payload), decoder
+
+
+G726_NIBBLE_LSB = str(os.getenv("OPS_G726_NIBBLE", "") or "").strip().lower() in ("lsb", "little", "aal2")
+
+_QTAB = (-124, 80, 178, 246, 300, 349, 400)
+_DQLNTAB = (-2048, 4, 135, 213, 273, 323, 373, 425,
+            425, 373, 323, 273, 213, 135, 4, -2048)
+_WITAB = (-12, 18, 41, 64, 112, 198, 355, 1122,
+          1122, 355, 198, 112, 64, 41, 18, -12)
+_FITAB = (0, 0, 0, 0x200, 0x200, 0x200, 0x600, 0xE00,
+          0xE00, 0x600, 0x200, 0x200, 0x200, 0, 0, 0)
+
+
+def _log2plus1(val):
+    return val.bit_length()
+
+
+def _to_short(v):
+    v &= 0xFFFF
+    return v - 0x10000 if v & 0x8000 else v
+
+
+def _fmult(an, srn):
+    anmag = an if an > 0 else (-an) & 0x1FFF
+    anexp = _log2plus1(anmag) - 6
+    if anmag == 0:
+        anmant = 32
+    elif anexp >= 0:
+        anmant = anmag >> anexp
+    else:
+        anmant = anmag << -anexp
+    wanexp = anexp + ((srn >> 6) & 0xF) - 13
+    wanmant = (anmant * (srn & 0o77) + 0x30) >> 4
+    if wanexp >= 0:
+        retval = (wanmant << wanexp) & 0x7FFF
+    else:
+        retval = wanmant >> -wanexp
+    return -retval if (an ^ srn) < 0 else retval
+
+
+class G726State:
+    __slots__ = ("yl", "yu", "dms", "dml", "ap", "a", "b", "pk", "dq", "sr", "td")
+
+    def __init__(self):
+        self.yl = 34816
+        self.yu = 544
+        self.dms = 0
+        self.dml = 0
+        self.ap = 0
+        self.a = [0, 0]
+        self.pk = [0, 0]
+        self.sr = [32, 32]
+        self.b = [0] * 6
+        self.dq = [32] * 6
+        self.td = 0
+
+    def _predictor_zero(self):
+        b = self.b
+        dq = self.dq
+        sezi = 0
+        for i in range(6):
+            sezi += _fmult(_to_short(b[i]) >> 2, dq[i])
+        return sezi
+
+    def _predictor_pole(self):
+        return (_fmult(_to_short(self.a[1]) >> 2, self.sr[1]) +
+                _fmult(_to_short(self.a[0]) >> 2, self.sr[0]))
+
+    def _step_size(self):
+        if self.ap >= 256:
+            return self.yu
+        y = self.yl >> 6
+        dif = self.yu - y
+        al = self.ap >> 2
+        if dif > 0:
+            y += (dif * al) >> 6
+        elif dif < 0:
+            y += (dif * al + 0x3F) >> 6
+        return y
+
+    def _update(self, y, wi, fi, dq, sr, dqsez):
+        pk0 = 1 if dqsez < 0 else 0
+        mag = dq & 0x7FFF
+        ylint = self.yl >> 15
+        ylfrac = (self.yl >> 10) & 0x1F
+        thr1 = (32 + ylfrac) << ylint
+        thr2 = (31 << 10) if ylint > 9 else thr1
+        dqthr = (thr2 + (thr2 >> 1)) >> 1
+        if self.td == 0 or mag <= dqthr:
+            tr = 0
+        else:
+            tr = 1
+
+        self.yu = y + ((wi - y) >> 5)
+        if self.yu < 544:
+            self.yu = 544
+        elif self.yu > 5120:
+            self.yu = 5120
+        self.yl += self.yu + ((-self.yl) >> 6)
+
+        a2p = 0
+        if tr == 1:
+            self.a[0] = self.a[1] = 0
+            for i in range(6):
+                self.b[i] = 0
+        else:
+            pks1 = pk0 ^ self.pk[0]
+            a2p = self.a[1] - (self.a[1] >> 7)
+            if dqsez != 0:
+                fa1 = self.a[0] if pks1 else -self.a[0]
+                if fa1 < -8191:
+                    a2p -= 0x100
+                elif fa1 > 8191:
+                    a2p += 0xFF
+                else:
+                    a2p += fa1 >> 5
+                if pk0 ^ self.pk[1]:
+                    if a2p <= -12160:
+                        a2p = -12288
+                    elif a2p >= 12416:
+                        a2p = 12288
+                    else:
+                        a2p -= 0x80
+                elif a2p <= -12416:
+                    a2p = -12288
+                elif a2p >= 12160:
+                    a2p = 12288
+                else:
+                    a2p += 0x80
+            self.a[1] = a2p
+            self.a[0] -= self.a[0] >> 8
+            if dqsez != 0:
+                if pks1 == 0:
+                    self.a[0] += 192
+                else:
+                    self.a[0] -= 192
+            a1ul = 15360 - a2p
+            if self.a[0] < -a1ul:
+                self.a[0] = -a1ul
+            elif self.a[0] > a1ul:
+                self.a[0] = a1ul
+            for i in range(6):
+                self.b[i] -= self.b[i] >> 8
+                if dq & 0x7FFF:
+                    if (dq ^ self.dq[i]) >= 0:
+                        self.b[i] += 128
+                    else:
+                        self.b[i] -= 128
+
+        for i in range(5, 0, -1):
+            self.dq[i] = self.dq[i - 1]
+        if mag == 0:
+            self.dq[0] = 0x20 if dq >= 0 else _to_short(0xFC20)
+        else:
+            exp = _log2plus1(mag)
+            if dq >= 0:
+                self.dq[0] = (exp << 6) + ((mag << 6) >> exp)
+            else:
+                self.dq[0] = (exp << 6) + ((mag << 6) >> exp) - 0x400
+
+        self.sr[1] = self.sr[0]
+        if sr == 0:
+            self.sr[0] = 0x20
+        elif sr > 0:
+            exp = _log2plus1(sr)
+            self.sr[0] = (exp << 6) + ((sr << 6) >> exp)
+        elif sr > -32768:
+            mag2 = -sr
+            exp = _log2plus1(mag2)
+            self.sr[0] = (exp << 6) + ((mag2 << 6) >> exp) - 0x400
+        else:
+            self.sr[0] = _to_short(0xFC20)
+
+        self.pk[1] = self.pk[0]
+        self.pk[0] = pk0
+
+        if tr == 1:
+            self.td = 0
+        elif a2p < -11776:
+            self.td = 1
+        else:
+            self.td = 0
+
+        self.dms += (fi - self.dms) >> 5
+        self.dml += ((fi << 2) - self.dml) >> 7
+        if tr == 1:
+            self.ap = 256
+        elif y < 1536 or self.td == 1:
+            self.ap += (0x200 - self.ap) >> 4
+        elif abs((self.dms << 2) - self.dml) >= (self.dml >> 3):
+            self.ap += (0x200 - self.ap) >> 4
+        else:
+            self.ap += (-self.ap) >> 4
+
+
+def _quantize(d, y):
+    dqm = abs(d)
+    exp = _log2plus1(dqm >> 1)
+    mant = ((dqm << 7) >> exp) & 0x7F if exp < 21 else 0x7F
+    dl = (exp << 7) + mant
+    dln = dl - (y >> 2)
+    i = 0
+    for threshold in _QTAB:
+        if dln < threshold:
+            break
+        i += 1
+    if d < 0:
+        return 15 - i
+    if i == 0:
+        return 15
+    return i
+
+
+def _reconstruct(sign, dqln, y):
+    dql = dqln + (y >> 2)
+    if dql < 0:
+        return -0x8000 if sign else 0
+    dex = (dql >> 7) & 15
+    dqt = 128 + (dql & 127)
+    dq = (dqt << 7) >> (14 - dex)
+    return dq - 0x8000 if sign else dq
+
+
+def g726_encode_sample(state, sl):
+    sl >>= 2
+    sezi = state._predictor_zero()
+    sez = sezi >> 1
+    se = (sezi + state._predictor_pole()) >> 1
+    d = sl - se
+    y = state._step_size()
+    i = _quantize(d, y)
+    dq = _reconstruct(i & 8, _DQLNTAB[i], y)
+    sr = se - (dq & 0x3FFF) if dq < 0 else se + dq
+    dqsez = sr + sez - se
+    state._update(y, _WITAB[i] << 5, _FITAB[i], dq, sr, dqsez)
+    return i
+
+
+def g726_decode_sample(state, code):
+    i = code & 0x0F
+    sezi = state._predictor_zero()
+    sez = sezi >> 1
+    se = (sezi + state._predictor_pole()) >> 1
+    y = state._step_size()
+    dq = _reconstruct(i & 8, _DQLNTAB[i], y)
+    sr = se - (dq & 0x3FFF) if dq < 0 else se + dq
+    dqsez = sr - se + sez
+    state._update(y, _WITAB[i] << 5, _FITAB[i], dq, sr, dqsez)
+    sample = sr << 2
+    if sample > 32767:
+        sample = 32767
+    elif sample < -32768:
+        sample = -32768
+    return sample
+
+
+class G726Encoder:
+
+    def __init__(self):
+        self.state = G726State()
+
+    def encode(self, pcm16):
+        samples = len(pcm16) // 2
+        state = self.state
+        out = bytearray((samples + 1) // 2)
+        for n in range(samples):
+            v = int.from_bytes(pcm16[2 * n:2 * n + 2], "little", signed=True)
+            code = g726_encode_sample(state, v)
+            if G726_NIBBLE_LSB:
+                out[n >> 1] |= code << 4 if n & 1 else code
+            else:
+                out[n >> 1] |= code if n & 1 else code << 4
+        return bytes(out)
+
+    def close(self):
+        pass
+
+
+class G726Decoder:
+
+    def __init__(self):
+        self.state = G726State()
+
+    def decode(self, data):
+        data = bytes(data or b"")
+        state = self.state
+        out = bytearray(len(data) * 4)
+        pos = 0
+        for byte in data:
+            if G726_NIBBLE_LSB:
+                codes = (byte & 0x0F, byte >> 4)
+            else:
+                codes = (byte >> 4, byte & 0x0F)
+            for code in codes:
+                sample = g726_decode_sample(state, code)
+                out[pos:pos + 2] = sample.to_bytes(2, "little", signed=True)
+                pos += 2
+        return bytes(out)
+
+    def close(self):
+        pass
+
+
+_G7221_LIB_CANDIDATES = (
+    os.environ.get("OPS_G7221_LIB", ""),
+    "libg722_1.so.0",
+    "libg722_1.so",
+    "/usr/local/lib/libg722_1.so",
+    "libg722_1.dll",
+    "g722_1.dll",
+)
+
+_g7221_lib = None
+_g7221_lib_error = None
+
+
+def _load_g7221():
+    global _g7221_lib, _g7221_lib_error
+    if _g7221_lib is not None or _g7221_lib_error is not None:
+        return _g7221_lib
+    last_error = None
+    names = [name for name in _G7221_LIB_CANDIDATES if name]
+    found = ctypes.util.find_library("g722_1")
+    if found:
+        names.append(found)
+    for name in names:
+        try:
+            lib = ctypes.CDLL(name)
+        except OSError as exc:
+            last_error = exc
+            continue
+        try:
+            lib.g722_1_encode_init.restype = ctypes.c_void_p
+            lib.g722_1_encode_init.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_int)
+            lib.g722_1_encode.restype = ctypes.c_int
+            lib.g722_1_encode.argtypes = (
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8),
+                ctypes.POINTER(ctypes.c_int16), ctypes.c_int,
+            )
+            lib.g722_1_decode_init.restype = ctypes.c_void_p
+            lib.g722_1_decode_init.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_int)
+            lib.g722_1_decode.restype = ctypes.c_int
+            lib.g722_1_decode.argtypes = (
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_int16),
+                ctypes.POINTER(ctypes.c_uint8), ctypes.c_int,
+            )
+            for release in ("g722_1_encode_release", "g722_1_decode_release",
+                            "g722_1_encode_free", "g722_1_decode_free"):
+                if hasattr(lib, release):
+                    getattr(lib, release).restype = ctypes.c_int
+                    getattr(lib, release).argtypes = (ctypes.c_void_p,)
+        except AttributeError as exc:
+            last_error = exc
+            continue
+        _g7221_lib = lib
+        return _g7221_lib
+    _g7221_lib_error = last_error or OSError("libg722_1 not found")
+    return None
+
+
+def g7221_available():
+    return _load_g7221() is not None
+
+
+class G7221Encoder:
+
+    def __init__(self, bit_rate=48000, sample_rate=32000):
+        lib = _load_g7221()
+        if lib is None:
+            raise RuntimeError(f"libg722_1 unavailable: {_g7221_lib_error}")
+        self._lib = lib
+        self._state = lib.g722_1_encode_init(None, int(bit_rate), int(sample_rate))
+        if not self._state:
+            raise RuntimeError("g722_1_encode_init failed")
+        self.samples_per_frame = sample_rate // 50
+        self.bytes_per_frame = bit_rate // 50 // 8
+
+    def encode(self, pcm16):
+        samples = len(pcm16) // 2
+        if samples == 0:
+            return b""
+        in_buf = (ctypes.c_int16 * samples).from_buffer_copy(pcm16)
+        out_len = (samples // self.samples_per_frame + 1) * self.bytes_per_frame
+        out_buf = (ctypes.c_uint8 * out_len)()
+        n = self._lib.g722_1_encode(self._state, out_buf, in_buf, samples)
+        if n <= 0:
+            return b""
+        return bytes(out_buf[:n])
+
+    def close(self):
+        if self._state:
+            for name in ("g722_1_encode_release", "g722_1_encode_free"):
+                fn = getattr(self._lib, name, None)
+                if fn is not None:
+                    try:
+                        fn(self._state)
+                    except Exception:
+                        pass
+                    if name.endswith("_free"):
+                        break
+            self._state = None
+
+
+class G7221Decoder:
+
+    def __init__(self, bit_rate=48000, sample_rate=32000):
+        lib = _load_g7221()
+        if lib is None:
+            raise RuntimeError(f"libg722_1 unavailable: {_g7221_lib_error}")
+        self._lib = lib
+        self._state = lib.g722_1_decode_init(None, int(bit_rate), int(sample_rate))
+        if not self._state:
+            raise RuntimeError("g722_1_decode_init failed")
+        self.samples_per_frame = sample_rate // 50
+        self.bytes_per_frame = bit_rate // 50 // 8
+
+    def decode(self, data):
+        data = bytes(data or b"")
+        if not data:
+            return b""
+        in_buf = (ctypes.c_uint8 * len(data)).from_buffer_copy(data)
+        out_len = (len(data) // self.bytes_per_frame + 1) * self.samples_per_frame
+        out_buf = (ctypes.c_int16 * out_len)()
+        n = self._lib.g722_1_decode(self._state, out_buf, in_buf, len(data))
+        if n <= 0:
+            return b""
+        return ctypes.string_at(out_buf, n * 2)
+
+    def close(self):
+        if self._state:
+            for name in ("g722_1_decode_release", "g722_1_decode_free"):
+                fn = getattr(self._lib, name, None)
+                if fn is not None:
+                    try:
+                        fn(self._state)
+                    except Exception:
+                        pass
+                    if name.endswith("_free"):
+                        break
+            self._state = None
