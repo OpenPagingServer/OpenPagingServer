@@ -510,22 +510,22 @@ def handle_request():
         .login-box {{ max-width: 360px; width: 100%; height: auto; border-radius: 6px; padding: 22px; }} 
         .login-banner {{ max-width: 360px; width: 100%; border-radius: 4px; }}
       }}
-      .login-box h2 {{ color: #1976d2; font-weight: 500; margin-bottom: 20px; margin-top: 0; }}
+      .login-box h2 {{ color: var(--ops-accent); font-weight: 500; margin-bottom: 20px; margin-top: 0; }}
       .input-field {{ position: relative; margin-bottom: 20px; }}
       .input-field input {{ width: 100%; padding: 8px 0; border: none; border-bottom: 2px solid #ccc; font-size: 16px; background: transparent; outline: none; color: #333; font-family: "Roboto", sans-serif; }}
-      .input-field input:focus {{ border-bottom: 2px solid #1976d2; }}
+      .input-field input:focus {{ border-bottom: 2px solid var(--ops-accent); }}
       .input-field label {{ position: absolute; top: 8px; left: 0; color: #888; font-size: 14px; pointer-events: none; transition: 0.2s ease all; }}
-      .input-field input:focus ~ label, .input-field input:not(:placeholder-shown) ~ label {{ top: -16px; left: 0; font-size: 12px; color: #1976d2; }}
+      .input-field input:focus ~ label, .input-field input:not(:placeholder-shown) ~ label {{ top: -16px; left: 0; font-size: 12px; color: var(--ops-accent); }}
       .captcha-section {{ width: 100%; margin: 0 0 18px 0; display: flex; flex-direction: column; align-items: center; gap: 12px; }}
       .basic-captcha-row {{ display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%; }}
       .basic-captcha-row img {{ width: 220px; max-width: calc(100% - 50px); height: 70px; border: 1px solid #ccc; border-radius: 4px; background: #f5f5f5; }}
       .login-box .basic-captcha-refresh {{ width: 42px; height: 42px; padding: 0; flex: 0 0 42px; border-radius: 4px; font-size: 16px; text-transform: none; }}
       .captcha-answer-field {{ width: 100%; margin-bottom: 0; }}
       .cf-turnstile, .g-recaptcha {{ max-width: 100%; }}
-      .login-box button {{ width: 100%; padding: 12px; background-color: #1976d2; border: none; color: #fff; font-size: 16px; border-radius: 4px; cursor: pointer; font-family: "Roboto", sans-serif; text-transform: uppercase; position: relative; height: 45px; display: inline-flex; align-items: center; justify-content: center; }}
-      .login-box .text-action {{ width: auto; height: auto; padding: 6px 0; margin-top: 10px; background: transparent; color: #1976d2; border-radius: 0; text-transform: none; font-size: 14px; justify-content: center; }}
+      .login-box button {{ width: 100%; padding: 12px; background-color: var(--ops-accent); border: none; color: #fff; font-size: 16px; border-radius: 4px; cursor: pointer; font-family: "Roboto", sans-serif; text-transform: uppercase; position: relative; height: 45px; display: inline-flex; align-items: center; justify-content: center; }}
+      .login-box .text-action {{ width: auto; height: auto; padding: 6px 0; margin-top: 10px; background: transparent; color: var(--ops-accent); border-radius: 0; text-transform: none; font-size: 14px; justify-content: center; }}
       .login-box .text-action:hover {{ background: transparent; text-decoration: underline; }}
-      .login-box button.loading {{ pointer-events: none; background-color: #1565c0; }}
+      .login-box button.loading {{ pointer-events: none; background-color: var(--ops-accent-hover); }}
       .loading-circle {{ width: 24px; height: 24px; border: 2px solid rgba(255,255,255,0.3); border-top: 2px solid #fff; border-radius: 50%; animation: spin 1s linear infinite; position: absolute; }}
       @keyframes spin {{ from {{ transform: rotate(0deg); }} to {{ transform: rotate(360deg); }} }}
       .error {{ color: #d32f2f; font-size: 0.9em; margin-top: 10px; min-height: 1.2em; }}
@@ -536,7 +536,7 @@ def handle_request():
       .maintenance-popup-overlay {{ display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.72); z-index: 10; align-items: center; justify-content: center; padding: 20px; box-sizing: border-box; }}
       .maintenance-popup-overlay.active {{ display: flex; }}
       .maintenance-popup {{ width: min(460px, 100%); background: #fff; border-radius: 10px; padding: 24px; box-shadow: 0 18px 45px rgba(0,0,0,0.35); text-align: left; }}
-      .maintenance-popup h3 {{ margin: 0 0 18px 0; color: #1976d2; font-weight: 500; }}
+      .maintenance-popup h3 {{ margin: 0 0 18px 0; color: var(--ops-accent); font-weight: 500; }}
       .maintenance-option-row {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 12px; }}
       .maintenance-checkbox-label {{ font-size: 15px; color: #333; }}
       .maintenance-save-row {{ margin-bottom: 16px; }}
@@ -544,7 +544,7 @@ def handle_request():
       .maintenance-popup-status.success {{ color: #2e7d32; }}
       .maintenance-popup-status.error {{ color: #c62828; }}
       .maintenance-actions {{ display: flex; flex-direction: column; gap: 10px; }}
-      .maintenance-action-btn {{ width: 100%; padding: 12px; border: none; border-radius: 4px; cursor: pointer; font-size: 15px; text-transform: uppercase; background: #1976d2; color: #fff; }}
+      .maintenance-action-btn {{ width: 100%; padding: 12px; border: none; border-radius: 4px; cursor: pointer; font-size: 15px; text-transform: uppercase; background: var(--ops-accent); color: #fff; }}
       .maintenance-action-btn.secondary {{ width: auto; min-width: 120px; background: #5f6368; }}
       .maintenance-action-btn.danger {{ background: #c62828; }}
       @media (prefers-color-scheme: dark) {{
@@ -583,7 +583,7 @@ def handle_request():
         .login-app-settings-btn:hover {{ background: #2a2a2a; }}
       }}
     </style>
-  </head>
+  <link rel="stylesheet" href="/assets/theme.css"></head>
   <body>
     <div class="background-slideshow"></div>
     {logo_html}

@@ -268,7 +268,7 @@ def handle_request():
                     <label class="md-checkbox-container">
                         <input type="checkbox" name="send_all" id="send_all" value="1" onchange="toggleRecipients()"{all_disabled}{' checked' if form_state["send_all"] else ''}>
                         <span class="md-checkmark"></span>
-                        <span class="text" style="font-weight:bold;color:#1976D2;">All Recipients</span>
+                        <span class="text" style="font-weight:bold;color:var(--ops-accent);">All Recipients</span>
                         {all_note}
                     </label>
 {groups_html}

@@ -336,7 +336,7 @@ def sip_settings_body(ctx, data, detected_external_ipv4, user, unlock_page_token
     docker_mode = os.environ.get("OPS_DOCKER_MODE", "") == "1"
     docker_port_disabled = " disabled" if docker_mode else ""
     docker_port_style = ' style="background:rgba(0,0,0,0.05); color:#777;"' if docker_mode else ""
-    docker_port_notice = '<div style="display:flex; align-items:center; gap:6px; margin-top:4px;"><svg width="16" height="16" viewBox="0 0 24 24" fill="#1976D2"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg><span style="color:#1976D2; font-size:0.85em;">Change port by editing .env in Docker</span></div>' if docker_mode else ""
+    docker_port_notice = '<div style="display:flex; align-items:center; gap:6px; margin-top:4px;"><svg width="16" height="16" viewBox="0 0 24 24" style="fill:var(--ops-accent)"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg><span style="color:var(--ops-accent); font-size:0.85em;">Change port by editing .env in Docker</span></div>' if docker_mode else ""
     codec_items_html = "".join(
         f"""
                     <div class="sip-codec-item" draggable="true" data-codec="{h(codec)}">
@@ -370,7 +370,7 @@ def sip_settings_body(ctx, data, detected_external_ipv4, user, unlock_page_token
     }}
     .switch.static.checked .slider:before {{
         transform: translateX(20px);
-        background-color:#1976D2;
+        background-color:var(--ops-accent);
     }}
     .sip-security-divider {{
         border-top:1px solid #E5E5E5;
@@ -406,7 +406,7 @@ def sip_settings_body(ctx, data, detected_external_ipv4, user, unlock_page_token
     }}
     .sip-sensitive-login-box h2 {{
         margin:0 0 20px 0;
-        color:#1976D2;
+        color:var(--ops-accent);
         font-weight:500;
         font-size:1.5em;
     }}
@@ -427,7 +427,7 @@ def sip_settings_body(ctx, data, detected_external_ipv4, user, unlock_page_token
         box-sizing:border-box;
     }}
     .sip-sensitive-input-field input:focus {{
-        border-bottom:2px solid #1976d2;
+        border-bottom:2px solid var(--ops-accent);
     }}
     .sip-sensitive-input-field input[disabled] {{
         color:#999;
@@ -447,7 +447,7 @@ def sip_settings_body(ctx, data, detected_external_ipv4, user, unlock_page_token
         top:-16px;
         left:0;
         font-size:12px;
-        color:#1976d2;
+        color:var(--ops-accent);
     }}
     .sip-sensitive-actions {{
         display:flex;
@@ -459,7 +459,7 @@ def sip_settings_body(ctx, data, detected_external_ipv4, user, unlock_page_token
     .sip-sensitive-actions button {{
         width:100%;
         padding:12px;
-        background-color:#1976d2;
+        background-color:var(--ops-accent);
         border:none;
         color:#fff;
         font-size:16px;
@@ -477,7 +477,7 @@ def sip_settings_body(ctx, data, detected_external_ipv4, user, unlock_page_token
         cursor:default;
     }}
     .sip-sensitive-cancel {{
-        color:#1976d2;
+        color:var(--ops-accent);
         text-decoration:none;
         font-size:14px;
         line-height:1.4;

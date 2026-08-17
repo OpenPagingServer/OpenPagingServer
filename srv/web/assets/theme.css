@@ -1,0 +1,15 @@
+/* Global accent theming.
+   Light mode: orange accent. Dark mode: original blue accent.
+   Consumed via var(--ops-accent) / var(--ops-accent-hover) across the app. */
+:root {
+    --ops-accent: #C8654C;
+    --ops-accent-hover: #B0553E;
+    --ops-on-accent: #FFFFFF;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --ops-accent: #1976D2;
+        --ops-accent-hover: #1565C0;
+    }
+}

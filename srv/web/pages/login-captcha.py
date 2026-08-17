@@ -35,7 +35,7 @@ def _svg_noise(rng):
         cx = rng.randint(0, 220)
         cy = rng.randint(0, 70)
         radius = rng.randint(1, 4)
-        color = rng.choice(["#1976d2", "#ef6c00", "#2e7d32", "#6a1b9a"])
+        color = rng.choice(["var(--ops-accent)", "#ef6c00", "#2e7d32", "#6a1b9a"])
         elements.append(f'<circle cx="{cx}" cy="{cy}" r="{radius}" fill="{color}" opacity="0.18" />')
     return "".join(elements)
 
@@ -59,7 +59,7 @@ def _captcha_svg(code):
         '<svg xmlns="http://www.w3.org/2000/svg" width="220" height="70" viewBox="0 0 220 70" role="img" aria-label="CAPTCHA image">'
         '<rect width="220" height="70" rx="4" fill="#f7fbff" />'
         f'{_svg_noise(rng)}'
-        '<path d="M5 47 C 48 28, 82 66, 128 38 S 184 22, 215 49" fill="none" stroke="#1565c0" stroke-width="2" opacity="0.28" />'
+        '<path d="M5 47 C 48 28, 82 66, 128 38 S 184 22, 215 49" fill="none" style="stroke:var(--ops-accent-hover)" stroke-width="2" opacity="0.28" />'
         f'{"".join(text_elements)}'
         '</svg>'
     )

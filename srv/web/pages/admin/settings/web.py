@@ -81,7 +81,7 @@ def handle_request():
     docker_mode = os.environ.get("OPS_DOCKER_MODE", "") == "1"
     docker_port_disabled = " disabled" if docker_mode else ""
     docker_port_style = ' style="background:rgba(0,0,0,0.05); color:#777;"' if docker_mode else ""
-    docker_port_notice = '<div style="display:flex; align-items:center; gap:6px; margin-top:4px;"><svg width="16" height="16" viewBox="0 0 24 24" fill="#1976D2"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg><span style="color:#1976D2; font-size:0.85em;">Change port by editing .env in Docker</span></div>' if docker_mode else ""
+    docker_port_notice = '<div style="display:flex; align-items:center; gap:6px; margin-top:4px;"><svg width="16" height="16" viewBox="0 0 24 24" style="fill:var(--ops-accent)"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg><span style="color:var(--ops-accent); font-size:0.85em;">Change port by editing .env in Docker</span></div>' if docker_mode else ""
     body = f"""
     <div id="web" class="tab-content active">
         <div class="info-card login-settings">

@@ -3,7 +3,7 @@ from srv.web.app import *
 
 def action_frame_response(title, body, active="endpoints", user=None, status=200):
     return Response(
-        f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{h(title)}</title></head><body>{body}<script>
+        f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{h(title)}</title><link rel="stylesheet" href="/assets/theme.css"></head><body>{body}<script>
 (function() {{
   function sendHeight() {{
     const body = document.body;

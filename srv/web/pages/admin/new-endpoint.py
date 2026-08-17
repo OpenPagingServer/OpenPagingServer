@@ -2,15 +2,15 @@ from srv.web.app import *
 
 NEW_ENDPOINT_STYLE = r"""
 body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:300; background-color:#FFF; height:100%; }
-#sidebar { width:220px; background-color:#1976D2; color:#FFF; height:100vh; position:fixed; top:0; left:0; display:flex; flex-direction:column; box-shadow:2px 0 8px rgba(0,0,0,0.2); transition:transform 0.3s ease; z-index:1200; }
+#sidebar { width:220px; background-color:var(--ops-accent); color:#FFF; height:100vh; position:fixed; top:0; left:0; display:flex; flex-direction:column; box-shadow:2px 0 8px rgba(0,0,0,0.2); transition:transform 0.3s ease; z-index:1200; }
 @media (max-width:767px){ #sidebar{ transform:translateX(-100%); } #sidebar.open{ transform:translateX(0); } }
 #sidebar a,.logout-btn,.logout-btn-mobile,.admin-only{ color:#FFF; padding:12px 20px; display:block; border-bottom:1px solid rgba(255,255,255,0.1); text-decoration:none; transition:background 0.3s; font-size:0.9em; text-align:left; box-sizing:border-box; }
 #sidebar a i,.logout-btn i,.logout-btn-mobile i,.admin-only i { margin-right:8px; width:20px; }
-#sidebar a:hover,#sidebar a.active{ background-color:#1565C0; }
+#sidebar a:hover,#sidebar a.active{ background-color:var(--ops-accent-hover); }
 .logout-btn{ background-color:#C62828; border:none; cursor:pointer; margin-top:auto; transition:background-color 0.3s; }
 .logout-btn-mobile{ background-color:#C62828; border:none; cursor:pointer; transition:background-color 0.3s; display:none; }
 @media(max-width:767px){ .logout-btn{ display:none; } .logout-btn-mobile{ display:block; } }
-#mobile-header{ display:flex; background-color:#1565C0; color:#FFF; padding:calc(12px + env(safe-area-inset-top)) 16px 12px 16px; align-items:center; justify-content:space-between; position:fixed; top:0; left:0; right:0; z-index:1100; }
+#mobile-header{ display:flex; background-color:var(--ops-accent-hover); color:#FFF; padding:calc(12px + env(safe-area-inset-top)) 16px 12px 16px; align-items:center; justify-content:space-between; position:fixed; top:0; left:0; right:0; z-index:1100; }
 #mobile-header h2{ margin:0; font-size:1.1em; font-weight:400; color:#FFF; }
 #mobile-header .hamburger{ font-size:1.5em; cursor:pointer; }
 #overlay{ display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.3); z-index:900; }
@@ -19,14 +19,14 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 @media(max-width:767px){ #content{ margin-left:0; width:100%; padding-top:70px; } }
 #content h1{ font-weight:400; }
 .header-actions { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; gap:16px; flex-wrap:wrap; }
-.back-link { color:#1976D2; text-decoration:none; display:inline-flex; align-items:center; gap:8px; }
+.back-link { color:var(--ops-accent); text-decoration:none; display:inline-flex; align-items:center; gap:8px; }
 .module-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:14px; }
 .module-card { background:#FFF; border:1px solid #EEE; border-radius:12px; box-shadow:0 2px 4px rgba(0,0,0,0.08); padding:18px; display:flex; flex-direction:column; gap:10px; text-decoration:none; color:inherit; min-height:168px; }
-.module-card:focus,.module-card:hover { border-color:#1976D2; box-shadow:0 0 0 2px rgba(25,118,210,0.12); outline:none; }
+.module-card:focus,.module-card:hover { border-color:var(--ops-accent); box-shadow:0 0 0 2px rgba(25,118,210,0.12); outline:none; }
 .module-top { display:flex; justify-content:space-between; gap:10px; align-items:flex-start; }
 .module-name { font-size:1.08em; font-weight:500; color:#202124; }
 .module-badges { display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end; }
-.module-badge { align-self:flex-start; background:#E3F2FD; color:#1565C0; border-radius:999px; padding:4px 10px; font-size:0.82em; }
+.module-badge { align-self:flex-start; background:#E3F2FD; color:var(--ops-accent-hover); border-radius:999px; padding:4px 10px; font-size:0.82em; }
 .module-badge.disabled { background:#F1F3F4; color:#5F6368; }
 .module-description { color:#444; line-height:1.45; flex:1; }
 .module-meta { color:#666; font-size:0.9em; line-height:1.35; }

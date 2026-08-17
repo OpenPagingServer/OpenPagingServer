@@ -28,7 +28,7 @@ def handle_request():
     gateway_name = f'<a href="{docs_link}" target="_blank" rel="noopener">Multicast Gateway</a>' if data.get("show_online_docs", "1") == "1" else "Multicast Gateway"
     manage_servers_style = (
         "display:inline-flex; align-items:center; justify-content:center; height:36px; padding:0 18px; border:none; "
-        "border-radius:999px; background:#1976D2; color:#FFF; text-decoration:none; font-weight:500; cursor:pointer; "
+        "border-radius:999px; background:var(--ops-accent); color:#FFF; text-decoration:none; font-weight:500; cursor:pointer; "
         "box-shadow:0 1px 3px rgba(0,0,0,0.2), 0 1px 2px rgba(0,0,0,0.12); white-space:nowrap;"
         if data.get("allow_multicast_gateway", "0") == "1"
         else "display:none;"
@@ -42,7 +42,7 @@ def handle_request():
         .mg-modal {{ width:min(680px, 100%); background:#FFF; border-radius:18px; box-shadow:0 24px 60px rgba(0,0,0,0.25); }}
         .mg-modal.small {{ width:min(520px, 100%); }}
         .mg-modal-header {{ display:flex; align-items:center; justify-content:space-between; gap:12px; padding:22px 22px 0 22px; }}
-        .mg-modal-header h3 {{ margin:0; font-weight:500; color:#1976D2; }}
+        .mg-modal-header h3 {{ margin:0; font-weight:500; color:var(--ops-accent); }}
         .mg-modal-body {{ padding:18px 22px 22px 22px; }}
         .mg-modal-actions {{ display:flex; justify-content:flex-end; gap:10px; padding:0 22px 22px 22px; flex-wrap:wrap; }}
         .mg-icon-button {{ border:none; background:transparent; width:36px; height:36px; border-radius:50%; cursor:pointer; color:#5F6368; font-size:1.35em; }}
@@ -68,8 +68,8 @@ def handle_request():
         .mg-text-button, .mg-filled-button {{ border:none; border-radius:999px; padding:10px 16px; font-size:14px; cursor:pointer; }}
         .mg-text-button {{ background:#E8EEF5; color:#202124; }}
         .mg-text-button.danger {{ background:#FDECEC; color:#B71C1C; }}
-        .mg-filled-button {{ background:#1976D2; color:#FFF; }}
-        .mg-fab {{ width:40px; height:40px; border:none; border-radius:50%; background:#1976D2; color:#FFF; font-size:1.4em; line-height:1; cursor:pointer; }}
+        .mg-filled-button {{ background:var(--ops-accent); color:#FFF; }}
+        .mg-fab {{ width:40px; height:40px; border:none; border-radius:50%; background:var(--ops-accent); color:#FFF; font-size:1.4em; line-height:1; cursor:pointer; }}
         @media (max-width:767px) {{
             .general-toggle-actions {{ margin-left:0; }}
             .mg-modal-header {{ padding:18px 18px 0 18px; }}

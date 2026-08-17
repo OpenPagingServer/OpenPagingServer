@@ -3,7 +3,7 @@
     padding: 20px 12px;
     margin: 0;
     font-weight: 500;
-    background-color: #1565C0;
+    background-color: var(--ops-accent-hover);
     font-size: 1.2em;
     color: #FFF;
     box-sizing: border-box;

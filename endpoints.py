@@ -3292,10 +3292,10 @@ def sip_form_frame(body):
         "<style>body{font-family:Tahoma,sans-serif;margin:0;padding:20px;color:#202124;background:#fff}"
         ".form-surface,.surface{max-width:720px;background:#fff;border:1px solid #e6e8eb;border-radius:8px;padding:18px;box-shadow:0 1px 3px rgba(0,0,0,.08)}"
         ".grid{display:grid;gap:14px}.row{display:grid;gap:6px}label{font-weight:500}.control,input,select{padding:10px 11px;border:1px solid #ccd1d5;border-radius:6px;font:inherit;box-sizing:border-box;width:100%;background:#fff;color:#202124}.short-control,.short{max-width:180px}"
-        "button,.button{background:#1976D2;color:#fff;border:0;border-radius:6px;padding:10px 14px;font:inherit;cursor:pointer;justify-self:start;text-decoration:none}.danger{background:#C62828}"
+        "button,.button{background:var(--ops-accent);color:#fff;border:0;border-radius:6px;padding:10px 14px;font:inherit;cursor:pointer;justify-self:start;text-decoration:none}.danger{background:#C62828}"
         ".success{background:#E8F5E9;border:1px solid #A5D6A7;color:#1B5E20;padding:10px;border-radius:6px;margin-bottom:12px}.error{background:#FFEBEE;border:1px solid #EF9A9A;color:#B71C1C;padding:10px;border-radius:6px;margin-bottom:12px}.notice{background:#FFF8E1;border:1px solid #FFE082;color:#5D4037;padding:10px;border-radius:6px;margin-bottom:12px;line-height:1.4}.meta{color:#5f6368;margin:0 0 14px}.advanced{border:1px solid #e6e8eb;border-radius:6px;overflow:hidden}.advanced summary{cursor:pointer;padding:10px 11px;font-weight:500}.advanced-body{border-top:1px solid #e6e8eb;padding:12px;display:grid;gap:14px}"
         ".dropdown-checklist{position:relative}.dropdown-checklist summary{list-style:none;cursor:pointer;padding:10px 11px;border:1px solid #ccd1d5;border-radius:6px;background:#fff}.dropdown-checklist summary::-webkit-details-marker{display:none}.dropdown-panel{position:absolute;top:calc(100% + 6px);left:0;right:0;z-index:20;border:1px solid #d8dde2;border-radius:6px;padding:8px;display:grid;gap:6px;max-height:220px;overflow:auto;background:#fff;box-shadow:0 8px 18px rgba(0,0,0,.14)}"
-        ".md-checkbox-container{display:flex;align-items:center;position:relative;cursor:pointer;font-size:14px;font-weight:400;color:#202124;user-select:none;width:100%;gap:12px}.md-checkbox-container input{position:absolute;opacity:0;cursor:pointer;height:0;width:0}.md-checkmark{position:relative;display:inline-block;flex:0 0 auto;height:20px;width:20px;background:#fff;border:2px solid #5f6368;border-radius:2px;transition:all .2s}.md-checkbox-container:hover input ~ .md-checkmark{border-color:#202124}.md-checkbox-container input:checked ~ .md-checkmark{background:#1976D2;border-color:#1976D2}.md-checkmark:after{content:\"\";position:absolute;display:none;left:6px;top:2px;width:4px;height:10px;border:solid #fff;border-width:0 2px 2px 0;transform:rotate(45deg)}.md-checkbox-container input:checked ~ .md-checkmark:after{display:block}.md-checkbox-text{flex:1 1 auto;min-width:0}.check.disabled{opacity:.55}.switch-row{display:flex;align-items:center;gap:10px}.switch{position:relative;width:44px;height:24px}.switch input{opacity:0;width:0;height:0}.slider{position:absolute;cursor:pointer;inset:0;background:#9aa0a6;border-radius:999px;transition:.2s}.slider:before{content:\"\";position:absolute;height:18px;width:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 2px rgba(0,0,0,.25)}.switch input:checked + .slider{background:#1976D2}.switch input:checked + .slider:before{transform:translateX(20px)}.hint{color:#5f6368;font-size:.9em}"
+        ".md-checkbox-container{display:flex;align-items:center;position:relative;cursor:pointer;font-size:14px;font-weight:400;color:#202124;user-select:none;width:100%;gap:12px}.md-checkbox-container input{position:absolute;opacity:0;cursor:pointer;height:0;width:0}.md-checkmark{position:relative;display:inline-block;flex:0 0 auto;height:20px;width:20px;background:#fff;border:2px solid #5f6368;border-radius:2px;transition:all .2s}.md-checkbox-container:hover input ~ .md-checkmark{border-color:#202124}.md-checkbox-container input:checked ~ .md-checkmark{background:var(--ops-accent);border-color:var(--ops-accent)}.md-checkmark:after{content:\"\";position:absolute;display:none;left:6px;top:2px;width:4px;height:10px;border:solid #fff;border-width:0 2px 2px 0;transform:rotate(45deg)}.md-checkbox-container input:checked ~ .md-checkmark:after{display:block}.md-checkbox-text{flex:1 1 auto;min-width:0}.check.disabled{opacity:.55}.switch-row{display:flex;align-items:center;gap:10px}.switch{position:relative;width:44px;height:24px}.switch input{opacity:0;width:0;height:0}.slider{position:absolute;cursor:pointer;inset:0;background:#9aa0a6;border-radius:999px;transition:.2s}.slider:before{content:\"\";position:absolute;height:18px;width:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 2px rgba(0,0,0,.25)}.switch input:checked + .slider{background:var(--ops-accent)}.switch input:checked + .slider:before{transform:translateX(20px)}.hint{color:#5f6368;font-size:.9em}"
         "@media(prefers-color-scheme:dark){body{background:#1e1e1e;color:#e0e0e0}.form-surface,.surface{background:#232323;border-color:#333;box-shadow:none}.control,input,select,.dropdown-checklist summary,.dropdown-panel{background:#171717;border-color:#3a3a3a;color:#eee}.notice{background:#332800;border-color:#5f4b00;color:#FFE8A3}.advanced{border-color:#333}.advanced-body{border-top-color:#333}button,.button{background:#BB86FC;color:#000}.danger{background:#EF9A9A}.meta,.hint,.md-checkbox-container{color:#aaa}.md-checkmark{border-color:#9AA0A6;background:#171717}.md-checkbox-container:hover input ~ .md-checkmark{border-color:#E8EAED}.md-checkbox-container input:checked ~ .md-checkmark{background:#8AB4F8;border-color:#8AB4F8}.md-checkmark:after{border-color:#171717}.switch input:checked + .slider{background:#BB86FC}}</style>"
         + body
     )
@@ -4808,6 +4808,7 @@ class SipOutputSession:
         import sip.index as sip_index
 
         cid_number, cnam_name = sip_output_caller_values(self.row, self.metadata)
+<<<<<<< HEAD
         trunk_id = str(self.row.get("trunk_id") or "").strip()
         if not trunk_id:
             raise RuntimeError("SIP output row is missing trunk_id")
@@ -4815,6 +4816,9 @@ class SipOutputSession:
             f"siptrunks place_call row_id={self.row.get('id')} trunk_id={trunk_id} "
             f"number={self.row.get('number')} mode={self.mode}"
         )
+=======
+        trunk_id = self.row.get("trunk_id")
+>>>>>>> e68d55eca441e857c5354cca8b59252ee3ad0c6d
         trunk_fallback = {
             "id": trunk_id,
             "name": self.row.get("trunk_name"),
@@ -4829,6 +4833,7 @@ class SipOutputSession:
             "connected_server": self.row.get("trunk_connected_server"),
             "connected_transport": self.row.get("trunk_connected_transport"),
         }
+<<<<<<< HEAD
         place = sip_index.sip_server.place_outbound_call
         supports_fallback = True
         try:
@@ -4837,11 +4842,17 @@ class SipOutputSession:
         except (TypeError, ValueError):
             supports_fallback = True
         kwargs = dict(
+=======
+        return sip_index.sip_server.place_outbound_call(
+            trunk_id,
+            self.row.get("number"),
+>>>>>>> e68d55eca441e857c5354cca8b59252ee3ad0c6d
             caller_id_number=cid_number,
             caller_id_name=cnam_name,
             alert_info_value=sip_output_alert_value(self.row),
             custom_headers=sip_output_headers(self.row),
             answer_timeout=answer_timeout,
+            trunk_fallback=trunk_fallback,
         )
         if supports_fallback:
             kwargs["trunk_fallback"] = trunk_fallback
@@ -5345,7 +5356,7 @@ MULTICAST_RTP_FORM_CSS = """<style>
 .stream-row.dragging{opacity:.5}
 .stream-url{flex:1 1 auto;min-width:0}
 .icon-btn{background:transparent;border:0;padding:2px 4px;margin:0;color:#5f6368;cursor:pointer;font-size:14px;line-height:1;border-radius:0;box-shadow:none}
-.icon-btn:hover{color:#1976D2}
+.icon-btn:hover{color:var(--ops-accent)}
 .icon-btn.trash{color:#C62828}
 .icon-btn.trash:hover{color:#B71C1C}
 .icon-btn:disabled{opacity:.35;cursor:default}
@@ -5368,8 +5379,8 @@ MULTICAST_RTP_FORM_CSS = """<style>
 .mdc-radio-row:hover{background:rgba(25,118,210,.06)}
 .mdc-radio-input{position:absolute;opacity:0;width:0;height:0;margin:0}
 .mdc-radio-circle{flex:0 0 auto;position:relative;width:20px;height:20px;margin-top:1px;border:2px solid #5f6368;border-radius:50%;box-sizing:border-box;transition:border-color .15s ease}
-.mdc-radio-circle::after{content:"";position:absolute;top:50%;left:50%;width:10px;height:10px;border-radius:50%;background:#1976D2;transform:translate(-50%,-50%) scale(0);transition:transform .15s ease}
-.mdc-radio-input:checked + .mdc-radio-circle{border-color:#1976D2}
+.mdc-radio-circle::after{content:"";position:absolute;top:50%;left:50%;width:10px;height:10px;border-radius:50%;background:var(--ops-accent);transform:translate(-50%,-50%) scale(0);transition:transform .15s ease}
+.mdc-radio-input:checked + .mdc-radio-circle{border-color:var(--ops-accent)}
 .mdc-radio-input:checked + .mdc-radio-circle::after{transform:translate(-50%,-50%) scale(1)}
 .mdc-radio-input:focus-visible + .mdc-radio-circle{box-shadow:0 0 0 4px rgba(25,118,210,.2)}
 .mdc-radio-text{display:flex;flex-direction:column;line-height:1.35}
@@ -5378,7 +5389,7 @@ MULTICAST_RTP_FORM_CSS = """<style>
 .codec-note{display:flex;align-items:flex-start;gap:6px;font-size:.84em;margin:4px 0 0;max-width:360px}
 .codec-note .codec-note-icon{flex:0 0 auto;line-height:1.4}
 .codec-note.warn{color:#B7791F}
-.codec-note.info{color:#1976D2}
+.codec-note.info{color:var(--ops-accent)}
 @media(prefers-color-scheme:dark){.standby-block{border-color:#333}.icon-btn{color:#bbb}.icon-btn.trash{color:#EF9A9A}.stream-warn{color:#F6C244}.stream-hint{color:#aaa}.codec-note.warn{color:#F6C244}.codec-note.info{color:#64B5F6}.mdc-radio-row:hover{background:rgba(100,181,246,.12)}.mdc-radio-circle{border-color:#aaa}.mdc-radio-circle::after{background:#64B5F6}.mdc-radio-input:checked + .mdc-radio-circle{border-color:#64B5F6}.mdc-radio-desc{color:#aaa}}
 </style>"""
 
@@ -7912,7 +7923,7 @@ html.sm-modal-active .message-icon-picker-backdrop.open{{visibility:visible !imp
 <div class="form-group">
 <label class="main-label">Recipients</label>
 <div class="checkbox-row">
-<label class="md-checkbox-container"><input type="checkbox" name="send_all" id="send_all" value="1" onchange="toggleRecipients()"{" checked" if send_all else ""}><span class="md-checkmark"></span><span class="text" style="font-weight:bold;color:#1976D2;">All Recipients</span></label>
+<label class="md-checkbox-container"><input type="checkbox" name="send_all" id="send_all" value="1" onchange="toggleRecipients()"{" checked" if send_all else ""}><span class="md-checkmark"></span><span class="text" style="font-weight:bold;color:var(--ops-accent);">All Recipients</span></label>
 {rows_html}
 </div>
 </div>

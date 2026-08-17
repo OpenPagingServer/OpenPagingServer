@@ -510,6 +510,144 @@ def detect_desktop_client_context():
         # expiry checks still apply regardless of cookie lifetime.
         session.permanent = True
 
+
+# Minimum browser versions that support the CSS (flexbox `gap`, `inset`
+# shorthand) and JavaScript (async/await, Clipboard API, getUserMedia)
+# features the web UI relies on. Anything older is served a 403 explaining
+# that the browser is unsupported. See render_unsupported_browser_response().
+SUPPORTED_BROWSER_MIN_VERSION = {
+    "chrome": 87,
+    "chromium": 87,
+    "edge": 87,
+    "opera": 73,
+    "firefox": 66,
+}
+SUPPORTED_SAFARI_MIN_VERSION = (14, 1)
+SUPPORTED_IOS_WEBKIT_MIN_VERSION = (14, 5)
+BROWSER_GATE_EXEMPT_PREFIXES = ("/api/", "/assets/", "/bundled-assets/", "/.well-known/")
+BROWSER_GATE_EXEMPT_PATHS = {"/favicon.ico", "/robots.txt"}
+
+
+def _ua_version_int(token, low):
+    match = re.search(re.escape(token) + r"(\d+)", low)
+    return int(match.group(1)) if match else None
+
+
+def browser_meets_minimum(user_agent):
+    """Classify a User-Agent string.
+
+    Returns False for a recognized browser that is older than the supported
+    minimum (or a legacy engine such as Internet Explorer / EdgeHTML / Presto
+    Opera). Returns True for a supported browser. Returns None for anything we
+    do not recognize as a browser (API clients, tooling, bots, health checks,
+    desktop webviews, ...), which is always allowed through.
+    """
+    ua = str(user_agent or "").strip()
+    if not ua:
+        return None
+    low = ua.lower()
+
+    # Internet Explorer / legacy Trident engine -- never supported.
+    if "msie " in low or "trident/" in low:
+        return False
+
+    # iOS / iPadOS: every browser shares the system WebKit tied to the OS
+    # version, so gate on the reported OS version rather than the app version.
+    if "iphone" in low or "ipod" in low or ("ipad" in low and "version/" in low):
+        match = re.search(r"os (\d+)[_.](\d+)", low)
+        if match:
+            return (int(match.group(1)), int(match.group(2))) >= SUPPORTED_IOS_WEBKIT_MIN_VERSION
+        return None
+
+    # Legacy (pre-Chromium, EdgeHTML) Microsoft Edge -- "Edge/" not "Edg/".
+    if re.search(r"\bedge/\d", low):
+        return False
+
+    # Chromium-based Microsoft Edge ("Edg/" desktop, "EdgA/" Android).
+    if "edg/" in low or "edga/" in low:
+        version = _ua_version_int("edg/", low) or _ua_version_int("edga/", low)
+        return version is None or version >= SUPPORTED_BROWSER_MIN_VERSION["edge"]
+
+    # Chromium-based Opera ("OPR/").
+    if "opr/" in low:
+        version = _ua_version_int("opr/", low)
+        return version is None or version >= SUPPORTED_BROWSER_MIN_VERSION["opera"]
+    # Legacy Presto Opera ("Opera/9.80 ... Version/12.x") -- always outdated.
+    if low.startswith("opera/"):
+        return False
+
+    # Firefox and forks that report a Firefox version.
+    if "firefox/" in low and "seamonkey" not in low:
+        version = _ua_version_int("firefox/", low)
+        return version is None or version >= SUPPORTED_BROWSER_MIN_VERSION["firefox"]
+
+    # Chrome / Chromium -- checked after Edge/Opera, which also embed "Chrome/".
+    if "chrome/" in low or "chromium/" in low or "crios/" in low:
+        version = (
+            _ua_version_int("chrome/", low)
+            or _ua_version_int("chromium/", low)
+            or _ua_version_int("crios/", low)
+        )
+        return version is None or version >= SUPPORTED_BROWSER_MIN_VERSION["chrome"]
+
+    # Desktop Safari -- "Version/x.y ... Safari/" without a Chrome token.
+    if "safari/" in low and "version/" in low:
+        match = re.search(r"version/(\d+)\.(\d+)", low)
+        if match:
+            return (int(match.group(1)), int(match.group(2))) >= SUPPORTED_SAFARI_MIN_VERSION
+        return None
+
+    return None
+
+
+def render_unsupported_browser_response():
+    if show_online_docs_on_error_page():
+        docs = (
+            ' <a href="http://docs.openpagingserver.org/user/web/supportedbrowsers">'
+            "Learn more about supported browsers</a>."
+        )
+    else:
+        docs = ""
+    body = (
+        "<!DOCTYPE html>\n"
+        '<html lang="en">\n'
+        "<head>\n"
+        '<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        "<title>Your browser is outdated and unsupported</title>\n"
+        "<style>body{font-family:Arial,Helvetica,sans-serif;margin:0;padding:40px;"
+        "color:#333;background:#fff;}h1{font-weight:normal;}"
+        "p{max-width:600px;line-height:1.5;}a{color:#1565C0;}</style>\n"
+        "</head>\n"
+        "<body>\n"
+        "<h1>Your browser is outdated and unsupported</h1>\n"
+        "<p>Your browser is too old to support dependencies of this service and to "
+        "securely connect to the server. Please update your browser." + docs + "</p>\n"
+        "</body>\n"
+        "</html>\n"
+    )
+    response = Response(body, status=403, mimetype="text/html")
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.before_request
+def enforce_supported_browser():
+    if request.method not in {"GET", "HEAD"}:
+        return None
+    path = request.path or ""
+    if path in BROWSER_GATE_EXEMPT_PATHS or any(
+        path.startswith(prefix) for prefix in BROWSER_GATE_EXEMPT_PREFIXES
+    ):
+        return None
+    # Desktop client webviews (which may embed an old engine) are always allowed.
+    if desktop_client_context():
+        return None
+    if browser_meets_minimum(request.headers.get("User-Agent")) is False:
+        return render_unsupported_browser_response()
+    return None
+
+
 @app.before_request
 def enforce_web_rate_limits():
     if str(os.getenv("WEB_RATE_LIMIT_ENABLE", "1")).strip().lower() in {"0", "false", "no", "off"}:
@@ -4100,8 +4238,8 @@ def legacy_page(title, ctx, active, style, content, extra_script="", extra_after
 #ops-page-banners .system-banner-close:hover{background:rgba(0,0,0,.08)}
 #ops-page-banners .system-banner-danger{background:#FDECEA;border-color:#F4B1AB;color:#A50E0E}
 #ops-page-banners .system-banner-info{background:#E3F2FD;border-color:#90CAF9;color:#0D47A1}
-#ops-page-banners .system-banner-action{display:inline-block;flex:0 0 auto;background:#1565C0;color:#FFF;padding:3px 14px;border-radius:999px;text-decoration:none;font-size:0.9em;align-self:center}
-#ops-page-banners .system-banner-action:hover{background:#0D47A1}
+#ops-page-banners .system-banner-action{display:inline-block;flex:0 0 auto;background:var(--ops-accent-hover);color:#FFF;padding:3px 14px;border-radius:999px;text-decoration:none;font-size:0.9em;align-self:center}
+#ops-page-banners .system-banner-action:hover{background:var(--ops-accent-hover)}
 #ops-page-banners .system-banner-warning{background:#FFF8E1;border-color:#F2C94C;color:#8A5A00}
 #ops-page-banners .system-banner-warning-expiration{background:#FFF3E0;border-color:#FB8C00;color:#B85C00}
 body.has-system-banners #sidebar{top:var(--ops-banner-offset, 0px)!important;height:calc(100vh - var(--ops-banner-offset, 0px))!important}
@@ -4162,7 +4300,7 @@ document.addEventListener('keydown', function(event) {
 {style}
 {common_sidebar_style}
 </style>
-</head>
+<link rel="stylesheet" href="/assets/theme.css"></head>
 <body class="{'has-system-banners' if banner_markup else ''}" data-page="{h(active)}">
 {f'<div id="ops-page-banners">{banner_markup}</div>' if banner_markup else ''}
 <script>
@@ -4335,24 +4473,24 @@ def sidebar(active="dashboard", is_admin=False, is_receiver=False):
 
 BASE_CSS = """
 body,html{margin:0;padding:0;font-family:Tahoma,Arial,sans-serif;background:#fff;color:#222;min-height:100%}
-a{color:#1976d2;text-decoration:none}a:hover{text-decoration:underline}
-.layout{display:flex;min-height:100vh}.sidebar{width:220px;background:#1976d2;color:white;position:fixed;inset:0 auto 0 0;display:flex;flex-direction:column;box-shadow:2px 0 8px rgba(0,0,0,.2)}
-.sidebar a,.sidebar .brand{color:white;display:flex;align-items:center;gap:10px;padding:12px 20px;border-bottom:1px solid rgba(255,255,255,.14);box-sizing:border-box}.sidebar a.active,.sidebar a:hover{background:#1565c0;text-decoration:none}.sidebar .nav-icon{width:24px;display:inline-flex;justify-content:center;flex:0 0 24px}.sidebar .logout{margin-top:auto;background:#c62828}.sidebar .logout:hover{background:#b71c1c!important}.sidebar-logo{display:block;max-width:170px;max-height:64px;object-fit:contain;margin:auto}
-.content{margin-left:220px;padding:24px;box-sizing:border-box;width:calc(100% - 220px)}h1,h2{font-weight:400;color:#1976d2}.card{border:1px solid #e5e5e5;border-radius:8px;padding:16px;margin:0 0 16px;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.08)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px}.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-input,select,textarea{box-sizing:border-box;width:100%;padding:10px;border:1px solid #bbb;border-radius:4px;font:inherit;background:#fff;color:#222}textarea{min-height:110px}.button,button{display:inline-flex;align-items:center;gap:8px;border:0;border-radius:4px;background:#1976d2;color:#fff;padding:10px 14px;font:inherit;cursor:pointer;text-decoration:none}.button:hover,button:hover{background:#1565c0;text-decoration:none}.danger{background:#c62828}.danger:hover{background:#b71c1c}.muted{color:#666}.table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid #eee;text-align:left;padding:10px;vertical-align:top}.flash{padding:12px;border-radius:4px;margin-bottom:16px}.success{background:#e8f5e9;color:#1b5e20}.error{background:#ffebee;color:#b71c1c}.tabs{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}.tabs a{padding:10px 14px;background:#f5f5f5;border-radius:5px 5px 0 0}.tabs a.active{background:#1976d2;color:#fff;text-decoration:none}.pill{display:inline-block;padding:4px 8px;border-radius:999px;background:#e3f2fd;color:#1565c0}
-.md-checkbox-container{display:flex;align-items:center;position:relative;cursor:pointer;font-size:14px;font-weight:500;color:#222;user-select:none;gap:12px}.md-checkbox-container input{position:absolute;opacity:0;cursor:pointer;height:0;width:0}.md-checkmark{position:relative;display:inline-block;flex:0 0 auto;height:20px;width:20px;background:#fff;border:2px solid #5f6368;border-radius:2px;transition:all .2s}.md-checkbox-container:hover input ~ .md-checkmark{border-color:#202124}.md-checkbox-container input:checked ~ .md-checkmark{background:#1976D2;border-color:#1976D2}.md-checkmark:after{content:"";position:absolute;display:none;left:6px;top:2px;width:4px;height:10px;border:solid #fff;border-width:0 2px 2px 0;transform:rotate(45deg)}.md-checkbox-container input:checked ~ .md-checkmark:after{display:block}
+a{color:var(--ops-accent);text-decoration:none}a:hover{text-decoration:underline}
+.layout{display:flex;min-height:100vh}.sidebar{width:220px;background:var(--ops-accent);color:white;position:fixed;inset:0 auto 0 0;display:flex;flex-direction:column;box-shadow:2px 0 8px rgba(0,0,0,.2)}
+.sidebar a,.sidebar .brand{color:white;display:flex;align-items:center;gap:10px;padding:12px 20px;border-bottom:1px solid rgba(255,255,255,.14);box-sizing:border-box}.sidebar a.active,.sidebar a:hover{background:var(--ops-accent-hover);text-decoration:none}.sidebar .nav-icon{width:24px;display:inline-flex;justify-content:center;flex:0 0 24px}.sidebar .logout{margin-top:auto;background:#c62828}.sidebar .logout:hover{background:#b71c1c!important}.sidebar-logo{display:block;max-width:170px;max-height:64px;object-fit:contain;margin:auto}
+.content{margin-left:220px;padding:24px;box-sizing:border-box;width:calc(100% - 220px)}h1,h2{font-weight:400;color:var(--ops-accent)}.card{border:1px solid #e5e5e5;border-radius:8px;padding:16px;margin:0 0 16px;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.08)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px}.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+input,select,textarea{box-sizing:border-box;width:100%;padding:10px;border:1px solid #bbb;border-radius:4px;font:inherit;background:#fff;color:#222}textarea{min-height:110px}.button,button{display:inline-flex;align-items:center;gap:8px;border:0;border-radius:4px;background:var(--ops-accent);color:#fff;padding:10px 14px;font:inherit;cursor:pointer;text-decoration:none}.button:hover,button:hover{background:var(--ops-accent-hover);text-decoration:none}.danger{background:#c62828}.danger:hover{background:#b71c1c}.muted{color:#666}.table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid #eee;text-align:left;padding:10px;vertical-align:top}.flash{padding:12px;border-radius:4px;margin-bottom:16px}.success{background:#e8f5e9;color:#1b5e20}.error{background:#ffebee;color:#b71c1c}.tabs{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}.tabs a{padding:10px 14px;background:#f5f5f5;border-radius:5px 5px 0 0}.tabs a.active{background:var(--ops-accent);color:#fff;text-decoration:none}.pill{display:inline-block;padding:4px 8px;border-radius:999px;background:#e3f2fd;color:var(--ops-accent-hover)}
+.md-checkbox-container{display:flex;align-items:center;position:relative;cursor:pointer;font-size:14px;font-weight:500;color:#222;user-select:none;gap:12px}.md-checkbox-container input{position:absolute;opacity:0;cursor:pointer;height:0;width:0}.md-checkmark{position:relative;display:inline-block;flex:0 0 auto;height:20px;width:20px;background:#fff;border:2px solid #5f6368;border-radius:2px;transition:all .2s}.md-checkbox-container:hover input ~ .md-checkmark{border-color:#202124}.md-checkbox-container input:checked ~ .md-checkmark{background:var(--ops-accent);border-color:var(--ops-accent)}.md-checkmark:after{content:"";position:absolute;display:none;left:6px;top:2px;width:4px;height:10px;border:solid #fff;border-width:0 2px 2px 0;transform:rotate(45deg)}.md-checkbox-container input:checked ~ .md-checkmark:after{display:block}
 @media(max-width:767px){.layout{display:block}.sidebar{position:static;width:100%;min-height:auto}.content{margin-left:0;width:100%;padding:16px}.table{display:block;overflow-x:auto}}
 @media(prefers-color-scheme:dark){body,html{background:#121212;color:#e0e0e0}.sidebar{background:#424242}.sidebar a.active,.sidebar a:hover{background:#505050}.card{background:#1e1e1e;border-color:#333;box-shadow:none}.table th,.table td{border-color:#333}input,select,textarea{background:#222;color:#e0e0e0;border-color:#555}h1,h2{color:#90caf9}.muted{color:#bbb}.tabs a{background:#222}.pill{background:#263238;color:#90caf9}.md-checkbox-container{color:#E0E0E0}.md-checkmark{border-color:#9AA0A6;background:#1E1E1E}.md-checkbox-container:hover input ~ .md-checkmark{border-color:#E8EAED}.md-checkbox-container input:checked ~ .md-checkmark{background:#8AB4F8;border-color:#8AB4F8}.md-checkmark:after{border-color:#1E1E1E}}
 """
 
 LEGACY_GENERIC_STYLE = """
 body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:300; background-color:#FFF; height:100%; }
-#sidebar { width:220px; background-color:#1976D2; color:#FFF; height:100vh; position:fixed; top:0; left:0; display:flex; flex-direction:column; box-shadow:2px 0 8px rgba(0,0,0,0.2); transition:transform 0.3s ease; z-index:1200; }
+#sidebar { width:220px; background-color:var(--ops-accent); color:#FFF; height:100vh; position:fixed; top:0; left:0; display:flex; flex-direction:column; box-shadow:2px 0 8px rgba(0,0,0,0.2); transition:transform 0.3s ease; z-index:1200; }
 @media (max-width:767px){ #sidebar{ transform:translateX(-100%); } #sidebar.open{ transform:translateX(0); } }
 #sidebar a,.logout-btn,.logout-btn-mobile,.admin-only,.desktop-app-settings-btn{ color:#FFF; padding:12px 20px; display:flex; align-items:center; gap:10px; border-bottom:1px solid rgba(255,255,255,0.1); text-decoration:none; transition:background 0.3s; font-size:0.9em; text-align:left; box-sizing:border-box; }
 #sidebar .nav-icon,.logout-btn .nav-icon,.logout-btn-mobile .nav-icon,.admin-only .nav-icon,.desktop-app-settings-btn .nav-icon { width:20px; display:inline-flex; justify-content:center; flex:0 0 20px; }
 #sidebar .nav-label,.logout-btn .nav-label,.logout-btn-mobile .nav-label,.admin-only .nav-label,.desktop-app-settings-btn .nav-label { min-width:0; }
-#sidebar a:hover,#sidebar a.active{ background-color:#1565C0; }
+#sidebar a:hover,#sidebar a.active{ background-color:var(--ops-accent-hover); }
 .logout-btn{ background-color:#C62828; border:none; cursor:pointer; margin-top:auto; transition:background-color 0.3s; }
 .desktop-app-settings-btn{ background-color:transparent; border:none; border-radius:0; cursor:pointer; margin-top:0; transition:background-color 0.3s; width:100%; font-family:inherit; }
 .login-btn{ background-color:#2E7D32; border:none; cursor:pointer; margin-top:auto; transition:background-color 0.3s; color:#FFF; padding:12px 20px; display:flex; align-items:center; gap:10px; border-bottom:1px solid rgba(255,255,255,0.1); text-decoration:none; font-size:0.9em; text-align:left; box-sizing:border-box; width:100%; }
@@ -4361,7 +4499,7 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .logout-btn-mobile{ background-color:#C62828; border:none; cursor:pointer; transition:background-color 0.3s; display:none; }
 .logout-btn:hover,.logout-btn-mobile:hover{ background-color:#B71C1C; }
 @media(max-width:767px){ .logout-btn{ display:none; } .logout-btn-mobile{ display:flex; } }
-#mobile-header{ display:flex; background-color:#1565C0; color:#FFF; padding:calc(12px + env(safe-area-inset-top)) 16px 12px 16px; align-items:center; justify-content:space-between; position:fixed; top:0; left:0; right:0; z-index:1100; }
+#mobile-header{ display:flex; background-color:var(--ops-accent-hover); color:#FFF; padding:calc(12px + env(safe-area-inset-top)) 16px 12px 16px; align-items:center; justify-content:space-between; position:fixed; top:0; left:0; right:0; z-index:1100; }
 #mobile-header h2{ margin:0; font-size:1.1em; font-weight:400; color:#FFF; }
 #mobile-header .hamburger{ font-size:1.5em; cursor:pointer; }
 #overlay{ display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.3); z-index:900; }
@@ -4375,20 +4513,20 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .actions{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
 .table{ width:100%; border-collapse:collapse; }
 .table th,.table td{ border-bottom:1px solid #EEE; padding:10px; text-align:left; vertical-align:top; }
-.button,button{ background:#1976D2; color:#FFF; border:none; padding:10px 16px; border-radius:6px; font-size:14px; cursor:pointer; text-decoration:none; display:inline-flex; align-items:center; gap:8px; font-family:inherit; }
-.button:hover,button:hover{ background:#1565C0; text-decoration:none; }
+.button,button{ background:var(--ops-accent); color:#FFF; border:none; padding:10px 16px; border-radius:6px; font-size:14px; cursor:pointer; text-decoration:none; display:inline-flex; align-items:center; gap:8px; font-family:inherit; }
+.button:hover,button:hover{ background:var(--ops-accent-hover); text-decoration:none; }
 .danger{ background:#C62828; }
 .danger:hover{ background:#B71C1C; }
 .muted{ color:#777; }
 input,select,textarea{ box-sizing:border-box; padding:10px; border:1px solid #DDD; border-radius:4px; background:#FFF; color:#000; font-family:inherit; }
 label{ display:block; margin-bottom:10px; }
-.md-checkbox-container{display:flex;align-items:center;position:relative;cursor:pointer;font-size:14px;font-weight:500;color:#202124;user-select:none;gap:12px}.md-checkbox-container input{position:absolute;opacity:0;cursor:pointer;height:0;width:0}.md-checkmark{position:relative;display:inline-block;flex:0 0 auto;height:20px;width:20px;background:#FFF;border:2px solid #5f6368;border-radius:2px;transition:all .2s}.md-checkbox-container:hover input ~ .md-checkmark{border-color:#202124}.md-checkbox-container input:checked ~ .md-checkmark{background:#1976D2;border-color:#1976D2}.md-checkmark:after{content:"";position:absolute;display:none;left:6px;top:2px;width:4px;height:10px;border:solid #FFF;border-width:0 2px 2px 0;transform:rotate(45deg)}.md-checkbox-container input:checked ~ .md-checkmark:after{display:block}
+.md-checkbox-container{display:flex;align-items:center;position:relative;cursor:pointer;font-size:14px;font-weight:500;color:#202124;user-select:none;gap:12px}.md-checkbox-container input{position:absolute;opacity:0;cursor:pointer;height:0;width:0}.md-checkmark{position:relative;display:inline-block;flex:0 0 auto;height:20px;width:20px;background:#FFF;border:2px solid #5f6368;border-radius:2px;transition:all .2s}.md-checkbox-container:hover input ~ .md-checkmark{border-color:#202124}.md-checkbox-container input:checked ~ .md-checkmark{background:var(--ops-accent);border-color:var(--ops-accent)}.md-checkmark:after{content:"";position:absolute;display:none;left:6px;top:2px;width:4px;height:10px;border:solid #FFF;border-width:0 2px 2px 0;transform:rotate(45deg)}.md-checkbox-container input:checked ~ .md-checkmark:after{display:block}
 .flash{ padding:12px 14px; border-radius:8px; margin-bottom:14px; }
 .success{ background:#E6F4EA; border:1px solid #CEEAD6; color:#137333; }
 .error{ background:#FCE8E6; border:1px solid #F6AEA9; color:#A50E0E; }
 .tabs{ display:flex; gap:8px; margin-bottom:16px; flex-wrap:wrap; }
 .tabs a{ padding:10px 14px; background:#F5F5F5; border-radius:5px 5px 0 0; text-decoration:none; }
-.tabs a.active{ background:#1976D2; color:#FFF; }
+.tabs a.active{ background:var(--ops-accent); color:#FFF; }
 @media(prefers-color-scheme:dark){
 body,html{ background-color:#121212; color:#E0E0E0; }
 #sidebar{ background-color:#424242; }
@@ -4427,7 +4565,7 @@ def module_page(title, body, active="endpoints", user=None, status=200):
     return Response(
         render_template_string(
             """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{{ title }}</title><style>{{ css }}</style></head><body><main class="content" style="margin-left:0;width:100%">{{ flashes|safe }}{{ body|safe }}</main></body></html>""",
+<title>{{ title }}</title><style>{{ css }}</style><link rel="stylesheet" href="/assets/theme.css"></head><body><main class="content" style="margin-left:0;width:100%">{{ flashes|safe }}{{ body|safe }}</main></body></html>""",
             title=title,
             css=BASE_CSS,
             flashes=flashes,
@@ -5353,7 +5491,7 @@ def desktop_sso_complete():
       .login-banner h3 {{ margin: 0 0 5px 0; font-size: 15px; font-weight: 700; text-transform: uppercase; }}
       .login-banner p {{ margin: 0; font-size: 14px; line-height: 1.4; }}
       .login-box {{ background: #fff; padding: 30px; border-radius: 6px; box-shadow: 0 4px 6px rgba(0,0,0,0.1),0 1px 3px rgba(0,0,0,0.08); max-width: 390px; width: min(92vw, 390px); text-align: center; animation: fadeInPage 1.5s ease-in-out; }}
-      .login-box h2 {{ color: #1976d2; font-weight: 500; margin-bottom: 14px; margin-top: 0; }}
+      .login-box h2 {{ color: var(--ops-accent); font-weight: 500; margin-bottom: 14px; margin-top: 0; }}
       .sso-status-icon {{ font-size: 44px; margin-bottom: 14px; }}
       .sso-status-icon.success {{ color: #2e7d32; }}
       .sso-status-icon.error {{ color: #c62828; }}
@@ -5380,7 +5518,7 @@ def desktop_sso_complete():
       }}
       @media (prefers-color-scheme: dark) and (max-width: 768px) {{ body {{ background: #121212; }} }}
     </style>
-  </head>
+  <link rel="stylesheet" href="/assets/theme.css"></head>
   <body>
     <div class="background-slideshow"></div>
     {logo_html}

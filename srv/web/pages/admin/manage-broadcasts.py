@@ -27,7 +27,7 @@ BROADCASTS_STYLE = r"""
 .broadcast-head{background:#F8F9FA;color:#5F6368;font-size:0.78em;font-weight:600;letter-spacing:.03em;text-transform:uppercase;}
 .broadcast-row{border-top:1px solid #ECEFF1;}
 .broadcast-row.emergency{box-shadow:inset 4px 0 0 #C62828;}
-.broadcast-row.live{box-shadow:inset 4px 0 0 #1976D2;}
+.broadcast-row.live{box-shadow:inset 4px 0 0 var(--ops-accent);}
 .broadcast-primary{min-width:0;}
 .broadcast-title{font-weight:500;color:#202124;line-height:1.28;overflow-wrap:anywhere;font-size:0.97em;}
 .broadcast-subtitle{margin-top:2px;color:#5F6368;font-size:0.86em;line-height:1.34;white-space:pre-wrap;}
