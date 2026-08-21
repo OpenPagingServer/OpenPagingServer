@@ -1,5 +1,4 @@
-
-import base64
+import base64
 import hashlib
 import hmac
 import html
@@ -5259,6 +5258,10 @@ def login_sso_start():
             session.pop(DESKTOP_SSO_SESSION_KEY, None)
             return desktop_sso_finish_redirect(desktop_sso_request_id, ok=False, message="SSO is not enabled.")
         return redirect("/login")
+    # Guard against auto-redirect loops: if the login page keeps bouncing to the
+    # identity provider without a login ever completing (e.g. the browser already
+    # holds an identity-provider session that silently redirects straight back),
+    # stop auto-redirecting and fall back to the manual retry screen.
     if not desktop_sso_request_id:
         now_value = time.time()
         recent_starts = [
@@ -5280,6 +5283,8 @@ def login_sso_start():
         if provider == "oidc":
             client = build_oidc_client(config)
             redirect_uri = request.url_root.rstrip("/") + "/login/oidc/callback"
+            # Force the identity provider to prompt for authentication instead of
+            # silently reusing whatever account is already signed in to the browser.
             return client.authorize_redirect(redirect_uri, prompt="login")
         auth = build_saml_auth(config)
         return redirect(auth.login(return_to=request.url_root.rstrip("/") + "/", force_authn=True))
