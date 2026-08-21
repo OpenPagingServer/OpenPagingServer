@@ -9,9 +9,15 @@ import time
 from pathlib import Path
 
 try:
-    from sip.codec import encode_sip_rtp_payload, decode_sip_rtp_payload
+    from sip.codec import (
+        decode_sip_rtp_payload_to_pcm_s16le_48k_stereo,
+        encode_sip_rtp_payload,
+    )
 except ImportError:
-    from codec import encode_sip_rtp_payload, decode_sip_rtp_payload
+    from codec import (
+        decode_sip_rtp_payload_to_pcm_s16le_48k_stereo,
+        encode_sip_rtp_payload,
+    )
 
 trigger_name = "page"
 
@@ -123,6 +129,8 @@ class SipLivePageSession(livepaged.LivePageSession):
         self.codec_info = {"payload_type": 0, "samples_per_frame": 160}
         self.codec_encoder = None
         self.codec_decoder = None
+        self.pace_pcm_forwarding = False
+        self.next_pcm_forward_time = None
         page_debug(
             f"session_init stream={self.stream_id} remote={remote_ip}:{remote_port} "
             f"group={self.group_id!r} sender={self.sender!r} local_port={self.local_port}"
@@ -149,10 +157,8 @@ class SipLivePageSession(livepaged.LivePageSession):
 
     def decode_inbound_payload(self, payload):
         codec_name = str(getattr(self, "codec_name", "PCMU") or "PCMU").upper()
-        if codec_name == "PCMU":
-            return payload
         try:
-            decoded, decoder = decode_sip_rtp_payload(
+            decoded, decoder = decode_sip_rtp_payload_to_pcm_s16le_48k_stereo(
                 codec_name,
                 payload,
                 decoder_state=getattr(self, "codec_decoder", None),
@@ -162,6 +168,27 @@ class SipLivePageSession(livepaged.LivePageSession):
         except Exception as exc:
             page_debug(f"rtp_decode_error stream={self.stream_id} codec={codec_name} error={exc}")
             return b""
+
+    def forward_live_payload(self, payload):
+        data = bytes(payload or b"")
+        frame_size = livepaged.ENDPOINT_PCM_FRAME_BYTES
+        complete = len(data) - (len(data) % frame_size)
+        if complete <= 0:
+            return False
+
+        forwarded = False
+        for offset in range(0, complete, frame_size):
+            if self.pace_pcm_forwarding:
+                now = time.monotonic()
+                deadline = self.next_pcm_forward_time
+                if deadline is None or deadline < now - 0.02:
+                    deadline = now
+                wait_for = deadline - now
+                if wait_for > 0 and self.stop_event.wait(wait_for):
+                    break
+                self.next_pcm_forward_time = deadline + 0.02
+            forwarded = self.forward_pcm_payload(data[offset:offset + frame_size]) or forwarded
+        return forwarded
 
     def poll_rtp_source(self, max_packets=4):
         if self.local_sock is None:
@@ -262,7 +289,7 @@ class SipLivePageSession(livepaged.LivePageSession):
 
         threading.Thread(target=prepare, daemon=True).start()
         loops = 0
-        max_loops = 1500  # 30 seconds at 20ms per frame
+        max_loops = 1500
         next_send = time.monotonic()
         while not setup_done.is_set():
             if loops >= max_loops:
@@ -296,30 +323,37 @@ class SipLivePageSession(livepaged.LivePageSession):
         if not self.pre_tones:
             self.pre_tone_completed = True
             return
-        from endpoints import audio_frames, mix_ulaw_frames
+        from endpoints import endpoint_pcm_audio_frames
 
         self.pre_tone_active = True
         frame_duration = 0.02
         next_send = time.monotonic()
         try:
             for tone in self.pre_tones:
-                for frame in audio_frames(tone):
+                for frame in endpoint_pcm_audio_frames(tone):
                     if self.stop_event.is_set() and not self.end_requested.is_set():
                         return
                     if self.local_sock is not None:
                         self.send_rtp(SILENCE_FRAME, poll_source=False)
                     next_send += frame_duration
                     live_payload = self.recv_pre_tone_payload_until(next_send)
-                    output_frame = self.normalize_audio_frame(frame)
+                    output_frame = livepaged.normalize_endpoint_pcm_frame(
+                        frame,
+                        accept_legacy_ulaw=False,
+                    )
                     if live_payload:
-                        output_frame = mix_ulaw_frames([output_frame, self.normalize_audio_frame(live_payload)])
+                        live_frame = bytes(live_payload)[:livepaged.ENDPOINT_PCM_FRAME_BYTES]
+                        live_frame = live_frame.ljust(livepaged.ENDPOINT_PCM_FRAME_BYTES, b"\x00")
+                        output_frame = livepaged.mix_endpoint_pcm_frames(
+                            [output_frame, live_frame]
+                        )
                     else:
                         sleep_for = next_send - time.monotonic()
                         if sleep_for > 0:
                             time.sleep(sleep_for)
                         else:
                             next_send = time.monotonic()
-                    self.forward_payload(output_frame, ignore_pause=True, ignore_stop=True)
+                    self.forward_pcm_payload(output_frame, ignore_pause=True, ignore_stop=True)
         finally:
             self.pre_tone_active = False
             self.pre_tone_completed = True
@@ -422,9 +456,13 @@ class SipLivePageSession(livepaged.LivePageSession):
                 self.forward_rtp_payloads_until(next_send)
             self.rtp_keepalive_payload = SILENCE_FRAME
             live_audio_started = True
+            self.next_pcm_forward_time = None
+            self.pace_pcm_forwarding = True
             page_debug(f"run_live_audio_start stream={self.stream_id} keepalive=20ms")
             super().run()
         finally:
+            self.pace_pcm_forwarding = False
+            self.next_pcm_forward_time = None
             if live_audio_started and self.post_tones:
                 try:
                     self.play_post_tones()

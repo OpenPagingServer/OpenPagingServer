@@ -161,7 +161,6 @@ def _row_to_record(row):
         data = {}
     if not isinstance(data, dict):
         data = {}
-    # Row columns are the live authority for mutable broadcast state.
     data["id"] = row["id"]
     data["template_id"] = row["template_id"]
     data["expires_rule"] = row["expires_rule"]

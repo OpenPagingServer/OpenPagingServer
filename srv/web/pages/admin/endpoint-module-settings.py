@@ -144,6 +144,12 @@ def validate_uploaded_endpoint_module(temp_path, original_name):
             raise RuntimeError("The uploaded file is not a valid .opsepm package.")
     package = endpoints.endpoint_package_info(temp_path, extract_if_trusted=True)
     if not package.get("trusted"):
+        verification = package.get("verification") or {}
+        if verification.get("signature_state") == "unsigned":
+            raise RuntimeError(
+                "This endpoint module package is unsigned. Input modules also execute code and must include "
+                ".signature/cert.pem and .signature/signature.sig from a trusted signer."
+            )
         raise RuntimeError(package.get("load_error") or "This module is not signed by a trusted CA.")
     payload_path = Path(package.get("payload_path") or "")
     if not payload_path.is_dir() or not (payload_path / "index.py").is_file():

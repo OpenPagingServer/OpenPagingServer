@@ -21,13 +21,18 @@ from broadcasts import (
     is_audio_type,
 )
 from endpoints import (
+    ENDPOINT_PCM_FRAME_BYTES,
+    ENDPOINT_PCM_SAMPLE_RATE,
     MULTICAST_RTP_MODULE,
+    configured_internal_streaming_codec,
     connect_endpoint_ipc,
     discover_endpoint_packages,
+    internal_stream_audio_frames,
+    internal_streaming_uses_pcm,
     module_type_has_output,
     multicast_rtp_endpoint_count,
 )
-from group_features import fetch_group_rows, regular_group_targets
+from group_features import apply_all_recipients_policy, fetch_group_rows, regular_group_targets
 from tts import decode_tts_token, iter_tts_ffmpeg_chunks, split_audio_entries
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -98,11 +103,14 @@ def resolve_group_targets(group_id):
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
+            groups_value, _removed_all = apply_all_recipients_policy(group_id, cursor=cur)
             group_ids = []
-            for gid in str(group_id or "").split("."):
+            for gid in groups_value.split("."):
                 token = gid.strip()
                 if token and token not in group_ids:
                     group_ids.append(token)
+            if not group_ids:
+                return []
             rows = fetch_group_rows(cur, None if "0" in group_ids else group_ids)
             targets = regular_group_targets(rows)
             if targets:
@@ -270,7 +278,11 @@ def send_legacy_ipc(stream_id, broadcast, dispatch_message_id=None):
     msg_type = broadcast.get("type")
     audio_files = broadcast.get("audio") or ""
     if is_audio_type(msg_type):
-        frames = get_all_audio_frames(audio_files)
+        internal_codec = configured_internal_streaming_codec()
+        use_pcm = internal_streaming_uses_pcm(internal_codec)
+        frames = internal_stream_audio_frames(audio_files, internal_codec)
+        frame_size = ENDPOINT_PCM_FRAME_BYTES if use_pcm else FRAME_SIZE
+        sample_rate = ENDPOINT_PCM_SAMPLE_RATE if use_pcm else SAMPLE_RATE
         try:
             first_frame = next(frames)
         except StopIteration:
@@ -279,13 +291,14 @@ def send_legacy_ipc(stream_id, broadcast, dispatch_message_id=None):
             sock = None
             try:
                 sock = connect_ipc()
-                command = f"PREPARE {stream_id} {msg_id} {' '.join(targets)}\n"
+                command_name = "PREPAREPCM" if use_pcm else "PREPARE"
+                command = f"{command_name} {stream_id} {msg_id} {' '.join(targets)}\n"
                 sock.sendall(command.encode("utf-8"))
                 response = sock.recv(1024)
-                debug_log(f"fallback PREPARE stream={stream_id} broadcast={broadcast_id} msg={msg_id} response={response!r} targets={targets}")
+                debug_log(f"fallback {command_name} stream={stream_id} broadcast={broadcast_id} msg={msg_id} response={response!r} targets={targets}")
                 if b"OK" not in response:
                     return False
-                frame_duration = FRAME_SIZE / SAMPLE_RATE
+                frame_duration = frame_size / (sample_rate * (4 if use_pcm else 1))
                 next_send_time = time.perf_counter()
                 sock.sendall(first_frame)
                 for frame in frames:
@@ -338,6 +351,10 @@ def main():
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
+            group_id, removed_all = apply_all_recipients_policy(group_id, cursor=cur)
+            if removed_all and not group_id:
+                debug_log("dropped message before insert: sending to all recipients is disabled")
+                return
             template = fetch_template(cur, message_id)
             if not template:
                 print(f"Message '{message_id}' was not found", file=sys.stderr)

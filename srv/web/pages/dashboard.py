@@ -207,6 +207,8 @@ var dashAudioButton = null;
 var dashLiveBid = '';
 var dashLivePaused = false;
 var dashLiveQueue = [];
+var dashLiveCodec = 'mulaw';
+var dashLiveSampleRate = 8000;
 var dashAudioCtx = null;
 var dashAudioNode = null;
 var dashWs = null;
@@ -276,10 +278,45 @@ function decodeUlawFrame(payload) {
   for (var i = 0; i < payload.length; i += 1) out[i] = ulawByteToFloat(payload[i]);
   return out;
 }
+function normalizeLiveCodec(codec) {
+  var token = String(codec || '').trim().toLowerCase();
+  if (token === 'pcm_s16le_48k_stereo' || token === 's16le48' || token === 'pcm') return 'pcm_s16le_48k_stereo';
+  return 'mulaw';
+}
+function decodePcmS16leStereoFrame(payload) {
+  var frames = Math.floor(payload.length / 4);
+  var out = new Float32Array(frames);
+  var view = new DataView(payload.buffer, payload.byteOffset, frames * 4);
+  for (var i = 0; i < frames; i += 1) {
+    var left = view.getInt16(i * 4, true);
+    var right = view.getInt16(i * 4 + 2, true);
+    out[i] = Math.max(-1, Math.min(1, (left + right) / 65536));
+  }
+  return out;
+}
+function decodeLiveFrame(payload) {
+  return dashLiveCodec === 'pcm_s16le_48k_stereo' ? decodePcmS16leStereoFrame(payload) : decodeUlawFrame(payload);
+}
+function setDashLiveFormat(codec, sampleRate) {
+  var normalized = normalizeLiveCodec(codec);
+  var rate = Number(sampleRate) || (normalized === 'pcm_s16le_48k_stereo' ? 48000 : 8000);
+  if (normalized === dashLiveCodec && rate === dashLiveSampleRate) return;
+  dashLiveCodec = normalized;
+  dashLiveSampleRate = rate;
+  dashLiveQueue = [];
+  if (dashAudioNode) {
+    try { dashAudioNode.disconnect(); } catch (_e) {}
+  }
+  if (dashAudioCtx) {
+    try { dashAudioCtx.close(); } catch (_e) {}
+  }
+  dashAudioCtx = null;
+  dashAudioNode = null;
+}
 function ensureLiveAudioContext() {
   if (dashAudioCtx || !window.AudioContext) return;
   try {
-    dashAudioCtx = new AudioContext({sampleRate: 8000});
+    dashAudioCtx = new AudioContext({sampleRate: dashLiveSampleRate});
     dashAudioNode = dashAudioCtx.createScriptProcessor(1024, 0, 1);
     dashAudioNode.onaudioprocess = function(event) {
       var output = event.outputBuffer.getChannelData(0);
@@ -330,7 +367,7 @@ function queueLiveFrame(bid, payload) {
   ensureLiveAudioContext();
   if (!dashAudioCtx) return;
   if (dashAudioCtx.state === 'suspended') dashAudioCtx.resume().catch(function(){});
-  dashLiveQueue.push(decodeUlawFrame(payload));
+  dashLiveQueue.push(decodeLiveFrame(payload));
   if (dashLiveQueue.length > 120) dashLiveQueue.splice(0, dashLiveQueue.length - 120);
 }
 function isDesktopBridge() {
@@ -483,6 +520,7 @@ function maybeAutoPlayIncoming(payload) {
   dashAutoPlayAttempted[bid] = true;
   if (isDesktopBridge()) return;
   if (!isLiveAudioMode(payload.audio_mode)) return;
+  setDashLiveFormat(payload.audio_codec, payload.audio_sample_rate);
   tryUnlockAudio('incoming');
   if (dashBroadcastMeta[bid] && dashBroadcastMeta[bid].live) {
     dashLiveBid = bid;
@@ -507,6 +545,7 @@ function onRtpStreamControl(message) {
   dashBroadcastMeta[bid] = dashBroadcastMeta[bid] || {};
   if (command === 'start') {
     dashBroadcastMeta[bid].live = true;
+    setDashLiveFormat(message.audio_codec, message.audio_sample_rate);
     if (!dashLiveBid || dashLiveBid === bid) {
       dashLiveBid = bid;
       dashLivePaused = false;

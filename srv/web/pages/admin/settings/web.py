@@ -17,15 +17,14 @@ def handle_request():
     user = require_admin()
     if not isinstance(user, dict):
         return user
-    data = settings()
+    data = ensure_certificate_schema(settings())
     if request.method == "POST":
         if demo_mode_enabled():
             return jsonify(status="error", message="Demo Mode is enabled.") if request.headers.get("X-Requested-With") == "XMLHttpRequest" else demo_mode_page("Web Settings", legacy_user_context(user), "settings", "settings")
         http_port = request.form.get("webserver_http_port", "80").strip()
         https_enabled = normalize_toggle(request.form.get("webserver_https_enable"))
         https_port = request.form.get("webserver_https_port", data.get("webserver_https_port", "443")).strip()
-        https_privkey = request.form.get("webserver_https_privkey", data.get("webserver_https_privkey", "")).strip()
-        https_cert = request.form.get("webserver_https_cert", data.get("webserver_https_cert", "")).strip()
+        certificate_id = request.form.get("webserver_https_certificate_id", data.get("webserver_https_certificate_id", "")).strip()
         http_to_https = normalize_toggle(request.form.get("webserver_http_to_https")) if https_enabled == "1" else "0"
         hsts_enabled = normalize_toggle(request.form.get("webserver_hsts")) if https_enabled == "1" else "0"
         errors = []
@@ -37,6 +36,8 @@ def handle_request():
                 errors.append(f"Port {http_port} is already in use.")
             elif data.get("api_http_enable", "0") == "1" and str(http_port) == str(data.get("api_http_port", "8088")):
                 errors.append("Web and API ports must be different.")
+            elif data.get("api_https_enable", "0") == "1" and str(http_port) == str(data.get("api_https_port", "8089")):
+                errors.append("Web HTTP and API HTTPS ports must be different.")
         except ValueError:
             errors.append("Invalid port range.")
         if https_enabled == "1":
@@ -50,24 +51,26 @@ def handle_request():
                     errors.append(f"Port {https_port} is already in use.")
                 elif data.get("api_http_enable", "0") == "1" and str(https_port) == str(data.get("api_http_port", "8088")):
                     errors.append("HTTPS and API ports must be different.")
+                elif data.get("api_https_enable", "0") == "1" and str(https_port) == str(data.get("api_https_port", "8089")):
+                    errors.append("Web and API HTTPS ports must be different.")
             except ValueError:
                 errors.append("Invalid HTTPS port range.")
-            if not https_privkey:
-                errors.append("Private key path is required when HTTPS is enabled.")
-            elif not validate_absolute_server_path(https_privkey):
-                errors.append("Private key path must start with /.")
-            if not https_cert:
-                errors.append("Certificate path is required when HTTPS is enabled.")
-            elif not validate_absolute_server_path(https_cert):
-                errors.append("Certificate path must start with /.")
+            certificate = certificate_record(certificate_id)
+            if not certificate:
+                errors.append("Select a certificate when HTTPS is enabled.")
+            else:
+                try:
+                    validate_tls_certificate(certificate["certificate_path"], certificate["private_key_path"])
+                except ValueError as exc:
+                    errors.append(str(exc))
         if errors:
             return jsonify(status="error", message=" ".join(errors)) if request.headers.get("X-Requested-With") == "XMLHttpRequest" else page("Web Settings", h(" ".join(errors)), "settings", user)
         save_setting("webserver_enable", "1", "Enable access to Open Paging Server via a web browser (0/1)")
         save_setting("webserver_http_port", http_port, "HTTP Server Port (Default: 80)")
         save_setting("webserver_https_enable", https_enabled, "HTTPs Enable (0/1)")
         save_setting("webserver_https_port", https_port or "443", "HTTPs Server Port (Default: 443)")
-        save_setting("webserver_https_privkey", https_privkey, "HTTPS private key path on the server. Must start with /")
-        save_setting("webserver_https_cert", https_cert, "HTTPS certificate path on the server. Must start with /")
+        if https_enabled == "1" and certificate_id:
+            set_certificate_for_service("web", certificate_id)
         save_setting("webserver_http_to_https", http_to_https, "Automatically redirect HTTP requests to HTTPS (0/1)")
         save_setting("webserver_hsts", hsts_enabled, "Send HSTS headers over HTTPS (0/1)")
         if request.headers.get("X-Requested-With") == "XMLHttpRequest":
@@ -82,6 +85,10 @@ def handle_request():
     docker_port_disabled = " disabled" if docker_mode else ""
     docker_port_style = ' style="background:rgba(0,0,0,0.05); color:#777;"' if docker_mode else ""
     docker_port_notice = '<div style="display:flex; align-items:center; gap:6px; margin-top:4px;"><svg width="16" height="16" viewBox="0 0 24 24" style="fill:var(--ops-accent)"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg><span style="color:var(--ops-accent); font-size:0.85em;">Change port by editing .env in Docker</span></div>' if docker_mode else ""
+    certificate_options = '<option value="">Select a certificate</option>' + "".join(
+        f'<option value="{int(record["id"])}"{" selected" if str(record["id"]) == str(data.get("webserver_https_certificate_id", "")) else ""}>{h(record.get("name"))}</option>'
+        for record in certificate_records()
+    )
     body = f"""
     <div id="web" class="tab-content active">
         <div class="info-card login-settings">
@@ -107,12 +114,9 @@ def handle_request():
                     <span id="webHttpsPortError" class="port-error-text">Please enter a valid port (1-65535).</span>
                 </div>
                 <div class="info-row" style="flex-direction: column; align-items: flex-start; gap: 8px; border-bottom:none;">
-                    <span class="info-label">Private Key Path</span>
-                    <input type="text" name="webserver_https_privkey" id="webHttpsPrivkey" value="{h(data.get("webserver_https_privkey", ""))}"{https_field_disabled}>
-                </div>
-                <div class="info-row" style="flex-direction: column; align-items: flex-start; gap: 8px; border-bottom:none;">
-                    <span class="info-label">Certificate Path</span>
-                    <input type="text" name="webserver_https_cert" id="webHttpsCert" value="{h(data.get("webserver_https_cert", ""))}"{https_field_disabled}>
+                    <span class="info-label">Certificate</span>
+                    <select name="webserver_https_certificate_id" id="webHttpsCertificate"{https_field_disabled}>{certificate_options}</select>
+                    <span class="info-description">Certificates are managed in the Certificates settings panel.</span>
                 </div>
                 <div class="info-row" style="border-bottom:none;">
                     <span class="info-label">Auto Upgrade HTTP to HTTPS</span>
@@ -139,8 +143,7 @@ document.addEventListener('DOMContentLoaded', function() {
     const httpsSettings = document.getElementById('webHttpsSettings');
     const httpsPortInput = document.getElementById('webHttpsPort');
     const httpsPortError = document.getElementById('webHttpsPortError');
-    const httpsPrivkey = document.getElementById('webHttpsPrivkey');
-    const httpsCert = document.getElementById('webHttpsCert');
+    const httpsCertificate = document.getElementById('webHttpsCertificate');
     const httpToHttpsToggle = document.getElementById('webHttpToHttpsToggle');
     const hstsToggle = document.getElementById('webHstsToggle');
     function validatePortInput(input, errorElement) {
@@ -180,8 +183,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 httpsPortError.style.display = 'none';
             }
         }
-        if (httpsPrivkey) httpsPrivkey.disabled = !enabled;
-        if (httpsCert) httpsCert.disabled = !enabled;
+        if (httpsCertificate) httpsCertificate.disabled = !enabled;
         if (httpToHttpsToggle) {
             httpToHttpsToggle.disabled = !enabled;
             if (!enabled) httpToHttpsToggle.checked = false;

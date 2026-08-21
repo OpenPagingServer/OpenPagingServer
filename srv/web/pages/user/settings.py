@@ -188,7 +188,10 @@ def handle_request():
     synced_user = auth_provider in {"ldap", "oidc", "saml"}
     synced_password_change_url = identity_password_change_url(user, ctx["settings"])
     forced_password_change = user_requires_password_change(user)
-    api_enabled = str(ctx["settings"].get("api_http_enable", "0")) == "1" and not forced_password_change
+    api_enabled = (
+        str(ctx["settings"].get("api_http_enable", "0")) == "1"
+        or str(ctx["settings"].get("api_https_enable", "0")) == "1"
+    ) and not forced_password_change
     requested_tab = str(request.args.get("tab") or "").strip()
     history_limit = session_history_limit_value(request.args.get("limit"))
     open_password_modal = str(request.args.get("open") or "").strip().lower() == "password" or forced_password_change

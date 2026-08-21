@@ -113,6 +113,12 @@ def read_web_settings():
         "webserver_hsts": "0",
         "api_http_enable": "0",
         "api_http_port": "8088",
+        "api_https_enable": "0",
+        "api_https_port": "8089",
+        "api_https_cert": "",
+        "api_https_privkey": "",
+        "api_http_to_https": "0",
+        "api_hsts": "0",
     }
     if not all([DB_HOST, DB_USER, DB_NAME]):
         return defaults
@@ -127,7 +133,8 @@ def read_web_settings():
                 "SELECT parameter, value FROM systemsettings WHERE parameter IN "
                 "('webserver_enable','webserver_http_port','webserver_https_enable','webserver_https_port',"
                 "'webserver_https_privkey','webserver_https_cert','webserver_http_to_https','webserver_hsts',"
-                "'api_http_enable','api_http_port')"
+                "'api_http_enable','api_http_port','api_https_enable','api_https_port','api_https_cert',"
+                "'api_https_privkey','api_http_to_https','api_hsts')"
             )
             for row in cur.fetchall():
                 defaults[str(row["parameter"])] = str(row["value"])
@@ -218,10 +225,6 @@ class ReverseProxyTrustMiddleware:
         self.default_scheme = str(default_scheme or "http").lower()
 
     def __call__(self, environ, start_response):
-        # Each internal server is dedicated to a single front-facing scheme, so
-        # apply that scheme as the authoritative default. This keeps every request
-        # correct even on keep-alive connections, where the front proxy only
-        # injects the X-Ops-Forwarded-Proto header on the first request.
         if self.default_scheme in {"http", "https"}:
             environ["wsgi.url_scheme"] = self.default_scheme
             environ["HTTPS"] = "on" if self.default_scheme == "https" else "off"
@@ -790,10 +793,41 @@ def build_servers(settings):
                     },
                 )
             )
-    if enabled(settings.get("api_http_enable")):
+    api_http_enabled = enabled(settings.get("api_http_enable"))
+    api_https_enabled = enabled(settings.get("api_https_enable"))
+    if api_http_enabled or api_https_enabled:
         from srv.api.app import app as api_app
 
-        servers.append(("api", "Open Paging Server API", api_app, server_ports("api", settings.get("api_http_port")), {"scheme": "http"}))
+        api_https_port = port_value(settings.get("api_https_port"), 8089)
+        if api_http_enabled:
+            servers.append(
+                (
+                    "api",
+                    "Open Paging Server API",
+                    api_app,
+                    server_ports("api", settings.get("api_http_port")),
+                    {
+                        "scheme": "http",
+                        "redirect_https_port": api_https_port if api_https_enabled and enabled(settings.get("api_http_to_https")) else None,
+                        "hsts_enabled": False,
+                    },
+                )
+            )
+        if api_https_enabled:
+            api_ssl_context = create_ssl_context(settings.get("api_https_cert"), settings.get("api_https_privkey"))
+            servers.append(
+                (
+                    "api-https",
+                    "Open Paging Server API",
+                    api_app,
+                    server_ports("api-https", settings.get("api_https_port")),
+                    {
+                        "scheme": "https",
+                        "ssl_context": api_ssl_context,
+                        "hsts_enabled": enabled(settings.get("api_hsts")),
+                    },
+                )
+            )
     return servers
 
 

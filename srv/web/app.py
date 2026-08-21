@@ -1,4 +1,4 @@
-#srv/web/app.py
+
 import base64
 import hashlib
 import hmac
@@ -78,7 +78,7 @@ from clientd import (
     verify_desktop_token,
 )
 from dotenv import load_dotenv
-from group_features import ensure_group_feature_schema, record_is_active_emergency, suspended_bell_groups
+from group_features import all_recipients_disabled, ensure_group_feature_schema, record_is_active_emergency, suspended_bell_groups
 from flask import (
     Flask,
     Response,
@@ -93,6 +93,7 @@ from flask import (
     session,
 )
 from werkzeug.utils import secure_filename
+from werkzeug.exceptions import HTTPException
 
 
 WEB_DIR = Path(__file__).resolve().parent
@@ -104,6 +105,7 @@ WEB_ERROR_DIR = WEB_ROOT_DIR / "errors"
 DEMO_MODE_HTML_PATH = WEB_ROOT_DIR / "demomode.html"
 ENDPOINT_MODULES_DIR = endpoints.MODULE_STORE_DIR
 ASSET_DIR = Path(os.getenv("ASSET_PATH", "/var/lib/openpagingserver/assets"))
+CERTIFICATE_DIR = Path(os.getenv("OPS_CERTIFICATE_PATH", "/var/lib/openpagingserver/certificates"))
 load_dotenv(BASE_DIR / ".env")
 
 DB_HOST = os.getenv("DB_HOST")
@@ -117,6 +119,8 @@ API_TOKEN_LABEL_LENGTH = 120
 ENDPOINT_IPC_TIMEOUT = max(2.0, float(os.getenv("OPS_ENDPOINT_IPC_TIMEOUT", "5")))
 API_TOKEN_HASHER = PasswordHasher() if PasswordHasher is not None else None
 MESSAGE_VENDOR_SCHEMA_READY = False
+CERTIFICATE_SCHEMA_READY = False
+CERTIFICATE_SCHEMA_LOCK = threading.Lock()
 IDENTITY_ACCESS_SCHEMA_READY = False
 WEB_RATE_LIMIT_BUCKETS = {}
 WEB_RATE_LIMIT_LOCK = threading.Lock()
@@ -505,16 +509,9 @@ def detect_desktop_client_context():
     ):
         session["desktop_client"] = True
     if bool(session.get("desktop_client")):
-        # Desktop client web sessions use a persistent cookie so relaunching
-        # the app doesn't drop users on the login page. Server-side session
-        # expiry checks still apply regardless of cookie lifetime.
         session.permanent = True
 
 
-# Minimum browser versions that support the CSS (flexbox `gap`, `inset`
-# shorthand) and JavaScript (async/await, Clipboard API, getUserMedia)
-# features the web UI relies on. Anything older is served a 403 explaining
-# that the browser is unsupported. See render_unsupported_browser_response().
 SUPPORTED_BROWSER_MIN_VERSION = {
     "chrome": 87,
     "chromium": 87,
@@ -534,54 +531,37 @@ def _ua_version_int(token, low):
 
 
 def browser_meets_minimum(user_agent):
-    """Classify a User-Agent string.
-
-    Returns False for a recognized browser that is older than the supported
-    minimum (or a legacy engine such as Internet Explorer / EdgeHTML / Presto
-    Opera). Returns True for a supported browser. Returns None for anything we
-    do not recognize as a browser (API clients, tooling, bots, health checks,
-    desktop webviews, ...), which is always allowed through.
-    """
     ua = str(user_agent or "").strip()
     if not ua:
         return None
     low = ua.lower()
 
-    # Internet Explorer / legacy Trident engine -- never supported.
     if "msie " in low or "trident/" in low:
         return False
 
-    # iOS / iPadOS: every browser shares the system WebKit tied to the OS
-    # version, so gate on the reported OS version rather than the app version.
     if "iphone" in low or "ipod" in low or ("ipad" in low and "version/" in low):
         match = re.search(r"os (\d+)[_.](\d+)", low)
         if match:
             return (int(match.group(1)), int(match.group(2))) >= SUPPORTED_IOS_WEBKIT_MIN_VERSION
         return None
 
-    # Legacy (pre-Chromium, EdgeHTML) Microsoft Edge -- "Edge/" not "Edg/".
     if re.search(r"\bedge/\d", low):
         return False
 
-    # Chromium-based Microsoft Edge ("Edg/" desktop, "EdgA/" Android).
     if "edg/" in low or "edga/" in low:
         version = _ua_version_int("edg/", low) or _ua_version_int("edga/", low)
         return version is None or version >= SUPPORTED_BROWSER_MIN_VERSION["edge"]
 
-    # Chromium-based Opera ("OPR/").
     if "opr/" in low:
         version = _ua_version_int("opr/", low)
         return version is None or version >= SUPPORTED_BROWSER_MIN_VERSION["opera"]
-    # Legacy Presto Opera ("Opera/9.80 ... Version/12.x") -- always outdated.
     if low.startswith("opera/"):
         return False
 
-    # Firefox and forks that report a Firefox version.
     if "firefox/" in low and "seamonkey" not in low:
         version = _ua_version_int("firefox/", low)
         return version is None or version >= SUPPORTED_BROWSER_MIN_VERSION["firefox"]
 
-    # Chrome / Chromium -- checked after Edge/Opera, which also embed "Chrome/".
     if "chrome/" in low or "chromium/" in low or "crios/" in low:
         version = (
             _ua_version_int("chrome/", low)
@@ -590,7 +570,6 @@ def browser_meets_minimum(user_agent):
         )
         return version is None or version >= SUPPORTED_BROWSER_MIN_VERSION["chrome"]
 
-    # Desktop Safari -- "Version/x.y ... Safari/" without a Chrome token.
     if "safari/" in low and "version/" in low:
         match = re.search(r"version/(\d+)\.(\d+)", low)
         if match:
@@ -640,7 +619,6 @@ def enforce_supported_browser():
         path.startswith(prefix) for prefix in BROWSER_GATE_EXEMPT_PREFIXES
     ):
         return None
-    # Desktop client webviews (which may embed an old engine) are always allowed.
     if desktop_client_context():
         return None
     if browser_meets_minimum(request.headers.get("User-Agent")) is False:
@@ -860,6 +838,244 @@ def save_setting(parameter, value, description):
         """,
         (parameter, value, description),
     )
+
+
+CERTIFICATE_SETTING_MAP = {
+    "web": (
+        "webserver_https_certificate_id",
+        "webserver_https_cert",
+        "webserver_https_privkey",
+    ),
+    "api": (
+        "api_https_certificate_id",
+        "api_https_cert",
+        "api_https_privkey",
+    ),
+    "sip": (
+        "secure_sip_certificate_id",
+        "secure_sip_cert",
+        "secure_sip_privkey",
+    ),
+}
+
+
+def tls_certificate_details(certificate_path):
+    path = Path(str(certificate_path or "").strip())
+    result = {
+        "valid_from": None,
+        "expires_at": None,
+        "subject": "",
+        "issuer": "",
+        "error": "",
+    }
+    if not path.is_file():
+        result["error"] = "Certificate file is unavailable."
+        return result
+    try:
+        decoded = ssl._ssl._test_decode_cert(str(path))
+        if decoded.get("notBefore"):
+            result["valid_from"] = int(ssl.cert_time_to_seconds(decoded["notBefore"]))
+        if decoded.get("notAfter"):
+            result["expires_at"] = int(ssl.cert_time_to_seconds(decoded["notAfter"]))
+        for key in ("subject", "issuer"):
+            parts = []
+            for rdn in decoded.get(key, ()):
+                for name, value in rdn:
+                    if name in {"commonName", "organizationName"} and value:
+                        parts.append(str(value))
+            result[key] = ", ".join(parts)
+    except Exception as exc:
+        result["error"] = f"Unable to read certificate: {exc}"
+    return result
+
+
+def validate_tls_certificate(certificate_path, private_key_path):
+    certificate = Path(str(certificate_path or "").strip())
+    private_key = Path(str(private_key_path or "").strip())
+    if not certificate.is_file():
+        raise ValueError("Certificate file does not exist or is not readable.")
+    if not private_key.is_file():
+        raise ValueError("Private key file does not exist or is not readable.")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    if hasattr(ssl, "TLSVersion") and hasattr(ssl.TLSVersion, "TLSv1_2"):
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+    try:
+        context.load_cert_chain(certfile=str(certificate), keyfile=str(private_key))
+    except (OSError, ssl.SSLError) as exc:
+        raise ValueError(f"Certificate and private key could not be loaded: {exc}") from exc
+    details = tls_certificate_details(certificate)
+    if details.get("error"):
+        raise ValueError(details["error"])
+    return details
+
+
+def _legacy_certificate_record(name, certificate_path, private_key_path):
+    certificate_path = str(certificate_path or "").strip()
+    private_key_path = str(private_key_path or "").strip()
+    if not certificate_path or not private_key_path:
+        return None
+    existing = query_one(
+        "SELECT * FROM certificates WHERE certificate_path=%s AND private_key_path=%s LIMIT 1",
+        (certificate_path, private_key_path),
+    )
+    if existing:
+        return existing
+    existing = query_one("SELECT * FROM certificates WHERE name=%s LIMIT 1", (name,))
+    if existing:
+        return existing
+    certificate_id = execute(
+        """
+        INSERT INTO certificates (name, certificate_path, private_key_path, managed_upload)
+        VALUES (%s,%s,%s,0)
+        """,
+        (name, certificate_path, private_key_path),
+    )
+    return query_one("SELECT * FROM certificates WHERE id=%s LIMIT 1", (certificate_id,))
+
+
+def migrate_legacy_tls_certificates(data=None):
+    source = dict(data) if isinstance(data, dict) else settings()
+    if not str(source.get("webserver_https_certificate_id", "") or "").strip():
+        legacy_web = _legacy_certificate_record(
+            "Legacy HTTPS Certificate",
+            source.get("webserver_https_cert"),
+            source.get("webserver_https_privkey"),
+        )
+        if legacy_web:
+            save_setting(
+                "webserver_https_certificate_id",
+                str(legacy_web["id"]),
+                "Certificate used by the Web HTTPS listener",
+            )
+            source["webserver_https_certificate_id"] = str(legacy_web["id"])
+
+    if not str(source.get("secure_sip_certificate_id", "") or "").strip():
+        legacy_sip = None
+        secure_mode = str(source.get("enable_secure_sip", "0") or "0").strip()
+        if secure_mode == "1" and source.get("webserver_https_certificate_id"):
+            legacy_sip = query_one(
+                "SELECT * FROM certificates WHERE id=%s LIMIT 1",
+                (source["webserver_https_certificate_id"],),
+            )
+        elif secure_mode not in {"", "0"}:
+            legacy_sip = _legacy_certificate_record(
+                "Legacy SIP TLS Certificate",
+                source.get("secure_sip_cert"),
+                source.get("secure_sip_privkey"),
+            )
+        if legacy_sip:
+            save_setting(
+                "secure_sip_certificate_id",
+                str(legacy_sip["id"]),
+                "Certificate used by the SIP TLS listener",
+            )
+            save_setting("secure_sip_cert", legacy_sip["certificate_path"], "Certificate path for SIP TLS")
+            save_setting("secure_sip_privkey", legacy_sip["private_key_path"], "Private key path for SIP TLS")
+            source["secure_sip_certificate_id"] = str(legacy_sip["id"])
+    return source
+
+
+def ensure_certificate_schema(data=None):
+    global CERTIFICATE_SCHEMA_READY
+    with CERTIFICATE_SCHEMA_LOCK:
+        if not CERTIFICATE_SCHEMA_READY:
+            execute_many(
+                [
+                    (
+                        """
+                        CREATE TABLE IF NOT EXISTS certificates (
+                            id INT AUTO_INCREMENT PRIMARY KEY,
+                            name VARCHAR(255) NOT NULL,
+                            certificate_path TEXT NOT NULL,
+                            private_key_path TEXT NOT NULL,
+                            managed_upload TINYINT(1) NOT NULL DEFAULT 0,
+                            certbot_name VARCHAR(255) DEFAULT NULL,
+                            certbot_domains TEXT DEFAULT NULL,
+                            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                            UNIQUE KEY certificates_name_unique (name)
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+                        """,
+                        (),
+                    ),
+                ]
+            )
+            certificate_columns = table_columns("certificates")
+            certificate_alters = []
+            if "certbot_name" not in certificate_columns:
+                certificate_alters.append(("ALTER TABLE certificates ADD COLUMN certbot_name VARCHAR(255) DEFAULT NULL AFTER managed_upload", ()))
+            if "certbot_domains" not in certificate_columns:
+                certificate_alters.append(("ALTER TABLE certificates ADD COLUMN certbot_domains TEXT DEFAULT NULL AFTER certbot_name", ()))
+            if certificate_alters:
+                execute_many(certificate_alters)
+            CERTIFICATE_SCHEMA_READY = True
+        return migrate_legacy_tls_certificates(data)
+
+
+def certificate_record(certificate_id):
+    wanted = str(certificate_id or "").strip()
+    if not wanted.isdigit():
+        return None
+    return query_one("SELECT * FROM certificates WHERE id=%s LIMIT 1", (int(wanted),))
+
+
+def certificate_records():
+    records = list(query_all("SELECT * FROM certificates"))
+    now = int(time.time())
+    for record in records:
+        details = tls_certificate_details(record.get("certificate_path"))
+        record.update(details)
+        expires_at = details.get("expires_at")
+        record["expired"] = expires_at is not None and expires_at <= now
+        valid_from = details.get("valid_from")
+        record["renewal_at"] = None
+        if record.get("certbot_name") and valid_from is not None and expires_at is not None and expires_at > valid_from:
+            lifetime = expires_at - valid_from
+            renewal_fraction = 0.5 if lifetime <= 10 * 24 * 60 * 60 else (2.0 / 3.0)
+            record["renewal_at"] = int(valid_from + lifetime * renewal_fraction)
+    records.sort(
+        key=lambda record: (
+            0 if record.get("expired") else 1 if record.get("error") else 2,
+            record.get("expires_at") if record.get("expires_at") is not None else 2**63,
+            str(record.get("name") or "").lower(),
+        )
+    )
+    return records
+
+
+def set_certificate_for_service(service, certificate_id):
+    keys = CERTIFICATE_SETTING_MAP.get(str(service or "").strip().lower())
+    if not keys:
+        raise ValueError("Unknown certificate service.")
+    record = certificate_record(certificate_id)
+    if not record:
+        raise ValueError("Select an available certificate.")
+    validate_tls_certificate(record["certificate_path"], record["private_key_path"])
+    id_key, certificate_key, private_key_key = keys
+    save_setting(id_key, str(record["id"]), f"Certificate used by the {service.upper()} TLS listener")
+    save_setting(certificate_key, record["certificate_path"], f"Certificate path for {service.upper()} TLS")
+    save_setting(private_key_key, record["private_key_path"], f"Private key path for {service.upper()} TLS")
+    return record
+
+
+def refresh_certificate_assignments(certificate_id):
+    record = certificate_record(certificate_id)
+    if not record:
+        return
+    data = settings()
+    for service, (id_key, _certificate_key, _private_key_key) in CERTIFICATE_SETTING_MAP.items():
+        if str(data.get(id_key, "") or "").strip() == str(record["id"]):
+            set_certificate_for_service(service, record["id"])
+
+
+def certificate_usage(certificate_id):
+    data = settings()
+    wanted = str(certificate_id or "").strip()
+    return [
+        service
+        for service, (id_key, _certificate_key, _private_key_key) in CERTIFICATE_SETTING_MAP.items()
+        if str(data.get(id_key, "") or "").strip() == wanted
+    ]
 
 
 def table_columns(table_name):
@@ -4756,6 +4972,8 @@ def endpoint_availability_map(endpoint_payload):
 
 
 def all_group_ids_value(user=None):
+    if all_recipients_disabled(settings()):
+        return ""
     rows = query_all("SELECT id, owner_user_id FROM `groups` ORDER BY name ASC")
     rows = filter_group_rows_for_user(user, rows)
     ids = [str(row.get("id") or "").strip() for row in rows if str(row.get("id") or "").strip()]
@@ -5041,10 +5259,6 @@ def login_sso_start():
             session.pop(DESKTOP_SSO_SESSION_KEY, None)
             return desktop_sso_finish_redirect(desktop_sso_request_id, ok=False, message="SSO is not enabled.")
         return redirect("/login")
-    # Guard against auto-redirect loops: if the login page keeps bouncing to the
-    # identity provider without a login ever completing (e.g. the browser already
-    # holds an identity-provider session that silently redirects straight back),
-    # stop auto-redirecting and fall back to the manual retry screen.
     if not desktop_sso_request_id:
         now_value = time.time()
         recent_starts = [
@@ -5066,8 +5280,6 @@ def login_sso_start():
         if provider == "oidc":
             client = build_oidc_client(config)
             redirect_uri = request.url_root.rstrip("/") + "/login/oidc/callback"
-            # Force the identity provider to prompt for authentication instead of
-            # silently reusing whatever account is already signed in to the browser.
             return client.authorize_redirect(redirect_uri, prompt="login")
         auth = build_saml_auth(config)
         return redirect(auth.login(return_to=request.url_root.rstrip("/") + "/", force_authn=True))
@@ -6067,6 +6279,24 @@ def endpoint_ipc(command):
         return {"ok": False, "error": str(exc), "modules": []}
 
 
+@app.route(
+    "/endpoints/<module>",
+    defaults={"module_path": ""},
+    methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+@app.route(
+    "/endpoints/<module>/",
+    defaults={"module_path": ""},
+    methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+@app.route(
+    "/endpoints/<module>/<path:module_path>",
+    methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+def endpoint_module_web(module, module_path):
+    return dispatch_web_page("endpoints/index")
+
+
 @alias("/admin/manage-endpoints")
 def manage_endpoints():
     return dispatch_web_page("admin/manage-endpoints")
@@ -6127,7 +6357,7 @@ def endpoint_module_settings_configure():
     return dispatch_web_page("admin/endpoint-module-settings-configure")
 
 
-SETTINGS_TABS = "<div class='tabs'><a href='/admin/settings/general'>General</a><a href='/admin/settings/login'>Login</a><a href='/admin/settings/sip'>SIP</a><a href='/admin/settings/branding'>Branding</a><a href='/admin/settings/about'>About</a></div>"
+SETTINGS_TABS = "<div class='tabs'><a href='/admin/settings/general'>General</a><a href='/admin/settings/login'>Login</a><a href='/admin/settings/sip'>SIP</a><a href='/admin/settings/branding'>Branding</a><a href='/admin/settings/advanced'>Advanced</a><a href='/admin/settings/about'>About</a></div>"
 
 
 @alias("/admin/settings/general", methods=["GET", "POST"])
@@ -6150,6 +6380,11 @@ def settings_branding():
     return dispatch_web_page("admin/settings/branding")
 
 
+@alias("/admin/settings/advanced", methods=["GET", "POST"])
+def settings_advanced():
+    return dispatch_web_page("admin/settings/advanced")
+
+
 @alias("/admin/settings/sip", methods=["GET", "POST"])
 def settings_sip():
     return dispatch_web_page("admin/settings/sip")
@@ -6168,6 +6403,21 @@ def settings_web():
 @alias("/admin/settings/api", methods=["GET", "POST"])
 def settings_api():
     return dispatch_web_page("admin/settings/api")
+
+
+@alias("/admin/settings/certificates", methods=["GET", "POST"])
+def settings_certificates():
+    try:
+        return dispatch_web_page("admin/settings/certificates")
+    except HTTPException as exc:
+        if request.method == "POST" and request.headers.get("X-Requested-With") == "XMLHttpRequest":
+            return jsonify(status="error", message=exc.description or "The certificate request was rejected."), int(exc.code or 500)
+        raise
+    except Exception as exc:
+        if request.method == "POST" and request.headers.get("X-Requested-With") == "XMLHttpRequest":
+            app.logger.exception("Unhandled certificate settings request failure")
+            return jsonify(status="error", message=str(exc) or "The certificate request failed."), 500
+        raise
 
 
 def read_version():

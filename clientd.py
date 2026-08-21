@@ -775,7 +775,9 @@ def start_desktop_livepage(stream_id, groups_value, sender="", codec="mulaw", sa
     )
 
 
-def desktop_livepage_payload(connection, stream_id, groups_value, sender=""):
+def desktop_livepage_payload(connection, stream_id, groups_value, sender="", codec="mulaw", sample_rate=8000):
+    codec = str(codec or "mulaw").strip().lower()
+    sample_rate = int(sample_rate or 8000)
     return {
         "type": "broadcast",
         "broadcast_id": str(stream_id or ""),
@@ -789,14 +791,14 @@ def desktop_livepage_payload(connection, stream_id, groups_value, sender=""):
         "product_name": product_name(),
         "audio_url": "",
         "audio_mode": "websocket",
-        "audio_codec": "mulaw",
-        "audio_sample_rate": 8000,
+        "audio_codec": codec,
+        "audio_sample_rate": sample_rate,
         "has_audio": True,
         "groups": groups_for_user(connection.user.get("id")),
     }
 
 
-def start_livepage_for_group(stream_id, groups_value, sender=""):
+def start_livepage_for_group(stream_id, groups_value, sender="", codec="mulaw", sample_rate=8000):
     started = 0
     now = time.time()
     with connections_lock:
@@ -807,11 +809,25 @@ def start_livepage_for_group(stream_id, groups_value, sender=""):
         if not connection_in_groups(connection, groups_value):
             continue
         try:
-            payload = desktop_livepage_payload(connection, stream_id, groups_value, sender)
+            payload = desktop_livepage_payload(
+                connection,
+                stream_id,
+                groups_value,
+                sender,
+                codec=codec,
+                sample_rate=sample_rate,
+            )
             payload["groups"] = list(getattr(connection, "groups_cache", []) or cached_groups_for_user(connection.user.get("id")))
             with connection.send_lock:
                 send_ws_json(connection.sock, payload)
-                send_rtp_stream_command(connection.sock, stream_id, "start", codec="mulaw", sample_rate=8000, stream_kind="livepage")
+                send_rtp_stream_command(
+                    connection.sock,
+                    stream_id,
+                    "start",
+                    codec=codec,
+                    sample_rate=sample_rate,
+                    stream_kind="livepage",
+                )
             connection.last_activity = now
             maybe_touch_connected(connection, now)
             started += 1
@@ -838,7 +854,7 @@ def send_livepage_audio(stream_id, groups_value, frame):
             connection.closed.set()
 
 
-def finish_livepage(stream_id, groups_value):
+def finish_livepage(stream_id, groups_value, codec="mulaw", sample_rate=8000):
     now = time.time()
     with connections_lock:
         current_connections = list(connections)
@@ -849,7 +865,14 @@ def finish_livepage(stream_id, groups_value):
             continue
         try:
             with connection.send_lock:
-                send_rtp_stream_command(connection.sock, stream_id, "end", codec="mulaw", sample_rate=8000, stream_kind="livepage")
+                send_rtp_stream_command(
+                    connection.sock,
+                    stream_id,
+                    "end",
+                    codec=codec,
+                    sample_rate=sample_rate,
+                    stream_kind="livepage",
+                )
                 send_binary_packet(connection.sock, AUDIO_END_PREFIX, stream_id, b"")
             connection.last_activity = now
             maybe_touch_connected(connection, now)
@@ -1063,7 +1086,15 @@ def handle_streaming_ipc(conn, payload):
         stream_id = str(payload.get("stream_id") or "").strip()
         groups = str(payload.get("groups") or "").strip()
         sender = payload.get("sender") or "Live Page"
-        matched = start_livepage_for_group(stream_id, groups, sender)
+        codec = str(payload.get("codec") or "mulaw").strip().lower()
+        sample_rate = int(payload.get("sample_rate") or 8000)
+        matched = start_livepage_for_group(
+            stream_id,
+            groups,
+            sender,
+            codec=codec,
+            sample_rate=sample_rate,
+        )
         conn.sendall(json.dumps({"ok": True, "matched": matched}, separators=(",", ":")).encode("utf-8") + b"\n")
         while True:
             header = recv_exact(conn, 2)
@@ -1074,7 +1105,7 @@ def handle_streaming_ipc(conn, payload):
             if len(frame) < frame_len:
                 break
             send_livepage_audio(stream_id, groups, frame)
-        finish_livepage(stream_id, groups)
+        finish_livepage(stream_id, groups, codec=codec, sample_rate=sample_rate)
         return
     conn.sendall(json.dumps({"ok": False, "error": f"unknown streaming action: {action}"}, separators=(",", ":")).encode("utf-8") + b"\n")
 

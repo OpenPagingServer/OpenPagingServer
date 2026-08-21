@@ -1,4 +1,3 @@
-#/srv/web/pages/index.py
 import hmac
 import ipaddress
 import json

@@ -454,8 +454,6 @@ def write_cluster_audio_file(cluster):
         f"{cluster['start_at'].strftime('%Y%m%d-%H%M%S')}-"
         f"{first_event_id}-{last_event_id}.wav"
     )
-    # The filename is deterministic — reuse a cluster file that was pre-built
-    # ahead of the fire time so dispatch is instant.
     try:
         if path.is_file() and path.stat().st_size > 44:
             return str(path)
@@ -494,9 +492,6 @@ def write_cluster_audio_file(cluster):
 
 
 def prepare_upcoming_clusters(schedule, now):
-    """Pre-build cluster audio files ahead of their fire time so dispatch at
-    the scheduled moment is instant. Returns the next upcoming cluster start
-    time (or None)."""
     day_value = now.date()
     events = fetch_schedule_events_after(schedule, day_value, now, now.strftime("%w"))
     lead_deadline = now + timedelta(seconds=BELL_PREBUILD_LEAD_SECONDS)
@@ -769,8 +764,6 @@ def main():
                             fire_event_cluster(cluster)
                             index += consumed
                     last_seen_by_schedule[schedule_id] = max(last_seen, advance_to)
-                    # Pre-build upcoming cluster audio and wake precisely for
-                    # the next scheduled bell instead of a fixed poll delay.
                     try:
                         next_start = prepare_upcoming_clusters(schedule, now)
                     except Exception as exc:

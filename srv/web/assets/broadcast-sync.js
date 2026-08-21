@@ -14,6 +14,8 @@
     liveBid: "",
     livePaused: false,
     liveQueue: [],
+    liveCodec: "mulaw",
+    liveSampleRate: 8000,
     audioCtx: null,
     audioNode: null,
     notificationEnabled: false,
@@ -60,11 +62,54 @@
     return out;
   }
 
+  function normalizeLiveCodec(codec) {
+    var token = String(codec || "").trim().toLowerCase();
+    if (token === "pcm_s16le_48k_stereo" || token === "s16le48" || token === "pcm") {
+      return "pcm_s16le_48k_stereo";
+    }
+    return "mulaw";
+  }
+
+  function decodePcmS16leStereoFrame(payload) {
+    var frames = Math.floor(payload.length / 4);
+    var out = new Float32Array(frames);
+    var view = new DataView(payload.buffer, payload.byteOffset, frames * 4);
+    for (var i = 0; i < frames; i += 1) {
+      var left = view.getInt16(i * 4, true);
+      var right = view.getInt16(i * 4 + 2, true);
+      out[i] = Math.max(-1, Math.min(1, (left + right) / 65536));
+    }
+    return out;
+  }
+
+  function decodeLiveFrame(payload) {
+    return sync.liveCodec === "pcm_s16le_48k_stereo"
+      ? decodePcmS16leStereoFrame(payload)
+      : decodeUlawFrame(payload);
+  }
+
+  function setLiveFormat(codec, sampleRate) {
+    var normalized = normalizeLiveCodec(codec);
+    var rate = Number(sampleRate) || (normalized === "pcm_s16le_48k_stereo" ? 48000 : 8000);
+    if (normalized === sync.liveCodec && rate === sync.liveSampleRate) return;
+    sync.liveCodec = normalized;
+    sync.liveSampleRate = rate;
+    sync.liveQueue = [];
+    if (sync.audioNode) {
+      try { sync.audioNode.disconnect(); } catch (_e) {}
+    }
+    if (sync.audioCtx) {
+      try { sync.audioCtx.close(); } catch (_e) {}
+    }
+    sync.audioCtx = null;
+    sync.audioNode = null;
+  }
+
   function ensureLiveAudioContext() {
     if (sync.audioCtx && sync.audioNode) return;
     var AudioContextCtor = window.AudioContext || window.webkitAudioContext;
     if (!AudioContextCtor) return;
-    sync.audioCtx = new AudioContextCtor({sampleRate: 8000});
+    sync.audioCtx = new AudioContextCtor({sampleRate: sync.liveSampleRate});
     var node = sync.audioCtx.createScriptProcessor(1024, 0, 1);
     node.onaudioprocess = function (event) {
       var output = event.outputBuffer.getChannelData(0);
@@ -114,7 +159,7 @@
     ensureLiveAudioContext();
     if (!sync.audioCtx) return;
     if (sync.audioCtx.state === "suspended") sync.audioCtx.resume().catch(function () {});
-    sync.liveQueue.push(decodeUlawFrame(payload));
+    sync.liveQueue.push(decodeLiveFrame(payload));
     if (sync.liveQueue.length > 120) sync.liveQueue.splice(0, sync.liveQueue.length - 120);
   }
 
@@ -151,6 +196,7 @@
     if (!bid) return;
     var mode = String(payload.audio_mode || "").toLowerCase();
     if (mode === "live" || mode === "websocket" || mode === "mulaw" || mode === "ulaw" || mode === "rtp") {
+      setLiveFormat(payload.audio_codec, payload.audio_sample_rate);
       sync.liveBid = bid;
       sync.livePaused = false;
       tryUnlockAudio();
@@ -180,6 +226,7 @@
     if (!bid) return;
     var command = String(message.command || "").trim().toLowerCase();
     if (command === "start") {
+      setLiveFormat(message.audio_codec, message.audio_sample_rate);
       sync.liveBid = bid;
       sync.livePaused = false;
       tryUnlockAudio();

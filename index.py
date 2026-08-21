@@ -928,10 +928,15 @@ def software_lines(settings):
 
 def sip_lines(settings):
     sip_enabled = truthy_setting(settings.get("enable_insecure_sip"))
+    sip_tls_enabled = str(settings.get("enable_secure_sip", "0") or "0").strip() in {"1", "2"}
     sip_port = settings.get("insecure_sip_port", "5060") or "5060"
+    sip_tls_port = settings.get("secure_sip_port", "5061") or "5061"
     return [
-        f"SIP ENABLED: {bool_text(sip_enabled)}",
+        f"SIP ENABLED: {bool_text(sip_enabled or sip_tls_enabled)}",
+        f"UDP/TCP SIP ENABLED: {bool_text(sip_enabled)}",
         f"UDP/TCP SIP PORT: {sip_port}",
+        f"SIP TLS ENABLED: {bool_text(sip_tls_enabled)}",
+        f"SIP TLS PORT: {sip_tls_port}",
     ]
 
 

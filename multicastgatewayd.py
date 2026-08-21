@@ -1038,8 +1038,6 @@ def provision_gateway_peer(query_one_fn, execute_fn, payload, remote_addr, reque
     product = system_product_name(query_one_fn)
     gateway_label = str(payload.get("gateway_label") or "").strip()
     remote_ip = str(remote_addr or "").split("%", 1)[0].strip()
-    
-    # In demo mode, ignore the provided value for the name to belong on ops, and instead store the client IP address.
     demo_mode = str(os.getenv("DEMO_MODE", "")).strip().lower() in {"1", "true", "yes", "on"}
     if demo_mode:
         gateway_label = remote_ip
@@ -1079,7 +1077,6 @@ class OpsPeerStore:
             if not key:
                 continue
             row["host"] = str(row.get("host") or "").strip() or str(row.get("last_ip") or "").strip()
-            # If no static host was specified, default port to last_port (the NAT-traversed UDP port)
             is_dynamic = not str(row.get("host") or "").strip()
             row["port"] = int((row.get("last_port") if is_dynamic else None) or row.get("port") or DEFAULT_PORT)
             mapping[key] = row

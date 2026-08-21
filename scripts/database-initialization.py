@@ -33,6 +33,90 @@ SIP_PORT_FALLBACKS = [5065, 5160, 5162, 5260, 17777, 17778, 18888, 18887]
 RANDOM_PORT_MIN = 1024
 RANDOM_PORT_MAX = 60999
 RANDOM_PORT_MAX_ATTEMPTS = 1000
+MIN_INTERNAL_PCM_CPU_CORES = 2
+MIN_INTERNAL_PCM_MEMORY_BYTES = 2_000_000_000
+
+
+def detected_cpu_capacity():
+    capacities = []
+
+    cpu_count = os.cpu_count()
+    if cpu_count:
+        capacities.append(float(cpu_count))
+
+    get_affinity = getattr(os, "sched_getaffinity", None)
+    if callable(get_affinity):
+        try:
+            affinity_count = len(get_affinity(0))
+            if affinity_count:
+                capacities.append(float(affinity_count))
+        except (OSError, TypeError):
+            pass
+
+    try:
+        cpu_max = Path("/sys/fs/cgroup/cpu.max").read_text(encoding="utf-8").strip().split()
+        if len(cpu_max) >= 2 and cpu_max[0] != "max":
+            quota = int(cpu_max[0])
+            period = int(cpu_max[1])
+            if quota > 0 and period > 0:
+                capacities.append(quota / period)
+    except (OSError, ValueError):
+        pass
+
+    try:
+        quota = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text(encoding="utf-8").strip())
+        period = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text(encoding="utf-8").strip())
+        if quota > 0 and period > 0:
+            capacities.append(quota / period)
+    except (OSError, ValueError):
+        pass
+
+    return min(capacities) if capacities else None
+
+
+def detected_memory_bytes():
+    capacities = []
+
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemTotal:"):
+                capacities.append(int(line.split()[1]) * 1024)
+                break
+    except (OSError, ValueError, IndexError):
+        pass
+
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        page_count = int(os.sysconf("SC_PHYS_PAGES"))
+        if page_size > 0 and page_count > 0:
+            capacities.append(page_size * page_count)
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
+
+    for limit_path in (
+        Path("/sys/fs/cgroup/memory.max"),
+        Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+    ):
+        try:
+            raw_limit = limit_path.read_text(encoding="utf-8").strip()
+            if raw_limit != "max":
+                limit = int(raw_limit)
+                if 0 < limit < (1 << 60):
+                    capacities.append(limit)
+        except (OSError, ValueError):
+            pass
+
+    return min(capacities) if capacities else None
+
+
+def internal_pcm_resources_are_limited():
+    cpu_capacity = detected_cpu_capacity()
+    memory_bytes = detected_memory_bytes()
+    return (
+        cpu_capacity is not None and cpu_capacity < MIN_INTERNAL_PCM_CPU_CORES
+    ) or (
+        memory_bytes is not None and memory_bytes < MIN_INTERNAL_PCM_MEMORY_BYTES
+    )
 
 
 def random_password(length=32):
@@ -439,6 +523,20 @@ def execute_schema(cursor):
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
         """,
         """
+        CREATE TABLE IF NOT EXISTS certificates (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            certificate_path TEXT NOT NULL,
+            private_key_path TEXT NOT NULL,
+            managed_upload TINYINT(1) NOT NULL DEFAULT 0,
+            certbot_name VARCHAR(255) DEFAULT NULL,
+            certbot_domains TEXT DEFAULT NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY certificates_name_unique (name)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+        """,
+        """
         CREATE TABLE IF NOT EXISTS api_tokens (
             id INT AUTO_INCREMENT PRIMARY KEY,
             user_id INT NOT NULL,
@@ -513,6 +611,8 @@ def execute_schema(cursor):
 
 
 def seed_defaults(cursor, webserver_http_port, insecure_sip_port):
+    internal_codec_downgraded = internal_pcm_resources_are_limited()
+    internal_streaming_codec = "pcmu_8k_mono" if internal_codec_downgraded else "pcm_s16le_48k_stereo"
     endpoint_module_dirs = [(module_dir, "true") for module_dir in discover_endpoint_module_packages()]
     if endpoint_module_dirs:
         cursor.executemany(
@@ -586,7 +686,7 @@ def seed_defaults(cursor, webserver_http_port, insecure_sip_port):
         ("sip_external_ipv4", "", "Manual SIP external IPv4 address"),
         ("sip_rtp_port_start", "40000", "SIP RTP port range start"),
         ("sip_rtp_port_end", "50000", "SIP RTP port range end"),
-        ("sip_codecs_order", "PCMU,G722,PCMA,OPUS", "SIP codec priority order"),
+        ("sip_codecs_order", "G722,OPUS,PCMU,PCMA", "SIP codec priority order"),
         ("sip_codecs_enabled", "PCMU,G722", "Enabled SIP codecs"),
         ("sip_intrusion_prevention", "1", "WARNING!!! Disabling this setting WILL compromise the security of this server, especially if the SIP port is exposed to WAN. There's usually no reason to disable this in production. The Open Paging Server project is NOT responsible for any financial loss caused by abuse of telephone service by malicious bots. CONTINUE AT YOUR OWN RISK!!!"),
         ("sip_block_scanners", "1", "WARNING!!! Disabling this setting WILL compromise the security of this server, especially if the SIP port is exposed to WAN. There's usually no reason to disable this in production. The Open Paging Server project is NOT responsible for any financial loss caused by abuse of telephone service by malicious bots. CONTINUE AT YOUR OWN RISK!!!"),
@@ -610,6 +710,7 @@ def seed_defaults(cursor, webserver_http_port, insecure_sip_port):
         ),
         ("product_name", "Open Paging Server", "Name of this server."),
         ("secure_sip_cert", "", "If enable_secure_sip is 2, this cert will be used. Path to file"),
+        ("secure_sip_certificate_id", "", "Certificate used by the SIP TLS listener"),
         ("secure_sip_port", "5061", "Port for TLS SIP"),
         ("secure_sip_privkey", "", "If enable_secure_sip is 2, this private key will be used. Path to file"),
         (
@@ -619,6 +720,8 @@ def seed_defaults(cursor, webserver_http_port, insecure_sip_port):
         ),
         ("show_online_docs", "1", "Show GUI links to docs.openpagingserver.org (0/1)"),
         ("allow_multicast_gateway", "1", "Allow Multicast Gateway connections to this server (0/1)"),
+        ("disable_all_recipients", "0", ""),
+        ("internal_streaming_codec", internal_streaming_codec, "This parameter defines which codec the paging server uses between internal processes"),
         ("use_logo_in_sidebar", "1", "Use a logo in the sidebar, if disabled the product name will show"),
         ("sidebar_logo_light", "/assets/OPENPAGINGSERVER-768x576-LIGHTMODE.png", "Light mode logo for the sidebar"),
         ("sidebar_logo_dark", "/assets/OPENPAGINGSERVER-768x576-DARKMODE.png", "Dark mode logo for the sidebar"),
@@ -627,11 +730,19 @@ def seed_defaults(cursor, webserver_http_port, insecure_sip_port):
         ("webserver_https_port", "443", "HTTPs Server Port (Default: 443)"),
         ("webserver_https_privkey", "", "HTTPS private key path on the server. Must start with /"),
         ("webserver_https_cert", "", "HTTPS certificate path on the server. Must start with /"),
+        ("webserver_https_certificate_id", "", "Certificate used by the Web HTTPS listener"),
         ("webserver_http_to_https", "0", "Automatically redirect HTTP requests to HTTPS (0/1)"),
         ("webserver_hsts", "0", "Send HSTS headers over HTTPS (0/1)"),
         ("webserver_http_port", str(webserver_http_port), "HTTP Server Port (Default: 80)"),
         ("api_http_enable", "0", "Enable REST API over HTTP (0/1)"),
         ("api_http_port", "8088", "REST API HTTP port"),
+        ("api_https_enable", "0", "Enable REST API over HTTPS (0/1)"),
+        ("api_https_port", "8089", "REST API HTTPS port"),
+        ("api_https_certificate_id", "", "Certificate used by the API HTTPS listener"),
+        ("api_https_cert", "", "Certificate path for API HTTPS"),
+        ("api_https_privkey", "", "Private key path for API HTTPS"),
+        ("api_http_to_https", "0", "Automatically redirect API HTTP requests to HTTPS (0/1)"),
+        ("api_hsts", "0", "Send HSTS headers over API HTTPS (0/1)"),
         ("identity_provider", "local", ""),
         ("identity_redirect_auto", "1", ""),
         ("identity_allow_local_login", "0", ""),

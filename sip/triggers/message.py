@@ -16,6 +16,7 @@ from broadcasts import (
     message_expiration_trigger_targets,
     parse_message_expiration,
 )
+from group_features import apply_all_recipients_policy
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
@@ -284,6 +285,9 @@ def _create_broadcast(arg, sender=""):
                 if not message_id:
                     return
                 if not group_id:
+                    return
+                group_id, removed_all = apply_all_recipients_policy(group_id, cursor=cur)
+                if removed_all and not group_id:
                     return
 
                 template = fetch_template(cur, message_id)

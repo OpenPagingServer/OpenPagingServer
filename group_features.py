@@ -20,6 +20,7 @@ DB_PASS = os.getenv("DB_PASS")
 DB_NAME = os.getenv("DB_NAME")
 
 MONITOR_CATEGORY_ORDER = ("messages", "paging", "bells")
+DISABLE_ALL_RECIPIENTS_SETTING = "disable_all_recipients"
 GROUP_FEATURE_COLUMNS = (
     "monitor_members",
     "monitor_categories",
@@ -57,6 +58,51 @@ def table_columns(cursor, table_name):
 
 def truthy(value):
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def recipient_group_ids(value):
+    raw_values = value if isinstance(value, (list, tuple, set)) else [value]
+    group_ids = []
+    for raw_value in raw_values:
+        for part in str(raw_value or "").replace(",", ".").split("."):
+            group_id = part.strip()
+            if group_id and group_id not in group_ids:
+                group_ids.append(group_id)
+    return group_ids
+
+
+def all_recipients_disabled(cursor=None):
+    if isinstance(cursor, dict):
+        return truthy(cursor.get(DISABLE_ALL_RECIPIENTS_SETTING))
+    owns_connection = cursor is None
+    conn = None
+    try:
+        conn = db() if owns_connection else None
+        cur = conn.cursor() if owns_connection else cursor
+        cur.execute(
+            "SELECT value FROM systemsettings WHERE parameter=%s LIMIT 1",
+            (DISABLE_ALL_RECIPIENTS_SETTING,),
+        )
+        row = cur.fetchone()
+    except Exception:
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
+    if isinstance(row, dict):
+        value = row.get("value")
+    else:
+        value = row[0] if row else None
+    return truthy(value)
+
+
+def apply_all_recipients_policy(groups_value, cursor=None, disabled=None):
+    group_ids = recipient_group_ids(groups_value)
+    policy_enabled = all_recipients_disabled(cursor) if disabled is None else bool(disabled)
+    removed_all = policy_enabled and "0" in group_ids
+    if removed_all:
+        group_ids = [group_id for group_id in group_ids if group_id != "0"]
+    return ".".join(group_ids), removed_all
 
 
 def group_member_tokens(value):
@@ -152,13 +198,12 @@ def fetch_group_rows(cursor, group_ids=None):
 
 
 def selected_group_ids(groups_value, cursor=None):
-    tokens = []
-    for part in str(groups_value or "").split("."):
-        token = str(part or "").strip()
-        if token and token not in tokens:
-            tokens.append(token)
+    tokens = recipient_group_ids(groups_value)
     if "0" not in tokens:
         return tokens
+    filtered_groups, removed_all = apply_all_recipients_policy(groups_value, cursor=cursor)
+    if removed_all:
+        return recipient_group_ids(filtered_groups)
     owns_connection = cursor is None
     conn = db() if owns_connection else None
     try:

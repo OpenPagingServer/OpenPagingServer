@@ -8,6 +8,7 @@ from datetime import datetime
 from flask import Flask, Response, jsonify, request
 
 import endpoints
+from group_features import apply_all_recipients_policy
 from broadcasts import (
     create_custom_broadcast,
     expire_any_message_rule_broadcasts,
@@ -215,6 +216,7 @@ def clean_group_value(value):
 
 def validate_groups(group_value):
     groups = clean_group_value(group_value)
+    groups, _removed_all = apply_all_recipients_policy(groups)
     if not groups:
         return "", "group_id is required"
     if groups == "0":

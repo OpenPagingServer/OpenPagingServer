@@ -1,6 +1,7 @@
 import ctypes
 import ctypes.util
 import os
+import struct
 
 try:
     G7221C_BIT_RATE = int(os.getenv("OPS_G7221C_BITRATE", "24000") or 24000)
@@ -10,6 +11,16 @@ if G7221C_BIT_RATE not in (24000, 32000, 48000):
     G7221C_BIT_RATE = 24000
 G7221C_SAMPLE_RATE = 32000
 G7221C_FRAME_BYTES = G7221C_BIT_RATE // 50 // 8
+
+PCM_S16LE_SAMPLE_RATE = 48000
+PCM_S16LE_CHANNELS = 2
+PCM_S16LE_SAMPLE_WIDTH = 2
+PCM_S16LE_FRAME_MS = 20
+PCM_S16LE_SAMPLES_PER_CHANNEL = PCM_S16LE_SAMPLE_RATE * PCM_S16LE_FRAME_MS // 1000
+PCM_S16LE_FRAME_BYTES = (
+    PCM_S16LE_SAMPLES_PER_CHANNEL * PCM_S16LE_CHANNELS * PCM_S16LE_SAMPLE_WIDTH
+)
+PCM_S16LE_SILENCE_FRAME = b"\x00" * PCM_S16LE_FRAME_BYTES
 
 SIP_CODEC_PAYLOADS = {
     "PCMU": {"payload_type": 0, "sample_rate": 8000, "rtpmap": "PCMU/8000", "samples_per_frame": 160},
@@ -88,6 +99,26 @@ def _linear_to_ulaw(sample):
     return ~(sign | (exponent << 4) | mantissa) & 0xFF
 
 
+def _linear_to_alaw(sample):
+    sample = int(sample)
+    if sample >= 0:
+        mask = 0xD5
+    else:
+        mask = 0x55
+        sample = -sample - 8
+    sample = max(0, min(32635, sample))
+    if sample >= 256:
+        exponent = 7
+        exp_mask = 0x4000
+        while exponent > 0 and not (sample & exp_mask):
+            exponent -= 1
+            exp_mask >>= 1
+        value = (exponent << 4) | ((sample >> (exponent + 3)) & 0x0F)
+    else:
+        value = sample >> 4
+    return value ^ mask
+
+
 def _build_alaw_to_ulaw_table():
     values = []
     for i in range(256):
@@ -108,6 +139,23 @@ def _build_alaw_to_ulaw_table():
 ALAW_TO_ULAW_TABLE = _build_alaw_to_ulaw_table()
 
 
+def _alaw_to_linear(sample):
+    value = int(sample) ^ 0x55
+    sign = value & 0x80
+    exponent = (value >> 4) & 0x07
+    mantissa = value & 0x0F
+    linear = (mantissa << 4) + 8
+    if exponent:
+        linear = (linear + 0x100) << (exponent - 1)
+    return linear if sign else -linear
+
+
+_ALAW_TO_PCM16 = tuple(
+    int(_alaw_to_linear(value)).to_bytes(2, "little", signed=True)
+    for value in range(256)
+)
+
+
 def _pcm16_to_ulaw_bytes(pcm):
     out = bytearray(len(pcm) // 2)
     for i in range(len(out)):
@@ -119,6 +167,71 @@ def _pcm16_to_ulaw_bytes(pcm):
 def _ulaw_to_pcm16_bytes(ulaw_frame):
     table = _ULAW_TO_PCM16
     return b"".join(table[b] for b in ulaw_frame)
+
+
+def _pcm8k_mono_to_pcm_s16le_48k_stereo(pcm16):
+    data = bytes(pcm16 or b"")
+    if len(data) & 1:
+        data = data[:-1]
+    out = bytearray((len(data) // 2) * 24)
+    offset = 0
+    for index in range(0, len(data), 2):
+        sample = data[index:index + 2]
+        stereo_sample = sample + sample
+        out[offset:offset + 24] = stereo_sample * 6
+        offset += 24
+    return bytes(out)
+
+
+def ulaw_to_pcm_s16le_48k_stereo(payload):
+    return _pcm8k_mono_to_pcm_s16le_48k_stereo(_ulaw_to_pcm16_bytes(bytes(payload or b"")))
+
+
+def alaw_to_pcm_s16le_48k_stereo(payload):
+    pcm = b"".join(_ALAW_TO_PCM16[value] for value in bytes(payload or b""))
+    return _pcm8k_mono_to_pcm_s16le_48k_stereo(pcm)
+
+
+def _pcm_s16le_48k_stereo_to_mono_8k_samples(payload):
+    data = bytes(payload or b"")
+    complete_group_bytes = 6 * PCM_S16LE_CHANNELS * PCM_S16LE_SAMPLE_WIDTH
+    usable = len(data) - (len(data) % complete_group_bytes)
+    samples = []
+    for offset in range(0, usable, complete_group_bytes):
+        total = 0
+        count = 0
+        for (left, right) in struct.iter_unpack("<hh", data[offset:offset + complete_group_bytes]):
+            total += int(left) + int(right)
+            count += 2
+        sample = int(round(total / count)) if count else 0
+        samples.append(max(-32768, min(32767, sample)))
+    return samples
+
+
+def pcm_s16le_48k_stereo_to_ulaw(payload):
+    return bytes(_linear_to_ulaw(sample) for sample in _pcm_s16le_48k_stereo_to_mono_8k_samples(payload))
+
+
+def pcm_s16le_48k_stereo_to_alaw(payload):
+    return bytes(
+        _linear_to_alaw(sample)
+        for sample in _pcm_s16le_48k_stereo_to_mono_8k_samples(payload)
+    )
+
+
+def pcm_s16le_48k_stereo_to_pcm16_mono_8k(payload):
+    return b"".join(
+        int(sample).to_bytes(2, "little", signed=True)
+        for sample in _pcm_s16le_48k_stereo_to_mono_8k_samples(payload)
+    )
+
+
+def normalize_pcm_s16le_48k_stereo_frame(payload, accept_legacy_ulaw=True):
+    data = bytes(payload or b"")
+    if accept_legacy_ulaw and len(data) <= 160:
+        legacy = data[:160].ljust(160, b"\xff")
+        return ulaw_to_pcm_s16le_48k_stereo(legacy)
+    return data[:PCM_S16LE_FRAME_BYTES].ljust(PCM_S16LE_FRAME_BYTES, b"\x00")
 
 
 class _AvEncoder:
@@ -145,14 +258,14 @@ class _AvEncoder:
         self._pts = 0
         self.frame_size = int(ctx.frame_size or 0)
 
-    def feed(self, pcm16_8k):
+    def feed(self, pcm16_48k_stereo):
         av = self._av
-        samples = len(pcm16_8k) // 2
-        frame = av.AudioFrame(format="s16", layout="mono", samples=samples)
-        frame.sample_rate = 8000
+        samples = len(pcm16_48k_stereo) // (PCM_S16LE_SAMPLE_WIDTH * PCM_S16LE_CHANNELS)
+        frame = av.AudioFrame(format="s16", layout="stereo", samples=samples)
+        frame.sample_rate = PCM_S16LE_SAMPLE_RATE
         frame.pts = self._pts
         self._pts += samples
-        frame.planes[0].update(pcm16_8k)
+        frame.planes[0].update(pcm16_48k_stereo)
 
         out = []
         for resampled in self.resampler.resample(frame):
@@ -185,14 +298,14 @@ class _G7221CEncoder:
         self._pts = 0
         self.frame_samples = G7221C_SAMPLE_RATE // 50
 
-    def feed(self, pcm16_8k):
+    def feed(self, pcm16_48k_stereo):
         av = self._av
-        samples = len(pcm16_8k) // 2
-        frame = av.AudioFrame(format="s16", layout="mono", samples=samples)
-        frame.sample_rate = 8000
+        samples = len(pcm16_48k_stereo) // (PCM_S16LE_SAMPLE_WIDTH * PCM_S16LE_CHANNELS)
+        frame = av.AudioFrame(format="s16", layout="stereo", samples=samples)
+        frame.sample_rate = PCM_S16LE_SAMPLE_RATE
         frame.pts = self._pts
         self._pts += samples
-        frame.planes[0].update(pcm16_8k)
+        frame.planes[0].update(pcm16_48k_stereo)
         for resampled in self.resampler.resample(frame):
             self.fifo.write(resampled)
         out = []
@@ -216,8 +329,8 @@ class _G726EncoderShim:
     def __init__(self):
         self.enc = G726Encoder()
 
-    def feed(self, pcm16_8k):
-        packet = self.enc.encode(pcm16_8k)
+    def feed(self, pcm16_48k_stereo):
+        packet = self.enc.encode(pcm_s16le_48k_stereo_to_pcm16_mono_8k(pcm16_48k_stereo))
         return [packet] if packet else []
 
     def close(self):
@@ -253,16 +366,16 @@ class SipCodecEncoder:
             self.failed = True
             self._encoder = None
 
-    def encode(self, ulaw_frame):
-        frame = bytes(ulaw_frame or b"")[:160].ljust(160, b"\xff")
+    def encode(self, pcm_frame):
+        frame = normalize_pcm_s16le_48k_stereo_frame(pcm_frame)
         if self.codec_name == "PCMU":
-            return frame
+            return pcm_s16le_48k_stereo_to_ulaw(frame)
         if self.codec_name == "PCMA":
-            return frame.translate(ULAW_TO_ALAW_TABLE)
+            return pcm_s16le_48k_stereo_to_alaw(frame)
         if self.failed or self._encoder is None:
             return b""
         try:
-            packets = self._encoder.feed(_ulaw_to_pcm16_bytes(frame))
+            packets = self._encoder.feed(frame)
         except Exception as exc:
             print(f"sip codec encode failed codec={self.codec_name}: {exc}", flush=True)
             self.failed = True
@@ -299,6 +412,11 @@ def encode_sip_rtp_payload(codec_name, payload, encoder_state=None):
     return encoder.encode(payload), encoder
 
 
+def encode_pcm_s16le_48k_stereo_to_sip_rtp_payload(codec_name, payload, encoder_state=None):
+    pcm = normalize_pcm_s16le_48k_stereo_frame(payload, accept_legacy_ulaw=False)
+    return encode_sip_rtp_payload(codec_name, pcm, encoder_state=encoder_state)
+
+
 class _AvDecoder:
 
     def __init__(self, av_codec_name, rate, channels=1):
@@ -311,7 +429,9 @@ class _AvDecoder:
         ctx.layout = "mono" if channels == 1 else "stereo"
         ctx.sample_rate = rate
         self.ctx = ctx
-        self.resampler = AudioResampler(format="s16", layout="mono", rate=8000)
+        self.resampler = AudioResampler(
+            format="s16", layout="stereo", rate=PCM_S16LE_SAMPLE_RATE
+        )
 
     def feed(self, payload):
         av = self._av
@@ -319,7 +439,11 @@ class _AvDecoder:
         pcm = bytearray()
         for frame in self.ctx.decode(packet):
             for resampled in self.resampler.resample(frame):
-                pcm.extend(bytes(resampled.planes[0])[: resampled.samples * 2])
+                pcm.extend(
+                    bytes(resampled.planes[0])[
+                        :resampled.samples * PCM_S16LE_CHANNELS * PCM_S16LE_SAMPLE_WIDTH
+                    ]
+                )
         return bytes(pcm)
 
     def close(self):
@@ -337,7 +461,9 @@ class _G7221CDecoder:
 
         self._av = av
         self.dec = G7221Decoder(bit_rate=G7221C_BIT_RATE, sample_rate=G7221C_SAMPLE_RATE)
-        self.resampler = AudioResampler(format="s16", layout="mono", rate=8000)
+        self.resampler = AudioResampler(
+            format="s16", layout="stereo", rate=PCM_S16LE_SAMPLE_RATE
+        )
         self._pts = 0
 
     def feed(self, payload):
@@ -353,7 +479,11 @@ class _G7221CDecoder:
         frame.planes[0].update(pcm32)
         out = bytearray()
         for resampled in self.resampler.resample(frame):
-            out.extend(bytes(resampled.planes[0])[: resampled.samples * 2])
+            out.extend(
+                bytes(resampled.planes[0])[
+                    :resampled.samples * PCM_S16LE_CHANNELS * PCM_S16LE_SAMPLE_WIDTH
+                ]
+            )
         return bytes(out)
 
     def close(self):
@@ -369,7 +499,7 @@ class _G726DecoderShim:
         self.dec = G726Decoder()
 
     def feed(self, payload):
-        return self.dec.decode(payload)
+        return _pcm8k_mono_to_pcm_s16le_48k_stereo(self.dec.decode(payload))
 
     def close(self):
         self.dec.close()
@@ -381,13 +511,14 @@ class SipCodecDecoder:
         self.codec_name = normalize_sip_codec_name(codec_name) or "PCMU"
         self.failed = False
         self._decoder = None
+        self._pcm_buffer = bytearray()
         if self.codec_name in ("PCMU", "PCMA"):
             return
         try:
             if self.codec_name == "G722":
                 self._decoder = _AvDecoder("adpcm_g722", 16000)
             elif self.codec_name == "OPUS":
-                self._decoder = _AvDecoder("libopus", 48000, channels=2)
+                self._decoder = _AvDecoder("opus", 48000, channels=2)
             elif self.codec_name == "G7221C":
                 self._decoder = _G7221CDecoder()
             elif self.codec_name == "G726-32":
@@ -404,18 +535,25 @@ class SipCodecDecoder:
         if not data:
             return b""
         if self.codec_name == "PCMU":
-            return data
-        if self.codec_name == "PCMA":
-            return data.translate(ALAW_TO_ULAW_TABLE)
-        if self.failed or self._decoder is None:
-            return b""
-        try:
-            pcm = self._decoder.feed(data)
-        except Exception:
-            return b""
+            pcm = ulaw_to_pcm_s16le_48k_stereo(data)
+        elif self.codec_name == "PCMA":
+            pcm = alaw_to_pcm_s16le_48k_stereo(data)
+        else:
+            if self.failed or self._decoder is None:
+                return b""
+            try:
+                pcm = self._decoder.feed(data)
+            except Exception:
+                return b""
         if not pcm:
             return b""
-        return _pcm16_to_ulaw_bytes(pcm)
+        self._pcm_buffer.extend(pcm)
+        complete = len(self._pcm_buffer) - (len(self._pcm_buffer) % PCM_S16LE_FRAME_BYTES)
+        if complete <= 0:
+            return b""
+        output = bytes(self._pcm_buffer[:complete])
+        del self._pcm_buffer[:complete]
+        return output
 
     def close(self):
         if self._decoder is not None:
@@ -423,7 +561,7 @@ class SipCodecDecoder:
             self._decoder = None
 
 
-def decode_sip_rtp_payload(codec_name, payload, decoder_state=None):
+def decode_sip_rtp_payload_to_pcm_s16le_48k_stereo(codec_name, payload, decoder_state=None):
     codec = normalize_sip_codec_name(codec_name) or "PCMU"
     decoder = decoder_state
     if decoder is None or getattr(decoder, "codec_name", "") != codec:
@@ -434,6 +572,15 @@ def decode_sip_rtp_payload(codec_name, payload, decoder_state=None):
                 pass
         decoder = SipCodecDecoder(codec)
     return decoder.decode(payload), decoder
+
+
+def decode_sip_rtp_payload(codec_name, payload, decoder_state=None):
+    pcm, decoder = decode_sip_rtp_payload_to_pcm_s16le_48k_stereo(
+        codec_name,
+        payload,
+        decoder_state=decoder_state,
+    )
+    return pcm_s16le_48k_stereo_to_ulaw(pcm) if pcm else b"", decoder
 
 
 G726_NIBBLE_LSB = str(os.getenv("OPS_G726_NIBBLE", "") or "").strip().lower() in ("lsb", "little", "aal2")

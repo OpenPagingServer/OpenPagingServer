@@ -44,7 +44,8 @@ CUSTOM_EXTRA_STYLE = r"""
 
 CUSTOM_SCRIPT = MESSAGE_FORM_SCRIPT + r"""
 function toggleRecipients(){
-    const all = document.getElementById('send_all').checked;
+    const allInput = document.getElementById('send_all');
+    const all = !!(allInput && allInput.checked);
     document.querySelectorAll('.group-checkbox').forEach(cb => {
         cb.disabled = all || cb.dataset.unavailable === '1';
         if (all) cb.checked = false;
@@ -130,6 +131,7 @@ def handle_request():
     if not can_send_messages(user):
         abort(403)
     ctx = legacy_user_context(user)
+    disable_all_recipients = all_recipients_disabled(ctx.get("settings"))
     if demo_mode_enabled():
         return demo_mode_iframe_html("messages")
     ensure_message_vendor_schema()
@@ -145,7 +147,7 @@ def handle_request():
         if not has_audio and not has_text:
             error = "Enter a message, add audio, or both."
         msg_type = "text+audio" if (has_audio and has_text) else ("audio" if has_audio else "text")
-        if not error and form_state["send_all"]:
+        if not error and form_state["send_all"] and not disable_all_recipients:
             groups_value = all_group_ids_value(user)
         elif not error:
             allowed_group_ids = {
@@ -161,7 +163,7 @@ def handle_request():
         else:
             groups_value = ""
         if not error and groups_value in {"", "0"}:
-            error = "Select at least one group, or choose All Recipients."
+            error = "Select at least one group." if disable_all_recipients else "Select at least one group, or choose All Recipients."
         if not error:
             expires_rule = message_expiration_from_form(request.form)
             try:
@@ -213,6 +215,13 @@ def handle_request():
     all_disabled = " disabled" if all_unavailable else ""
     all_row_cls = " recipient-row unavailable" if all_unavailable else ""
     all_note = '<span class="recipient-note">No available recipients</span>' if all_unavailable else ""
+    all_recipient_option = "" if disable_all_recipients else f"""                    <label class="md-checkbox-container">
+                        <input type="checkbox" name="send_all" id="send_all" value="1" onchange="toggleRecipients()"{all_disabled}{' checked' if form_state["send_all"] else ''}>
+                        <span class="md-checkmark"></span>
+                        <span class="text" style="font-weight:bold;color:var(--ops-accent);">All Recipients</span>
+                        {all_note}
+                    </label>
+"""
     selected_groups = set(form_state["groups"])
     if groups:
         group_rows = []
@@ -265,12 +274,7 @@ def handle_request():
             <div class="form-group">
                 <label class="main-label">Recipients</label>
                 <div class="checkbox-row">
-                    <label class="md-checkbox-container">
-                        <input type="checkbox" name="send_all" id="send_all" value="1" onchange="toggleRecipients()"{all_disabled}{' checked' if form_state["send_all"] else ''}>
-                        <span class="md-checkmark"></span>
-                        <span class="text" style="font-weight:bold;color:var(--ops-accent);">All Recipients</span>
-                        {all_note}
-                    </label>
+{all_recipient_option}
 {groups_html}
                 </div>
             </div>

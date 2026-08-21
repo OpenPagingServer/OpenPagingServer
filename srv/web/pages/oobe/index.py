@@ -1,6 +1,8 @@
 from srv.web.app import *
 
-OOBE_STAGES = {"welcome", "account", "time", "modules", "analytics", "complete"}
+OOBE_STAGES = {"welcome", "account", "time", "modules", "codec", "analytics", "complete"}
+
+INTERNAL_STREAMING_CODEC_PCMU = "pcmu_8k_mono"
 
 OOBE_STYLE = r"""
 body,html{margin:0;padding:0;min-height:100%;font-family:Tahoma,sans-serif;background:#e3f2fd;color:#202124}
@@ -34,9 +36,10 @@ def oobe_settings():
         "enable_login_logo": "1",
         "login_logo_light": "/assets/OPENPAGINGSERVER-768x576-LIGHTMODE.png",
         "login_logo_dark": "/assets/OPENPAGINGSERVER-768x576-DARKMODE.png",
+        "internal_streaming_codec": "pcm_s16le_48k_stereo",
     }
     try:
-        for row in query_all("SELECT parameter, value FROM systemsettings WHERE parameter IN ('product_name','favicon','separate_dark_logo','enable_login_logo','login_logo_light','login_logo_dark')"):
+        for row in query_all("SELECT parameter, value FROM systemsettings WHERE parameter IN ('product_name','favicon','separate_dark_logo','enable_login_logo','login_logo_light','login_logo_dark','internal_streaming_codec')"):
             defaults[str(row.get("parameter"))] = str(row.get("value") or "")
     except Exception:
         pass
@@ -45,6 +48,10 @@ def oobe_settings():
 
 def save_oobe_setting(parameter, value, description):
     execute("INSERT INTO systemsettings (`parameter`, `value`, `description`) VALUES (%s,%s,%s) ON DUPLICATE KEY UPDATE `value`=VALUES(`value`), `description`=VALUES(`description`)", (parameter, value, description))
+
+
+def internal_streaming_codec_is_pcmu(settings):
+    return settings.get("internal_streaming_codec") == INTERNAL_STREAMING_CODEC_PCMU
 
 
 def oobe_stage():
@@ -110,6 +117,11 @@ def stage_body(stage, settings, error, notice):
         <input type="hidden" name="stage" value="modules">
         <button type="submit" style="display:none" aria-hidden="true"></button>
         <div class="actions"><button class="button secondary" name="action" value="back" type="submit">Back</button><input type="hidden" name="back_stage" value="time"><button class="button" type="submit">Next</button></div></form>"""
+    elif stage == "codec":
+        content = """<h1>Internal streaming codec downgraded due to limited system resources</h1><p class="lead">Due to low system resources, the internal streaming codec was set to PCMU Mono 8 kHz. The default is PCM S16LE Stereo 48 kHz. This will stretch capacity, but audio quality will be limited. Minimum recommended specifications are 2 CPU cores, and 2 GB of RAM. 4 CPU cores and 4-8 GB of RAM preferred. It's recommended to increase your system resources if possible. To change this setting, go to System Settings &gt; Advanced &gt; Internal Streaming Codec.</p>
+        <form method="post">
+        <input type="hidden" name="stage" value="codec">
+        <div class="actions"><button class="button" type="submit">Continue</button></div></form>"""
     elif stage == "analytics":
         content = """<h1>Would you like to enable optional analytics?</h1><p class="lead">To help the Open Paging Server project improve, you can opt-in to share optional analytics. Analytics contain mainly anonymous data such as your operating system, software versions, anonymized crash logs, etc. And may include your public IP address. You can change this setting later. <a href="https://www.openpagingserver.org/privacypolicy/analytics">Privacy Policy</a></p>
         <form method="post">
@@ -129,6 +141,9 @@ def handle_request():
         return redirect("/")
     settings = oobe_settings()
     stage = oobe_stage()
+    codec_is_pcmu = internal_streaming_codec_is_pcmu(settings)
+    if stage == "codec" and not codec_is_pcmu:
+        stage = "analytics"
     error = ""
     notice = ""
     if request.method == "POST":
@@ -157,6 +172,8 @@ def handle_request():
         elif stage == "time":
             stage = "modules"
         elif stage == "modules":
+            stage = "codec" if codec_is_pcmu else "analytics"
+        elif stage == "codec":
             stage = "analytics"
         elif stage == "analytics":
             analytics = "1" if action == "opt_in" else "0"

@@ -9,8 +9,77 @@ from srv.web.pages.admin.settings.common import settings_page
 SIP_RTP_DEFAULT_PORT_START = "40000"
 SIP_RTP_DEFAULT_PORT_END = "50000"
 SIP_CODEC_OPTIONS = ("PCMU", "PCMA", "G722", "G726-32", "OPUS", "G7221C")
-SIP_CODEC_DEFAULT_ORDER = ("PCMU", "G722", "PCMA", "OPUS")
+SIP_CODEC_DEFAULT_ORDER = ("G722", "OPUS", "PCMU", "PCMA")
 SIP_CODEC_DEFAULT_ENABLED = {"PCMU", "G722"}
+SIP_CODEC_LEGACY_DEFAULT_ORDER = ("PCMU", "G722", "PCMA", "OPUS")
+SIP_BLOCK_SCANNERS_SETTING = "sip_block_scanners"
+SIP_INTRUSION_PREVENTION_SETTING = "sip_intrusion_prevention"
+SIP_SECURITY_FALSE_VALUES = {"0", "false", "off", "disable", "disabled", "no"}
+SIP_SECURITY_UNLOCK_SESSION_KEY = "sip_security_unlock_until"
+SIP_SECURITY_UNLOCK_IP_SESSION_KEY = "sip_security_unlock_ip"
+SIP_SECURITY_UNLOCK_PAGE_TOKEN_SESSION_KEY = "sip_security_unlock_page_token"
+SIP_SECURITY_UNLOCK_PAGE_TOKEN_FORM_KEY = "sip_security_unlock_page_token"
+SIP_SECURITY_UNLOCK_TTL_SECONDS = 300
+SIP_SENSITIVE_VERIFY_SESSION_KEY = "sip_sensitive_verify_until"
+SIP_SENSITIVE_VERIFY_CHALLENGE_KEY = "sip_sensitive_verify_challenge"
+SIP_SENSITIVE_VERIFY_TTL_SECONDS = 180
+
+
+def sip_abuse_override_enabled():
+    return str(os.getenv("ALLOW_SIP_ABUSE", "") or "").strip().lower() == "true"
+
+
+def is_port_in_use(port):
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=0.1):
+            return True
+    except OSError:
+        return False
+
+
+def is_public_routable_ipv4(value):
+    try:
+        address = ipaddress.IPv4Address(str(value or "").strip())
+    except Exception:
+        return False
+    return bool(address.is_global)
+
+
+def clean_sip_nat_support_mode(value):
+    token = str(value if value is not None else "").strip().lower()
+    return "no" if token in {"no", "off", "disable", "disabled", "0", "false"} else "auto"
+
+
+def detect_external_ipv4():
+    try:
+        request_obj = urllib.request.Request(
+            "https://analytics.openpagingserver.org/ipaddr",
+            headers={"User-Agent": "OpenPagingServer"},
+        )
+        with urllib.request.urlopen(request_obj, timeout=3) as response:
+            payload = response.read().decode("utf-8", errors="ignore").strip()
+    except Exception:
+        return ""
+    return payload if is_public_routable_ipv4(payload) else ""
+
+
+def setting_enabled_with_default(data, key, default=True):
+    token = str(data.get(key, "") or "").strip().lower()
+    if not token:
+        return bool(default)
+    return token not in SIP_SECURITY_FALSE_VALUES
+
+
+def normalize_toggle_value(value, default="1"):
+    token = str(value if value is not None else default).strip().lower()
+    return "0" if token in SIP_SECURITY_FALSE_VALUES else "1"
+
+
+def sip_security_unlock_hash():
+    return "2a6ad5390bc20f6102ea8c207b9f6c4dd7e636b6a2dbec1b7b45f65ac3792c271384042a1ccd9f92096363fc701ba3c3a531736309e0d2f95f110aa0931f8763"
+
+
+def sip_securitydowngrade_warning():
 SIP_BLOCK_SCANNERS_SETTING = "sip_block_scanners"
 SIP_INTRUSION_PREVENTION_SETTING = "sip_intrusion_prevention"
 SIP_SECURITY_FALSE_VALUES = {"0", "false", "off", "disable", "disabled", "no"}
@@ -113,8 +182,6 @@ def ensure_sip_security_settings(data):
 
 
 def sip_codec_is_available(codec):
-    """G7221C requires libg722_1 (installed via scripts/build-g7221.sh); hide it
-    from the codec picker when the library isn't present so it can't be selected."""
     if str(codec or "").strip().upper() == "G7221C":
         try:
             from sip.codec import g7221_available
@@ -135,6 +202,8 @@ def normalize_sip_codec_token(value):
 
 def parse_sip_codec_order(value):
     raw_tokens = [normalize_sip_codec_token(token) for token in str(value or "").split(",")]
+    if tuple(token for token in raw_tokens if token) == SIP_CODEC_LEGACY_DEFAULT_ORDER:
+        raw_tokens = list(SIP_CODEC_DEFAULT_ORDER)
     ordered = []
     seen = set()
     for token in raw_tokens:
@@ -166,6 +235,8 @@ def stored_sip_codec_order(value):
         if normalized and normalized not in seen:
             ordered.append(normalized)
             seen.add(normalized)
+    if tuple(ordered) == SIP_CODEC_LEGACY_DEFAULT_ORDER:
+        return list(SIP_CODEC_DEFAULT_ORDER)
     return ordered
 
 
@@ -298,6 +369,12 @@ def verify_sensitive_change_response(user):
 def sip_settings_body(ctx, data, detected_external_ipv4, user, unlock_page_token=""):
     udp_checked = " checked" if data.get("enable_insecure_sip", "0") == "1" else ""
     udp_disabled = "" if udp_checked else " disabled"
+    tls_checked = " checked" if str(data.get("enable_secure_sip", "0") or "0") not in {"", "0"} else ""
+    tls_disabled = "" if tls_checked else " disabled"
+    certificate_options = '<option value="">Select a certificate</option>' + "".join(
+        f'<option value="{int(record["id"])}"{" selected" if str(record["id"]) == str(data.get("secure_sip_certificate_id", "")) else ""}>{h(record.get("name"))}</option>'
+        for record in certificate_records()
+    )
     nat_enabled = clean_sip_nat_support_mode(data.get("sip_nat_support", "1")) != "no"
     nat_checked = " checked" if nat_enabled else ""
     sip_codec_order = stored_sip_codec_order(data.get("sip_codecs_order", ""))
@@ -600,6 +677,23 @@ def sip_settings_body(ctx, data, detected_external_ipv4, user, unlock_page_token
                     {docker_port_notice}
                     <span id="udpPortError" class="port-error-text">Please enter a valid port (1-65535).</span>
                 </div>
+                <div class="info-row" style="border-bottom:none; padding-bottom:0;">
+                    <span class="info-label">Enable SIP over TLS</span>
+                    <span><label class="switch"><input type="checkbox" name="enable_secure_sip" id="tlsToggle"{tls_checked}><span class="slider"></span></label></span>
+                </div>
+                <div id="sipTlsSettings">
+                    <div class="info-row" style="flex-direction: column; align-items: flex-start; gap: 8px; border-bottom:none;">
+                        <span class="info-label">TLS Port</span>
+                        <input type="number" name="secure_sip_port" id="tlsPort" min="1" max="65535" value="{h(data.get("secure_sip_port", "5061") or "5061")}"{docker_port_disabled if docker_mode else tls_disabled}{docker_port_style}>
+                        {docker_port_notice}
+                        <span id="tlsPortError" class="port-error-text">Please enter a valid port (1-65535).</span>
+                    </div>
+                    <div class="info-row" style="flex-direction: column; align-items: flex-start; gap: 8px; margin-bottom:16px;">
+                        <span class="info-label">Certificate</span>
+                        <select name="secure_sip_certificate_id" id="tlsCertificate"{tls_disabled}>{certificate_options}</select>
+                        <span class="info-description">Certificates are managed in the Certificates settings panel.</span>
+                    </div>
+                </div>
                 <div class="info-row" style="align-items:center; gap:16px; flex-wrap:wrap;">
                     <span class="info-label">RTP Port Range</span>
                     <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-left:auto;">
@@ -710,6 +804,11 @@ document.addEventListener('DOMContentLoaded', function() {
     const udpToggle = document.getElementById('udpToggle');
     const udpPort = document.getElementById('udpPort');
     const udpPortError = document.getElementById('udpPortError');
+    const tlsToggle = document.getElementById('tlsToggle');
+    const tlsSettings = document.getElementById('sipTlsSettings');
+    const tlsPort = document.getElementById('tlsPort');
+    const tlsPortError = document.getElementById('tlsPortError');
+    const tlsCertificate = document.getElementById('tlsCertificate');
     const natToggle = document.getElementById('natToggle');
     const natOptions = document.getElementById('natOptions');
     const externalIpv4ModeAuto = document.getElementById('externalIpv4ModeAuto');
@@ -905,6 +1004,18 @@ __UNLOCK_RUNTIME_DECLARATIONS__
         }
     }
 
+    function syncTls() {
+        const enabled = tlsToggle.checked;
+        tlsSettings.style.display = enabled ? '' : 'none';
+        tlsPort.disabled = !enabled;
+        tlsCertificate.disabled = !enabled;
+        if (enabled) validatePortInput(tlsPort, tlsPortError, 1);
+        else {
+            tlsPort.classList.remove('invalid-port');
+            tlsPortError.style.display = 'none';
+        }
+    }
+
     function syncExternalIpv4Field() {
         const autoSelected = externalIpv4ModeAuto.checked;
         if (autoSelected) {
@@ -928,9 +1039,11 @@ __UNLOCK_RUNTIME_DECLARATIONS__
 
     function validateForm() {
         const udpValid = !udpToggle.checked || validatePortInput(udpPort, udpPortError, 1);
+        const tlsValid = !tlsToggle.checked || validatePortInput(tlsPort, tlsPortError, 1);
+        const certificateValid = !tlsToggle.checked || Boolean(tlsCertificate.value);
         const natValid = validateExternalIpv4();
         const rtpValid = validateRtpRange();
-        return udpValid && natValid && rtpValid;
+        return udpValid && tlsValid && certificateValid && natValid && rtpValid;
     }
 
     function syncSecurityHiddenValues() {
@@ -1066,10 +1179,11 @@ __UNLOCK_RUNTIME_DECLARATIONS__
         hiddenInput.value = toggle.checked ? '1' : '0';
     }
 
-    [udpPort, rtpPortStart, rtpPortEnd].forEach(input => {
+    [udpPort, tlsPort, rtpPortStart, rtpPortEnd].forEach(input => {
         input.addEventListener('input', function() {
-            clampPortInput(this, this === udpPort ? 1 : 1024);
+            clampPortInput(this, (this === udpPort || this === tlsPort) ? 1 : 1024);
             if (this === udpPort) validatePortInput(udpPort, udpPortError, 1);
+            else if (this === tlsPort) validatePortInput(tlsPort, tlsPortError, 1);
             else validateRtpRange();
         });
     });
@@ -1078,6 +1192,7 @@ __UNLOCK_RUNTIME_DECLARATIONS__
         validateExternalIpv4();
     });
     udpToggle.addEventListener('change', syncUdp);
+    tlsToggle.addEventListener('change', syncTls);
     natToggle.addEventListener('change', syncNatOptions);
     externalIpv4ModeAuto.addEventListener('change', syncExternalIpv4Field);
     externalIpv4ModeManual.addEventListener('change', syncExternalIpv4Field);
@@ -1125,6 +1240,7 @@ __UNLOCK_RUNTIME_DECLARATIONS__
 __UNLOCK_LISTENER_BLOCK__
 
     syncUdp();
+    syncTls();
     syncNatOptions();
     syncSecurityHiddenValues();
     validateRtpRange();
@@ -1223,7 +1339,7 @@ def handle_request():
     user = require_admin()
     if not isinstance(user, dict):
         return user
-    data = settings()
+    data = ensure_certificate_schema(settings())
     ensure_sip_rtp_port_settings(data)
     ensure_sip_security_settings(data)
     allow_sip_abuse = sip_abuse_override_enabled()
@@ -1254,6 +1370,9 @@ def handle_request():
 
         udp_enabled = "1" if request.form.get("enable_insecure_sip") else "0"
         udp_port = request.form.get("insecure_sip_port", "5060").strip()
+        tls_enabled = "1" if request.form.get("enable_secure_sip") else "0"
+        tls_port = request.form.get("secure_sip_port", "5061").strip()
+        tls_certificate_id = request.form.get("secure_sip_certificate_id", data.get("secure_sip_certificate_id", "")).strip()
         nat_support = "1" if request.form.get("sip_nat_support") else "0"
         external_mode = str(request.form.get("sip_external_ipv4_mode", "auto") or "auto").strip().lower()
         stored_manual_external_ipv4 = str(data.get("sip_external_ipv4", "") or "").strip()
@@ -1264,7 +1383,6 @@ def handle_request():
         sip_codecs_enabled = request.form.get("sip_codecs_enabled", str(data.get("sip_codecs_enabled", "") or "")).strip()
         block_scanners = normalize_toggle_value(request.form.get(SIP_BLOCK_SCANNERS_SETTING, data.get(SIP_BLOCK_SCANNERS_SETTING, "1")), default="1")
         intrusion_prevention = normalize_toggle_value(request.form.get(SIP_INTRUSION_PREVENTION_SETTING, data.get(SIP_INTRUSION_PREVENTION_SETTING, "1")), default="1")
-        tls_enabled = data.get("enable_secure_sip", "0")
         scanners_were_enabled = effective_sip_security_enabled(data, SIP_BLOCK_SCANNERS_SETTING, default=True)
         intrusion_were_enabled = effective_sip_security_enabled(data, SIP_INTRUSION_PREVENTION_SETTING, default=True)
         if not allow_sip_abuse:
@@ -1287,6 +1405,27 @@ def handle_request():
                 errors.append(f"Port {udp_port} is already in use.")
         except ValueError:
             errors.append("Invalid SIP port.")
+
+        try:
+            tls_port_number = int(tls_port)
+            if tls_port_number < 1 or tls_port_number > 65535:
+                errors.append("Invalid SIP TLS port.")
+            elif tls_enabled == "1" and str(tls_port) != str(data.get("secure_sip_port", "5061")) and is_port_in_use(tls_port):
+                errors.append(f"Port {tls_port} is already in use.")
+            elif tls_enabled == "1" and udp_enabled == "1" and str(tls_port) == str(udp_port):
+                errors.append("SIP UDP/TCP and TLS ports must be different.")
+        except ValueError:
+            errors.append("Invalid SIP TLS port.")
+
+        if tls_enabled == "1":
+            certificate = certificate_record(tls_certificate_id)
+            if not certificate:
+                errors.append("Select a certificate when SIP over TLS is enabled.")
+            else:
+                try:
+                    validate_tls_certificate(certificate["certificate_path"], certificate["private_key_path"])
+                except ValueError as exc:
+                    errors.append(str(exc))
 
         try:
             rtp_start_number = int(rtp_port_start)
@@ -1316,6 +1455,9 @@ def handle_request():
                 {
                     "enable_insecure_sip": udp_enabled,
                     "insecure_sip_port": udp_port,
+                    "enable_secure_sip": tls_enabled,
+                    "secure_sip_port": tls_port,
+                    "secure_sip_certificate_id": tls_certificate_id,
                     "sip_nat_support": nat_support,
                     "sip_external_ipv4_mode": external_mode,
                     "sip_external_ipv4": manual_external_ipv4,
@@ -1350,6 +1492,10 @@ def handle_request():
         save_setting("sip", "1" if (udp_enabled == "1" or tls_enabled == "1") else "0", "Enable SIP")
         save_setting("enable_insecure_sip", udp_enabled, "Enable SIP over UDP/TCP")
         save_setting("insecure_sip_port", udp_port, "SIP UDP/TCP Port")
+        save_setting("enable_secure_sip", tls_enabled, "Enable SIP over TLS (0/1)")
+        save_setting("secure_sip_port", tls_port, "Port for TLS SIP")
+        if tls_enabled == "1" and tls_certificate_id:
+            set_certificate_for_service("sip", tls_certificate_id)
         save_setting("sip_nat_support", nat_support, "Enable NAT support for SIP (0/1)")
         save_setting("sip_external_ipv4_mode", external_mode, "SIP external IPv4 mode (auto/manual)")
         save_setting("sip_external_ipv4", manual_external_ipv4, "Manual SIP external IPv4 address")

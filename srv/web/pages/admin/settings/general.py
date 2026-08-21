@@ -13,9 +13,11 @@ def handle_request():
         show_docs = "1" if request.form.get("show_online_docs") else "0"
         analytics = "1" if request.form.get("analytics") else "0"
         allow_multicast_gateway = "1" if request.form.get("allow_multicast_gateway") else "0"
+        disable_all_recipients = "1" if request.form.get("disable_all_recipients") else "0"
         save_setting("show_online_docs", show_docs, "Show GUI links to docs.openpagingserver.org (0/1)")
         save_setting("analytics", analytics, "To help the Open Paging Server project improve, you can opt-in to share optional analytics.")
         save_setting("allow_multicast_gateway", allow_multicast_gateway, "Allow Multicast Gateway connections to this server (0/1)")
+        save_setting("disable_all_recipients", disable_all_recipients, "")
         if request.headers.get("X-Requested-With") == "XMLHttpRequest":
             return jsonify(status="success")
         return redirect("/admin/settings/general")
@@ -23,6 +25,7 @@ def handle_request():
     show_docs_checked = " checked" if data.get("show_online_docs", "1") == "1" else ""
     analytics_checked = " checked" if data.get("analytics", "0") == "1" else ""
     allow_multicast_gateway_checked = " checked" if data.get("allow_multicast_gateway", "0") == "1" else ""
+    disable_all_recipients_checked = " checked" if data.get("disable_all_recipients", "0") == "1" else ""
     demo = demo_mode_enabled()
     docs_link = "https://www.openpagingserver.org/software/multicastgateway/"
     gateway_name = f'<a href="{docs_link}" target="_blank" rel="noopener">Multicast Gateway</a>' if data.get("show_online_docs", "1") == "1" else "Multicast Gateway"
@@ -112,6 +115,10 @@ def handle_request():
                         <button type="button" id="manageMulticastGatewayBtn" style="{manage_servers_style}">Manage Servers</button>
                         <label class="switch"><input type="checkbox" name="allow_multicast_gateway" id="multicastGatewayToggle"{allow_multicast_gateway_checked}><span class="slider"></span></label>
                     </span>
+                </div>
+                <div class="info-row">
+                    <span class="info-label">Disable sending to all recipients</span>
+                    <span><label class="switch"><input type="checkbox" name="disable_all_recipients" id="disableAllRecipientsToggle"{disable_all_recipients_checked}><span class="slider"></span></label></span>
                 </div>
                 <input type="hidden" name="save_general_settings" value="1">
                 <div style="margin-top:20px; display:flex; align-items:center;">

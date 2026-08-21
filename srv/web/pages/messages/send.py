@@ -93,6 +93,7 @@ def handle_request():
     if not can_send_messages(user):
         abort(403)
     ctx = legacy_user_context(user)
+    disable_all_recipients = all_recipients_disabled(ctx.get("settings"))
     msgid = request.values.get("msgid", "")
     msg = query_one("SELECT name FROM messages WHERE messageid=%s LIMIT 1", (msgid,))
     if not msg:
@@ -108,7 +109,7 @@ def handle_request():
     groups = filter_group_rows_for_user(user, groups)
     allowed_group_ids = {str(group.get("id") or "").strip() for group in groups if str(group.get("id") or "").strip()}
     if request.method == "POST":
-        if request.form.get("send_all"):
+        if request.form.get("send_all") and not disable_all_recipients:
             targets = all_group_ids_value(user)
         else:
             selected_groups = [str(group_id or "").strip() for group_id in request.form.getlist("groups[]") if str(group_id or "").strip() in allowed_group_ids]
@@ -139,6 +140,15 @@ def handle_request():
     all_disabled = " disabled" if all_unavailable else ""
     all_row_cls = " recipient-row unavailable" if all_unavailable else ""
     all_note = '<span class="recipient-note">No available recipients</span>' if all_unavailable else ""
+    all_recipient_row = "" if disable_all_recipients else f"""            <div class="info-row{all_row_cls}">
+                <label class="md-checkbox-container">
+                    <input type="checkbox" name="send_all" id="send_all" value="1"{all_disabled}>
+                    <span class="md-checkmark"></span>
+                    <span class="text" style="font-weight: bold; color: var(--ops-accent);">All Recipients</span>
+                    {all_note}
+                </label>
+            </div>
+"""
     if groups:
         group_rows = []
         for group in groups:
@@ -171,15 +181,7 @@ def handle_request():
     <form action="/messages/send?msgid={h(msgid)}" method="POST" id="sendForm">
         <input type="hidden" name="msgid" value="{h(msgid)}">
         <div class="info-card">
-            <div class="info-row{all_row_cls}">
-                <label class="md-checkbox-container">
-                    <input type="checkbox" name="send_all" id="send_all" value="1"{all_disabled}>
-                    <span class="md-checkmark"></span>
-                    <span class="text" style="font-weight: bold; color: var(--ops-accent);">All Recipients</span>
-                    {all_note}
-                </label>
-            </div>
-
+{all_recipient_row}
 {group_html}
 
             <div class="info-row" style="margin-top: 20px; justify-content: flex-end; gap: 15px; border-bottom: none;">

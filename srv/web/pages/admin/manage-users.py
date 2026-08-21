@@ -552,7 +552,10 @@ def handle_request():
         return user
     ensure_api_token_schema()
     ctx = legacy_user_context(user)
-    api_enabled = str(ctx["settings"].get("api_http_enable", "0")) == "1"
+    api_enabled = (
+        str(ctx["settings"].get("api_http_enable", "0")) == "1"
+        or str(ctx["settings"].get("api_https_enable", "0")) == "1"
+    )
     form_error = ""
     edit_user = None
     show_editor = False

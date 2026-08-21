@@ -152,7 +152,9 @@ def settings_tabs(active):
         ("sip", "SIP", "/admin/settings/sip"),
         ("web", "Web", "/admin/settings/web"),
         ("api", "API", "/admin/settings/api"),
+        ("certificates", "Certificates", "/admin/settings/certificates"),
         ("branding", "Branding", "/admin/settings/branding"),
+        ("advanced", "Advanced", "/admin/settings/advanced"),
         ("about", "About", "/admin/settings/about"),
     ]
     links = "".join(

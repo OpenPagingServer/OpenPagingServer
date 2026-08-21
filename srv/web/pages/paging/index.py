@@ -140,23 +140,25 @@ function showPagingControls() {
   pageTitle.style.display = 'block';
 }
 function selectedGroupId() {
-  if (pageAll.checked) {
+  if (pageAll && pageAll.checked) {
     const allGroups = groupCheckboxes.map(cb => cb.value).join('.');
     return allGroups || '0';
   }
   return groupCheckboxes.filter(cb => cb.checked).map(cb => cb.value).join('.');
 }
 function setControlsLocked(locked) {
-  pageAll.disabled = locked;
-  groupCheckboxes.forEach(cb => cb.disabled = locked || pageAll.checked || cb.dataset.unavailable === '1');
+  if (pageAll) pageAll.disabled = locked;
+  groupCheckboxes.forEach(cb => cb.disabled = locked || !!(pageAll && pageAll.checked) || cb.dataset.unavailable === '1');
   micSelect.disabled = locked;
 }
-pageAll.addEventListener('change', () => {
-  groupCheckboxes.forEach(cb => {
-    cb.disabled = pageAll.checked || cb.dataset.unavailable === '1';
-    if (pageAll.checked) cb.checked = false;
+if (pageAll) {
+  pageAll.addEventListener('change', () => {
+    groupCheckboxes.forEach(cb => {
+      cb.disabled = pageAll.checked || cb.dataset.unavailable === '1';
+      if (pageAll.checked) cb.checked = false;
+    });
   });
-});
+}
 async function loadMicrophones() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
     showPermissionMessage('Please allow microphone access in your browser settings to use this page');
@@ -174,39 +176,31 @@ async function loadMicrophones() {
   });
   if (currentValue) micSelect.value = currentValue;
 }
-function ulawEncode(sample) {
-  const BIAS = 0x84;
-  const CLIP = 32635;
-  let pcm = Math.max(-1, Math.min(1, sample));
-  let value = Math.round(pcm * 32767);
-  let sign = (value < 0) ? 0x80 : 0;
-  if (value < 0) value = -value;
-  if (value > CLIP) value = CLIP;
-  value += BIAS;
-  let exponent = 7;
-  for (let mask = 0x4000; (value & mask) === 0 && exponent > 0; mask >>= 1) exponent--;
-  const mantissa = (value >> (exponent + 3)) & 0x0F;
-  return (~(sign | (exponent << 4) | mantissa)) & 0xFF;
-}
-function resampleToUlaw(input) {
-  const combined = resampleCarry.length ? Float32Array.from([...resampleCarry, ...input]) : input;
-  const ratio = sourceSampleRate / 8000;
+function resampleToPcmS16leStereo(input) {
+  const combined = new Float32Array(resampleCarry.length + input.length);
+  combined.set(resampleCarry, 0);
+  combined.set(input, resampleCarry.length);
+  const ratio = sourceSampleRate / 48000;
   const frameCount = Math.floor(combined.length / ratio);
-  const output = new Uint8Array(frameCount);
+  const output = new Uint8Array(frameCount * 4);
+  const view = new DataView(output.buffer);
   let peak = 0;
   for (let i = 0; i < frameCount; i++) {
-    const sample = combined[Math.floor(i * ratio)] || 0;
+    const sourceIndex = Math.min(combined.length - 1, Math.floor(i * ratio));
+    const sample = Math.max(-1, Math.min(1, combined[sourceIndex] || 0));
     peak = Math.max(peak, Math.abs(sample));
-    output[i] = ulawEncode(sample);
+    const signed = sample < 0 ? Math.round(sample * 32768) : Math.round(sample * 32767);
+    view.setInt16(i * 4, signed, true);
+    view.setInt16(i * 4 + 2, signed, true);
   }
-  const consumed = Math.floor(frameCount * ratio);
+  const consumed = Math.min(combined.length, Math.floor(frameCount * ratio));
   resampleCarry = Array.from(combined.slice(consumed));
   meterBar.style.width = `${Math.min(100, Math.round(peak * 120))}%`;
   return output;
 }
 function websocketUrl(groupId) {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const params = new URLSearchParams({ groups: groupId, sender: senderName });
+  const params = new URLSearchParams({ groups: groupId, sender: senderName, codec: 'pcm_s16le_48k_stereo' });
   return `${protocol}//${window.location.host}/live?${params.toString()}`;
 }
 async function startPaging() {
@@ -276,13 +270,13 @@ async function startPaging() {
     };
     processor.onaudioprocess = event => {
       if (!paging || !socket || socket.readyState !== WebSocket.OPEN) return;
-      const ulaw = resampleToUlaw(event.inputBuffer.getChannelData(0));
-      const pending = new Uint8Array(frameCarry.length + ulaw.length);
+      const pcm = resampleToPcmS16leStereo(event.inputBuffer.getChannelData(0));
+      const pending = new Uint8Array(frameCarry.length + pcm.length);
       pending.set(frameCarry, 0);
-      pending.set(ulaw, frameCarry.length);
+      pending.set(pcm, frameCarry.length);
       let offset = 0;
-      for (; offset + 160 <= pending.length; offset += 160) {
-        socket.send(pending.slice(offset, offset + 160));
+      for (; offset + 3840 <= pending.length; offset += 3840) {
+        socket.send(pending.slice(offset, offset + 3840));
       }
       frameCarry = pending.slice(offset);
     };
@@ -375,6 +369,7 @@ def handle_request():
         return user
     ctx = legacy_user_context(user)
     data = ctx["settings"]
+    disable_all_recipients = all_recipients_disabled(data)
     username = user.get("username") or session.get("username") or "User"
     conn = db()
     try:
@@ -391,6 +386,15 @@ def handle_request():
     all_disabled = " disabled" if all_unavailable else ""
     all_unavailable_cls = " recipient-row unavailable" if all_unavailable else ""
     all_note = '<span class="recipient-note">No available recipients</span>' if all_unavailable else ""
+    all_recipient_row = "" if disable_all_recipients else f"""            <div class="info-row{all_unavailable_cls}">
+                <label class="md-checkbox-container">
+                    <input type="checkbox" id="page_all" value="1"{all_disabled}>
+                    <span class="md-checkmark"></span>
+                    <span class="text" style="font-weight:bold;color:var(--ops-accent);">All Recipients</span>
+                    {all_note}
+                </label>
+            </div>
+"""
     if groups:
         group_rows = []
         for group in groups:
@@ -431,14 +435,7 @@ def handle_request():
     <div class="layout hidden" id="pagingLayout">
         <div class="card">
             <h2>Recipients</h2>
-            <div class="info-row{all_unavailable_cls}">
-                <label class="md-checkbox-container">
-                    <input type="checkbox" id="page_all" value="1"{all_disabled}>
-                    <span class="md-checkmark"></span>
-                    <span class="text" style="font-weight:bold;color:var(--ops-accent);">All Recipients</span>
-                    {all_note}
-                </label>
-            </div>
+{all_recipient_row}
 {group_html}
         </div>
         <div>

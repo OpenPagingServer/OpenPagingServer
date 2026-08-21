@@ -19,7 +19,19 @@ from active_broadcast_store import (
     mark_active_broadcast_delivery,
     put_active_broadcast,
 )
-from endpoints import connect_endpoint_ipc
+from endpoints import (
+    ENDPOINT_PCM_FRAME_BYTES,
+    ENDPOINT_PCM_SAMPLE_RATE,
+    INTERNAL_STREAMING_CODEC_PCM,
+    INTERNAL_STREAMING_CODEC_PCMU,
+    configured_internal_streaming_codec,
+    connect_endpoint_ipc,
+    endpoint_pcm_to_ulaw,
+    internal_streaming_uses_pcm,
+    mix_endpoint_pcm_frames,
+    normalize_endpoint_pcm_frame,
+    ulaw_to_endpoint_pcm,
+)
 from clientd import (
     desktop_member_user_id,
     is_desktop_member_token,
@@ -28,6 +40,7 @@ from clientd import (
     user_has_connected_client,
 )
 from group_features import (
+    apply_all_recipients_policy,
     group_names_for_value,
     monitor_targets_for_rows,
     paging_tone_sequence,
@@ -47,6 +60,11 @@ DB_NAME = os.getenv("DB_NAME")
 WS_HOST = os.getenv("LIVEPAGED_WS_HOST", "0.0.0.0")
 WS_PORT = int(os.getenv("LIVEPAGED_WS_PORT", "50010"))
 AUDIO_FRAME_BYTES = 160
+
+
+def endpoint_stream_prepare_command(stream_id, group_id, targets, internal_codec):
+    command = "PREPARELIVEPCM" if internal_streaming_uses_pcm(internal_codec) else "PREPARELIVE"
+    return f"{command} {stream_id} {group_id} {' '.join(targets)}\n"
 
 
 def page_debug(message):
@@ -203,8 +221,11 @@ def resolve_group_value(cur, group_id):
 def parse_rtp_payload(packet, payload_type=0):
     if len(packet) < 12:
         return b""
+    if (packet[0] >> 6) != 2:
+        return b""
     cc = packet[0] & 0x0F
     ext = (packet[0] & 0x10) >> 4
+    padded = bool(packet[0] & 0x20)
     pt = packet[1] & 0x7F
     if pt != int(payload_type):
         return b""
@@ -214,9 +235,15 @@ def parse_rtp_payload(packet, payload_type=0):
             return b""
         ext_len = int.from_bytes(packet[offset + 2:offset + 4], "big")
         offset += 4 + ext_len * 4
-    if offset >= len(packet):
+    payload_end = len(packet)
+    if padded:
+        padding_bytes = packet[-1]
+        if padding_bytes <= 0 or padding_bytes > payload_end - offset:
+            return b""
+        payload_end -= padding_bytes
+    if offset >= payload_end:
         return b""
-    return packet[offset:]
+    return packet[offset:payload_end]
 
 
 def normalize_livepage_targets(targets):
@@ -243,7 +270,11 @@ def resolve_targets(group_id):
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            resolved_group, rows = resolve_group_rows(cur, group_id)
+            allowed_groups, removed_all = apply_all_recipients_policy(group_id, cursor=cur)
+            if removed_all and not allowed_groups:
+                page_debug(f"resolve_targets_blocked_all group={group_id!r}")
+                return "", []
+            resolved_group, rows = resolve_group_rows(cur, allowed_groups)
             if resolved_group != str(group_id or "").strip():
                 page_debug(f"resolve_targets_sip_input_group extension={group_id!r} stored_group={resolved_group!r}")
             targets = paging_targets_from_rows(rows)
@@ -278,7 +309,10 @@ def connected_desktop_count(group_id):
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            resolved_group, rows = resolve_group_rows(cur, group_id)
+            allowed_groups, removed_all = apply_all_recipients_policy(group_id, cursor=cur)
+            if removed_all and not allowed_groups:
+                return 0
+            resolved_group, rows = resolve_group_rows(cur, allowed_groups)
             if resolved_group == "0" and not rows:
                 cur.execute(
                     """
@@ -309,6 +343,8 @@ class LivePageSession:
         self.local_sock.settimeout(0.5)
         self.local_port = self.local_sock.getsockname()[1]
         self.control_sock = None
+        self.endpoint_stream_pcm = False
+        self.internal_streaming_codec = INTERNAL_STREAMING_CODEC_PCM
         self.desktop_stream_sock = None
         self.stream_id = uuid.uuid4().hex
         self.stop_event = threading.Event()
@@ -417,18 +453,19 @@ class LivePageSession:
         self.skip_post_tones = True
         self.stop()
 
-    def forward_payload(self, payload, ignore_pause=False, ignore_stop=False):
+    def forward_stream_audio(self, endpoint_data, desktop_data, ignore_pause=False, ignore_stop=False):
         if (self.stop_event.is_set() and not ignore_stop) or self.cleaned_up:
             return False
         if self.rtp_paused and not ignore_pause:
             return False
-        data = bytes(payload or b"")
-        if not data:
+        endpoint_data = bytes(endpoint_data or b"")
+        desktop_data = bytes(desktop_data or b"")
+        if not endpoint_data and not desktop_data:
             return False
         with self.forward_lock:
-            if self.control_sock is not None:
+            if self.control_sock is not None and endpoint_data:
                 try:
-                    self.control_sock.sendall(data)
+                    self.control_sock.sendall(endpoint_data)
                 except OSError as exc:
                     page_debug(
                         f"endpoint_audio_error stream={self.stream_id} resolved_group={self.resolved_group_id!r} "
@@ -440,14 +477,46 @@ class LivePageSession:
                         pass
                     self.control_sock = None
             try:
-                if self.desktop_stream_sock is not None:
-                    send_stream_frame(self.desktop_stream_sock, data)
+                if self.desktop_stream_sock is not None and desktop_data:
+                    send_stream_frame(self.desktop_stream_sock, desktop_data)
             except Exception as exc:
                 page_debug(
                     f"desktop_audio_error stream={self.stream_id} resolved_group={self.resolved_group_id!r} "
                     f"error={exc.__class__.__name__}: {exc}"
                 )
         return True
+
+    def forward_payload(self, payload, ignore_pause=False, ignore_stop=False):
+        ulaw = bytes(payload or b"")
+        if not ulaw:
+            return False
+        endpoint_data = ulaw_to_endpoint_pcm(ulaw) if self.endpoint_stream_pcm else ulaw
+        desktop_data = endpoint_data if self.desktop_stream_sock is not None else b""
+        return self.forward_stream_audio(
+            endpoint_data,
+            desktop_data,
+            ignore_pause=ignore_pause,
+            ignore_stop=ignore_stop,
+        )
+
+    def forward_pcm_payload(self, payload, ignore_pause=False, ignore_stop=False):
+        pcm = bytes(payload or b"")
+        if not pcm:
+            return False
+        complete = len(pcm) - (len(pcm) % ENDPOINT_PCM_FRAME_BYTES)
+        if complete <= 0:
+            return False
+        pcm = pcm[:complete]
+        needs_ulaw = not self.endpoint_stream_pcm
+        ulaw = endpoint_pcm_to_ulaw(pcm) if needs_ulaw else b""
+        endpoint_data = pcm if self.endpoint_stream_pcm else ulaw
+        desktop_data = (pcm if self.endpoint_stream_pcm else ulaw) if self.desktop_stream_sock is not None else b""
+        return self.forward_stream_audio(
+            endpoint_data,
+            desktop_data,
+            ignore_pause=ignore_pause,
+            ignore_stop=ignore_stop,
+        )
 
     def normalize_audio_frame(self, payload):
         data = bytes(payload or b"")
@@ -461,7 +530,12 @@ class LivePageSession:
 
     def begin_pre_tone_slot(self, frame):
         with self.pre_tone_mix_lock:
-            self.pre_tone_slot_frame = self.normalize_audio_frame(frame)
+            if self.endpoint_stream_pcm:
+                self.pre_tone_slot_frame = normalize_endpoint_pcm_frame(frame)
+            elif len(frame or b"") == ENDPOINT_PCM_FRAME_BYTES:
+                self.pre_tone_slot_frame = endpoint_pcm_to_ulaw(frame)
+            else:
+                self.pre_tone_slot_frame = self.normalize_audio_frame(frame)
             self.pre_tone_slot_consumed = False
 
     def finish_pre_tone_slot(self):
@@ -472,7 +546,10 @@ class LivePageSession:
             self.pre_tone_slot_frame = None
             self.pre_tone_slot_consumed = False
         if frame is not None:
-            self.forward_payload(frame, ignore_pause=True, ignore_stop=True)
+            if self.endpoint_stream_pcm:
+                self.forward_pcm_payload(frame, ignore_pause=True, ignore_stop=True)
+            else:
+                self.forward_payload(frame, ignore_pause=True, ignore_stop=True)
 
     def clear_pre_tone_slot(self):
         with self.pre_tone_mix_lock:
@@ -491,10 +568,28 @@ class LivePageSession:
                 tone_frame = self.pre_tone_slot_frame
                 self.pre_tone_slot_consumed = True
         if tone_frame is None:
-            return data
+            return ulaw_to_endpoint_pcm(data) if self.endpoint_stream_pcm else data
+        if self.endpoint_stream_pcm:
+            return mix_endpoint_pcm_frames([tone_frame, ulaw_to_endpoint_pcm(data)])
         from endpoints import mix_ulaw_frames
 
         return mix_ulaw_frames([tone_frame, data])
+
+    def mix_pre_tone_pcm_payload(self, payload):
+        data = normalize_endpoint_pcm_frame(payload, accept_legacy_ulaw=False)
+        if not self.pre_tone_active:
+            return data
+        tone_frame = None
+        with self.pre_tone_mix_lock:
+            if self.pre_tone_active and self.pre_tone_slot_frame is not None and not self.pre_tone_slot_consumed:
+                tone_frame = self.pre_tone_slot_frame
+                self.pre_tone_slot_consumed = True
+        if self.endpoint_stream_pcm:
+            return mix_endpoint_pcm_frames([tone_frame, data]) if tone_frame is not None else data
+        from endpoints import mix_ulaw_frames
+
+        ulaw = endpoint_pcm_to_ulaw(data)
+        return mix_ulaw_frames([tone_frame, ulaw]) if tone_frame is not None else ulaw
 
     def before_pre_tone_slot(self, _frame):
         return
@@ -510,19 +605,37 @@ class LivePageSession:
         if not data:
             return False
         if self.pre_tone_active:
-            return self.forward_payload(self.mix_pre_tone_payload(data), ignore_pause=True)
+            mixed = self.mix_pre_tone_payload(data)
+            if self.endpoint_stream_pcm:
+                return self.forward_pcm_payload(mixed, ignore_pause=True)
+            return self.forward_payload(mixed, ignore_pause=True)
         return self.forward_payload(data)
+
+    def forward_live_pcm_payload(self, payload):
+        data = bytes(payload or b"")
+        if not data:
+            return False
+        if self.pre_tone_active:
+            mixed = self.mix_pre_tone_pcm_payload(data)
+            if not self.endpoint_stream_pcm:
+                return self.forward_payload(mixed, ignore_pause=True)
+            return self.forward_pcm_payload(mixed, ignore_pause=True)
+        return self.forward_pcm_payload(data)
 
     def play_tone_sequence(self, tones):
         if not tones:
             return
-        from endpoints import audio_frames
+        from endpoints import audio_frames, endpoint_pcm_audio_frames
 
-        frame_duration = 160 / 8000
+        frame_source = endpoint_pcm_audio_frames if self.endpoint_stream_pcm else audio_frames
+        frame_duration = 0.02
         next_send_time = time.perf_counter()
         for tone in tones:
-            for frame in audio_frames(tone):
-                self.forward_payload(frame, ignore_pause=True, ignore_stop=True)
+            for frame in frame_source(tone):
+                if self.endpoint_stream_pcm:
+                    self.forward_pcm_payload(frame, ignore_pause=True, ignore_stop=True)
+                else:
+                    self.forward_payload(frame, ignore_pause=True, ignore_stop=True)
                 next_send_time += frame_duration
                 sleep_time = next_send_time - time.perf_counter()
                 if sleep_time > 0:
@@ -536,12 +649,13 @@ class LivePageSession:
             return
         self.pre_tone_active = True
         try:
-            from endpoints import audio_frames
+            from endpoints import audio_frames, endpoint_pcm_audio_frames
 
-            frame_duration = AUDIO_FRAME_BYTES / 8000
+            frame_source = endpoint_pcm_audio_frames if self.endpoint_stream_pcm else audio_frames
+            frame_duration = 0.02
             next_send_time = time.perf_counter()
             for tone in self.pre_tones:
-                for frame in audio_frames(tone):
+                for frame in frame_source(tone):
                     if self.stop_event.is_set() and not self.end_requested.is_set():
                         return
                     self.begin_pre_tone_slot(frame)
@@ -614,10 +728,17 @@ class LivePageSession:
         if not endpoint_targets and self.desktop_clients <= 0:
             page_debug(f"preflight_no_targets stream={self.stream_id} group={self.group_id!r}")
             raise RuntimeError("503 Service Unavailable")
+        self.internal_streaming_codec = configured_internal_streaming_codec()
+        self.endpoint_stream_pcm = internal_streaming_uses_pcm(self.internal_streaming_codec)
         if endpoint_targets:
             try:
                 self.control_sock = connect_endpoint_ipc(timeout=10)
-                command = f"PREPARELIVE {self.stream_id} {self.group_id} {' '.join(endpoint_targets)}\n"
+                command = endpoint_stream_prepare_command(
+                    self.stream_id,
+                    self.group_id,
+                    endpoint_targets,
+                    self.internal_streaming_codec,
+                )
                 page_debug(
                     f"preflight_connect stream={self.stream_id} command={command.strip()!r}"
                 )
@@ -644,8 +765,8 @@ class LivePageSession:
                 self.stream_id,
                 self.resolved_group_id,
                 self.sender or "Live Page",
-                codec="mulaw",
-                sample_rate=8000,
+                codec=self.internal_streaming_codec if self.endpoint_stream_pcm else "mulaw",
+                sample_rate=ENDPOINT_PCM_SAMPLE_RATE if self.endpoint_stream_pcm else 8000,
             )
             self.desktop_clients = int((result or {}).get("matched") or 0)
         except Exception as exc:
@@ -779,6 +900,10 @@ class LivePageSession:
 
 
 class WebLivePageSession(LivePageSession):
+    def __init__(self, *args, source_codec=INTERNAL_STREAMING_CODEC_PCMU, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.source_pcm = str(source_codec or "").strip().lower() == INTERNAL_STREAMING_CODEC_PCM
+
     def start(self):
         return
 
@@ -811,7 +936,10 @@ class WebLivePageSession(LivePageSession):
         self.cleanup()
 
     def send_payload(self, payload):
-        self.forward_live_payload(payload)
+        if self.source_pcm:
+            self.forward_live_pcm_payload(payload)
+        else:
+            self.forward_live_payload(payload)
 
 def recv_until(sock, marker, limit=8192):
     data = b""
@@ -925,6 +1053,9 @@ def handle_websocket_client(conn, addr, request=None):
         key = headers.get("sec-websocket-key", "")
         group_id = clean_group_id((query.get("groups") or [""])[0])
         sender = str((query.get("sender") or ["Web Page"])[0]).strip()[:100]
+        source_codec = str((query.get("codec") or [INTERNAL_STREAMING_CODEC_PCMU])[0]).strip().lower()
+        if source_codec not in {INTERNAL_STREAMING_CODEC_PCM, INTERNAL_STREAMING_CODEC_PCMU}:
+            source_codec = INTERNAL_STREAMING_CODEC_PCMU
         if path != "/live" or not key or not group_id:
             conn.sendall(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
             return
@@ -935,7 +1066,7 @@ def handle_websocket_client(conn, addr, request=None):
             f"Sec-WebSocket-Accept: {websocket_accept_key(key)}\r\n\r\n"
         )
         conn.sendall(response.encode("ascii"))
-        session = WebLivePageSession(addr[0], 0, group_id=group_id, sender=sender)
+        session = WebLivePageSession(addr[0], 0, group_id=group_id, sender=sender, source_codec=source_codec)
         try:
             session.preflight()
         except Exception as exc:

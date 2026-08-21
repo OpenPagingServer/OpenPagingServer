@@ -54,14 +54,44 @@ from active_broadcast_store import (
     put_active_broadcast,
     request_active_broadcast_stop,
 )
-from group_features import fetch_group_rows, record_is_bell, record_is_immediate, regular_group_targets
+from group_features import (
+    all_recipients_disabled,
+    apply_all_recipients_policy,
+    fetch_group_rows,
+    record_is_bell,
+    record_is_immediate,
+    regular_group_targets,
+)
 from tts import decode_tts_token, iter_tts_ffmpeg_chunks, split_audio_entries
 from multicastgatewayd import encode_local_source_packet
+
+INTERNAL_STREAMING_CODEC_SETTING = "internal_streaming_codec"
+INTERNAL_STREAMING_CODEC_PCM = "pcm_s16le_48k_stereo"
+INTERNAL_STREAMING_CODEC_PCMU = "pcmu_8k_mono"
+INTERNAL_STREAMING_CODEC_DEFAULT = INTERNAL_STREAMING_CODEC_PCM
+ENDPOINT_PCM_SAMPLE_RATE = 48000
+ENDPOINT_PCM_CHANNELS = 2
+ENDPOINT_PCM_SAMPLE_WIDTH = 2
+ENDPOINT_PCM_FRAME_MS = 20
+ENDPOINT_PCM_SAMPLES_PER_CHANNEL = 960
+ENDPOINT_PCM_FRAME_BYTES = 3840
+ENDPOINT_PCM_SILENCE_FRAME = b"\x00" * ENDPOINT_PCM_FRAME_BYTES
+
 try:
     from sip.codec import (
+        PCM_S16LE_CHANNELS as ENDPOINT_PCM_CHANNELS,
+        PCM_S16LE_FRAME_BYTES as ENDPOINT_PCM_FRAME_BYTES,
+        PCM_S16LE_FRAME_MS as ENDPOINT_PCM_FRAME_MS,
+        PCM_S16LE_SAMPLE_RATE as ENDPOINT_PCM_SAMPLE_RATE,
+        PCM_S16LE_SAMPLE_WIDTH as ENDPOINT_PCM_SAMPLE_WIDTH,
+        PCM_S16LE_SAMPLES_PER_CHANNEL as ENDPOINT_PCM_SAMPLES_PER_CHANNEL,
+        PCM_S16LE_SILENCE_FRAME as ENDPOINT_PCM_SILENCE_FRAME,
         SIP_CODEC_PAYLOADS as SIP_EDGE_CODEC_PAYLOADS,
-        encode_sip_rtp_payload as encode_edge_rtp_payload,
-        decode_sip_rtp_payload as decode_edge_rtp_payload,
+        normalize_pcm_s16le_48k_stereo_frame as normalize_endpoint_pcm_frame,
+        pcm_s16le_48k_stereo_to_ulaw as endpoint_pcm_to_ulaw,
+        ulaw_to_pcm_s16le_48k_stereo as ulaw_to_endpoint_pcm,
+        encode_pcm_s16le_48k_stereo_to_sip_rtp_payload as encode_edge_rtp_payload,
+        decode_sip_rtp_payload_to_pcm_s16le_48k_stereo as decode_edge_rtp_payload,
     )
 except ImportError:
     SIP_EDGE_CODEC_PAYLOADS = {
@@ -73,23 +103,34 @@ except ImportError:
         "G726-32": {"payload_type": 2, "samples_per_frame": 160},
     }
 
+    def normalize_endpoint_pcm_frame(payload, accept_legacy_ulaw=True):
+        data = bytes(payload or b"")
+        if accept_legacy_ulaw and len(data) <= 160:
+            return ulaw_to_endpoint_pcm(data[:160].ljust(160, b"\xff"))
+        return data[:ENDPOINT_PCM_FRAME_BYTES].ljust(ENDPOINT_PCM_FRAME_BYTES, b"\x00")
+
+    def endpoint_pcm_to_ulaw(payload):
+        data = normalize_endpoint_pcm_frame(payload, accept_legacy_ulaw=False)
+        out = bytearray()
+        for offset in range(0, len(data), 24):
+            group = data[offset:offset + 24]
+            values = struct.unpack("<12h", group)
+            out.append(linear_to_ulaw(int(round(sum(values) / len(values)))))
+        return bytes(out)
+
     def encode_edge_rtp_payload(codec_name, payload, encoder_state=None):
-        frame = bytes(payload or b"")[:160].ljust(160, b"\xff")
+        frame = endpoint_pcm_to_ulaw(payload)
         if str(codec_name or "").upper() == "PCMA":
             return frame.translate(ULAW_TO_ALAW_TABLE), encoder_state
         return frame, encoder_state
 
     def decode_edge_rtp_payload(codec_name, payload, decoder_state=None):
-        # Fallback decoder used only when sip.codec is unavailable. Normalizes
-        # inbound RTP payloads to u-law bytes so AMD analysis works on the
-        # codecs we can decode without native libraries (PCMU/PCMA); other
-        # codecs return empty so AMD simply skips those frames.
         data = bytes(payload or b"")
         codec = str(codec_name or "").upper()
         if codec == "PCMA":
-            return data.translate(ALAW_TO_ULAW_TABLE), decoder_state
+            return ulaw_to_endpoint_pcm(data.translate(ALAW_TO_ULAW_TABLE)), decoder_state
         if codec in ("", "PCMU"):
-            return data, decoder_state
+            return ulaw_to_endpoint_pcm(data), decoder_state
         return b"", decoder_state
 
 try:
@@ -467,6 +508,37 @@ def bundle_hash(bundle_path):
     return digest.hexdigest()
 
 
+def module_type_tokens(value):
+    normalized = re.sub(r"[^a-z]+", "", str(value or "").strip().lower())
+    if normalized == "input":
+        return {"input"}
+    if normalized == "output":
+        return {"output"}
+    if normalized in {"inputoutput", "outputinput"}:
+        return {"input", "output"}
+    return set()
+
+
+def normalize_module_type(value, default="Output"):
+    raw = default if value in (None, "") else value
+    tokens = module_type_tokens(raw)
+    if tokens == {"input"}:
+        return "Input"
+    if tokens == {"output"}:
+        return "Output"
+    if tokens == {"input", "output"}:
+        return "Input+Output"
+    raise ValueError("manifest module type must be Input, Output, or Input+Output")
+
+
+def module_type_has_input(value):
+    return "input" in module_type_tokens(value)
+
+
+def module_type_has_output(value):
+    return "output" in module_type_tokens(value)
+
+
 def read_manifest(bundle_path):
     with tarfile.open(bundle_path, "r:gz") as tar:
         raw = read_tar_file(tar, "manifest.json")
@@ -486,7 +558,8 @@ def read_manifest(bundle_path):
     manifest.setdefault("version", "")
     manifest.setdefault("description", "")
     manifest.setdefault("developer", manifest.get("author", ""))
-    manifest.setdefault("input_type", manifest.get("type", "Output") or "Output")
+    declared_type = manifest.get("input_type") or manifest.get("type") or "Output"
+    manifest["input_type"] = normalize_module_type(declared_type)
     manifest.setdefault("minimum_ops_version", OPS_VERSION)
     manifest.setdefault("requirements", [])
     return manifest
@@ -882,8 +955,8 @@ SIP_ALERT_INFO_PRESETS = {
 }
 SIP_OUTPUT_AMD_ACTIONS = {"hangup", "redial"}
 SIP_OUTPUT_NAT_MODES = {"auto", "yes", "no"}
-SIP_OUTPUT_FRAME_BYTES = 160
-SIP_OUTPUT_SILENCE_FRAME = b"\xff" * SIP_OUTPUT_FRAME_BYTES
+SIP_OUTPUT_FRAME_BYTES = ENDPOINT_PCM_FRAME_BYTES
+SIP_OUTPUT_SILENCE_FRAME = ENDPOINT_PCM_SILENCE_FRAME
 SIP_AMD_FRAME_MS = 20
 SIP_AMD_LISTEN_SECONDS = 4.5
 SIP_AMD_TIMEOUT_STEP_MS = 250
@@ -905,36 +978,80 @@ MULTICAST_RTP_TABLE = "endpoints-output-multicastrtp"
 MULTICAST_RTP_NAME = "Multicast RTP"
 MULTICAST_RTP_DESCRIPTION = "Send a plain old multicast RTP stream. The vast majority of SME VoIP phones and speakers can subscribe to and accept to these."
 MULTICAST_RTP_WARNING = "Open Paging Server is unable to guarantee the delivery of audio to endpoints. Ensure that every single device subscribed to a multicast stream is able to reliably receive audio before beginning production use. Multicast packets are not transmitted over WAN and most VPN tunnels. In such a case you will need a multicast gateway."
-MULTICAST_RTP_CODECS = {"PCMU": 0, "PCMA": 8, "G722": 9, "OPUS": 111, "G7221C": 121, "G726-32": 2}
+MULTICAST_RTP_COMPRESSED_CODECS = {
+    "PCMU": 0,
+    "PCMA": 8,
+    "G722": 9,
+    "OPUS": 111,
+    "G7221C": 121,
+    "G726-32": 96,
+}
+MULTICAST_RTP_PCM_FORMATS = {
+    "S16LE48": {"payload_type": 96, "label": "PCM S16LE Stereo 48 kHz", "sample_rate": 48000, "sample_format": "s16le", "sample_width": 2, "channels": 2},
+    "S16LE1M": {"payload_type": 96, "label": "PCM S16LE Mono 48 kHz", "sample_rate": 48000, "sample_format": "s16le", "sample_width": 2, "channels": 1},
+    "L16-8K": {"payload_type": 96, "label": "16-bit Linear PCM (L16) Stereo 8 kHz", "sample_rate": 8000, "sample_format": "s16be", "sample_width": 2, "channels": 2},
+    "L16-8M": {"payload_type": 96, "label": "16-bit Linear PCM (L16) Mono 8 kHz", "sample_rate": 8000, "sample_format": "s16be", "sample_width": 2, "channels": 1},
+    "L16-16K": {"payload_type": 96, "label": "16-bit Linear PCM (L16) Stereo 16 kHz", "sample_rate": 16000, "sample_format": "s16be", "sample_width": 2, "channels": 2},
+    "L16-16M": {"payload_type": 96, "label": "16-bit Linear PCM (L16) Mono 16 kHz", "sample_rate": 16000, "sample_format": "s16be", "sample_width": 2, "channels": 1},
+    "L16-32K": {"payload_type": 96, "label": "16-bit Linear PCM (L16) Stereo 32 kHz", "sample_rate": 32000, "sample_format": "s16be", "sample_width": 2, "channels": 2},
+    "L16-32M": {"payload_type": 96, "label": "16-bit Linear PCM (L16) Mono 32 kHz", "sample_rate": 32000, "sample_format": "s16be", "sample_width": 2, "channels": 1},
+    "L16-441": {"payload_type": 10, "label": "16-bit Linear PCM (L16) Stereo 44.1 kHz", "sample_rate": 44100, "sample_format": "s16be", "sample_width": 2, "channels": 2},
+    "L16-44M": {"payload_type": 11, "label": "16-bit Linear PCM (L16) Mono 44.1 kHz", "sample_rate": 44100, "sample_format": "s16be", "sample_width": 2, "channels": 1},
+    "L16-48K": {"payload_type": 96, "label": "16-bit Linear PCM (L16) Stereo 48 kHz", "sample_rate": 48000, "sample_format": "s16be", "sample_width": 2, "channels": 2},
+    "L16-48M": {"payload_type": 96, "label": "16-bit Linear PCM (L16) Mono 48 kHz", "sample_rate": 48000, "sample_format": "s16be", "sample_width": 2, "channels": 1},
+    "L16-96K": {"payload_type": 96, "label": "16-bit Linear PCM (L16) Stereo 96 kHz", "sample_rate": 96000, "sample_format": "s16be", "sample_width": 2, "channels": 2},
+    "L16-96M": {"payload_type": 96, "label": "16-bit Linear PCM (L16) Mono 96 kHz", "sample_rate": 96000, "sample_format": "s16be", "sample_width": 2, "channels": 1},
+    "PCM-U8": {"payload_type": 96, "label": "8-bit unsigned PCM (L8) Stereo 48 kHz", "sample_rate": 48000, "sample_format": "u8", "sample_width": 1, "channels": 2},
+    "PCM-U8M": {"payload_type": 96, "label": "8-bit unsigned PCM (L8) Mono 48 kHz", "sample_rate": 48000, "sample_format": "u8", "sample_width": 1, "channels": 1},
+    "PCM-S16": {"payload_type": 96, "label": "16-bit signed PCM (S16BE) Stereo 48 kHz", "sample_rate": 48000, "sample_format": "s16be", "sample_width": 2, "channels": 2},
+    "PCM-S16M": {"payload_type": 96, "label": "16-bit signed PCM (S16BE) Mono 48 kHz", "sample_rate": 48000, "sample_format": "s16be", "sample_width": 2, "channels": 1},
+    "PCM-S24": {"payload_type": 96, "label": "24-bit signed PCM (L24/S24BE) Stereo 48 kHz", "sample_rate": 48000, "sample_format": "s24be", "sample_width": 3, "channels": 2},
+    "PCM-S24M": {"payload_type": 96, "label": "24-bit signed PCM (L24/S24BE) Mono 48 kHz", "sample_rate": 48000, "sample_format": "s24be", "sample_width": 3, "channels": 1},
+    "PCM-S32": {"payload_type": 96, "label": "32-bit signed PCM (S32BE) Stereo 48 kHz", "sample_rate": 48000, "sample_format": "s32be", "sample_width": 4, "channels": 2},
+    "PCM-S32M": {"payload_type": 96, "label": "32-bit signed PCM (S32BE) Mono 48 kHz", "sample_rate": 48000, "sample_format": "s32be", "sample_width": 4, "channels": 1},
+    "PCM-F32": {"payload_type": 96, "label": "32-bit float PCM (F32BE) Stereo 48 kHz", "sample_rate": 48000, "sample_format": "f32be", "sample_width": 4, "channels": 2},
+    "PCM-F32M": {"payload_type": 96, "label": "32-bit float PCM (F32BE) Mono 48 kHz", "sample_rate": 48000, "sample_format": "f32be", "sample_width": 4, "channels": 1},
+    "PCM-F64": {"payload_type": 96, "label": "64-bit float PCM (F64BE) Stereo 48 kHz", "sample_rate": 48000, "sample_format": "f64be", "sample_width": 8, "channels": 2},
+    "PCM-F64M": {"payload_type": 96, "label": "64-bit float PCM (F64BE) Mono 48 kHz", "sample_rate": 48000, "sample_format": "f64be", "sample_width": 8, "channels": 1},
+}
+MULTICAST_RTP_CODEC_OPTIONS = (
+    ("PCMU", "PCMU"),
+    ("PCMA", "PCMA"),
+    ("G722", "G722"),
+    ("G7221C", "G7221C"),
+    ("G726-32", "G726-32"),
+    ("OPUS", "OPUS"),
+    *((codec, info["label"]) for codec, info in MULTICAST_RTP_PCM_FORMATS.items()),
+)
+MULTICAST_RTP_CODECS = {
+    **MULTICAST_RTP_COMPRESSED_CODECS,
+    **{codec: info["payload_type"] for codec, info in MULTICAST_RTP_PCM_FORMATS.items()},
+}
+MULTICAST_RTP_STATIC_PAYLOAD_TYPES = {
+    "PCMU": 0,
+    "PCMA": 8,
+    "G722": 9,
+    "L16-441": 10,
+    "L16-44M": 11,
+}
 MULTICAST_RTP_DEFAULT_PACKET_MS = 20
 MULTICAST_RTP_MIN_PACKET_MS = 20
 MULTICAST_RTP_MAX_PACKET_MS = 200
 MULTICAST_RTP_FRAME_MS = 20
-MULTICAST_RTP_FRAME_SIZE = 160
-# When the codec changes on a live channel, stop the stream for this long
-# before rebuilding the RTP sender so listeners cleanly re-sync.
+MULTICAST_RTP_FRAME_SIZE = ENDPOINT_PCM_FRAME_BYTES
+MULTICAST_RTP_TARGET_MEDIA_BYTES = 1200
 MULTICAST_RTP_CODEC_RESTART_SECONDS = 5.0
-# Number of preroll frames the multicast channel streams before the source is
-# reported ready. Matches the original 60 ms priming (3 * 20 ms) so calls are
-# answered immediately; tunable via env for sites whose devices need more
-# settling time.
 try:
     MULTICAST_RTP_READY_SILENCE_FRAMES = max(1, int(os.getenv("OPS_MULTICAST_PREROLL_FRAMES", "3")))
 except (TypeError, ValueError):
     MULTICAST_RTP_READY_SILENCE_FRAMES = 3
 MULTICAST_RTP_IDLE_SECONDS = 1.0
-# Standby (background audio) configuration for a multicast stream. Controls what
-# the stream emits while no message/livepage is in effect.
 MULTICAST_RTP_STANDBY_MODES = ("stop", "rebroadcast", "silence")
 MULTICAST_RTP_STANDBY_MSG_ACTIONS = ("keep", "stop", "silence", "emergency")
 MULTICAST_RTP_MAX_STANDBY_SOURCES = 250
 MULTICAST_RTP_STANDBY_SOURCE_PLACEHOLDER = (
     "ex: https://radio.example.com/stream.mp3, rtp://239.255.0.1:2000, rtp://10.0.0.10:5004"
 )
-# Per-endpoint gain (dB) applied to the standby background audio. Each field is
-# either an integer dB value in [MIN, MAX] or the string "mute" (background
-# silenced). "on message/page/bell" duck the background while a broadcast of
-# that class is in effect; the master field applies at all times.
 MULTICAST_RTP_AMP_MIN_DB = -40
 MULTICAST_RTP_AMP_MAX_DB = 20
 MULTICAST_RTP_AMP_DEFAULTS = {
@@ -944,8 +1061,6 @@ MULTICAST_RTP_AMP_DEFAULTS = {
     "amp_message": "mute",
 }
 MESSAGE_PRIORITY_ORDER = {"Low": 0, "Normal": 1, "High": 2, "Emergency": 3}
-# How far ahead of real time deliver_broadcast feeds endpoint modules; this
-# jitter cushion keeps the self-pacing RTP senders from underrunning.
 MULTICAST_DELIVERY_LEAD_SECONDS = max(0.0, float(os.getenv("MULTICAST_DELIVERY_LEAD_SECONDS", "0.3")))
 MULTICAST_GATEWAY_HOST = os.getenv("OPS_MULTICAST_GATEWAY_HOST", "127.0.0.1")
 MULTICAST_GATEWAY_PORT = int(os.getenv("OPS_MULTICAST_GATEWAY_PORT", "8710"))
@@ -975,20 +1090,11 @@ SERVICE_MONITOR_MAX_INTERVAL = 86400
 SERVICE_MONITOR_DEFAULT_RETRIES = 5
 SERVICE_MONITOR_MIN_RETRIES = 0
 SERVICE_MONITOR_MAX_RETRIES = 4096
-# Grace window (seconds) after the monitor module boots during which probe
-# failures are absorbed instead of latching a monitor offline or firing a
-# "went down" alert. Startup load (SIP/DB/network stack still initialising) can
-# make even a healthy host miss a ping, which on a 0-retry monitor would
-# otherwise blast a false "server is down" broadcast seconds after boot. A down
-# that genuinely begins during this window is not missed: it simply alerts once
-# the window elapses and the failure is still present.
 SERVICE_MONITOR_STARTUP_GRACE_SECONDS = 15
 SERVICE_MONITOR_DEFAULT_WAIT_FOR_UP = 0
 SERVICE_MONITOR_MIN_WAIT_FOR_UP = 0
 SERVICE_MONITOR_MAX_WAIT_FOR_UP = 86400
 SERVICE_MONITOR_DOWN_DEFAULTS_AUDIO = "OPS-ShortBlip10Second-400Tria.wav"
-# Preferred default audio per direction, tried in order; the first file that
-# exists in the asset library is used, otherwise no audio file is inserted.
 SERVICE_MONITOR_DOWN_AUDIO_CANDIDATES = (
     "OPS-ShortBlip10Second-400Tria.wav",
     "OPS-400HZ-MedPulse.wav",
@@ -997,8 +1103,6 @@ SERVICE_MONITOR_UP_AUDIO_CANDIDATES = (
     "OPS-DualChime.wav",
     "OPS-900HZ-SlowPulse.wav",
 )
-# HTTP failure token choices. "noresponse" and the 4xx/5xx families are the
-# defaults; individual status codes can also be selected.
 SERVICE_MONITOR_HTTP_FAIL_TOKENS = ("noresponse", "4xx", "5xx")
 SERVICE_MONITOR_HTTP_DEFAULT_FAIL = ["noresponse", "4xx", "5xx"]
 SERVICE_MONITOR_HTTP_CODE_CHOICES = (
@@ -1047,7 +1151,83 @@ def build_ulaw_to_alaw_table():
 
 
 ULAW_TO_ALAW_TABLE = build_ulaw_to_alaw_table()
-MULTICAST_RTP_SILENCE_FRAME = b"\xff" * MULTICAST_RTP_FRAME_SIZE
+ULAW_FRAME_BYTES = 160
+ULAW_SILENCE_FRAME = b"\xff" * ULAW_FRAME_BYTES
+MULTICAST_RTP_SILENCE_FRAME = ENDPOINT_PCM_SILENCE_FRAME
+
+
+def normalize_internal_streaming_codec(value):
+    token = str(value or "").strip().lower()
+    if token in {
+        INTERNAL_STREAMING_CODEC_PCMU,
+        "pcmu",
+        "mulaw",
+        "ulaw",
+        "g711u",
+        "legacy",
+    }:
+        return INTERNAL_STREAMING_CODEC_PCMU
+    return INTERNAL_STREAMING_CODEC_PCM
+
+
+def configured_internal_streaming_codec():
+    """Read the format used between audio producers and endpoint modules.
+
+    Missing/unavailable settings deliberately resolve to PCM so upgrades and
+    installations created before this setting keep the recommended default.
+    The value is read once when each stream is prepared, allowing a settings
+    change to affect new streams without interrupting audio already in flight.
+    """
+    try:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value FROM systemsettings WHERE parameter=%s LIMIT 1",
+                    (INTERNAL_STREAMING_CODEC_SETTING,),
+                )
+                row = cur.fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        row = None
+    value = row[0] if row else INTERNAL_STREAMING_CODEC_DEFAULT
+    return normalize_internal_streaming_codec(value)
+
+
+def internal_streaming_uses_pcm(codec=None):
+    selected = configured_internal_streaming_codec() if codec is None else codec
+    return normalize_internal_streaming_codec(selected) == INTERNAL_STREAMING_CODEC_PCM
+
+
+def internal_stream_audio_metadata(codec):
+    """Describe the exact audio frames delivered to endpoint modules.
+
+    The IPC prepare command is the authoritative producer contract for a
+    stream.  Passing the same contract to ``handle_dispatch`` prevents an
+    endpoint module from having to infer PCM versus legacy PCMU from the first
+    chunk it happens to receive.
+    """
+    normalized = normalize_internal_streaming_codec(codec)
+    if normalized == INTERNAL_STREAMING_CODEC_PCM:
+        return {
+            "internal_streaming_codec": normalized,
+            "audio_codec": normalized,
+            "audio_sample_rate": ENDPOINT_PCM_SAMPLE_RATE,
+            "audio_channels": ENDPOINT_PCM_CHANNELS,
+            "audio_sample_width": ENDPOINT_PCM_SAMPLE_WIDTH,
+            "audio_frame_ms": ENDPOINT_PCM_FRAME_MS,
+            "audio_frame_bytes": ENDPOINT_PCM_FRAME_BYTES,
+        }
+    return {
+        "internal_streaming_codec": normalized,
+        "audio_codec": normalized,
+        "audio_sample_rate": 8000,
+        "audio_channels": 1,
+        "audio_sample_width": 1,
+        "audio_frame_ms": ENDPOINT_PCM_FRAME_MS,
+        "audio_frame_bytes": ULAW_FRAME_BYTES,
+    }
 
 
 def build_ulaw_to_linear_table():
@@ -1123,25 +1303,78 @@ ULAW_TO_PCM16LE_TABLE = tuple(
 )
 
 
+if "ulaw_to_endpoint_pcm" not in globals():
+    def ulaw_to_endpoint_pcm(payload):
+        out = bytearray()
+        for value in bytes(payload or b""):
+            sample = ULAW_TO_PCM16LE_TABLE[value]
+            out.extend((sample + sample) * 6)
+        return bytes(out)
+
+
 def mix_ulaw_frames(frames):
     if not frames:
-        return MULTICAST_RTP_SILENCE_FRAME
+        return ULAW_SILENCE_FRAME
     if len(frames) == 1:
         return frames[0]
-    mixed = bytearray(MULTICAST_RTP_FRAME_SIZE)
-    frame_count = len(frames)
-    for index in range(MULTICAST_RTP_FRAME_SIZE):
+    mixed = bytearray(ULAW_FRAME_BYTES)
+    for index in range(ULAW_FRAME_BYTES):
         total = 0
         for frame in frames:
             total += ULAW_TO_LINEAR_TABLE[frame[index]]
-        # Sum then clip to 16-bit range; wrapping overflow causes severe
-        # distortion when simultaneous sources (e.g. bell clusters) overlap.
         if total > 32767:
             total = 32767
         elif total < -32768:
             total = -32768
         mixed[index] = LINEAR_TO_ULAW_TABLE[total & 0xFFFF]
     return bytes(mixed)
+
+
+def mix_endpoint_pcm_frames(frames):
+    """Mix canonical S16LE stereo frames with saturating 16-bit addition."""
+    if not frames:
+        return ENDPOINT_PCM_SILENCE_FRAME
+    if len(frames) == 1:
+        return normalize_endpoint_pcm_frame(frames[0], accept_legacy_ulaw=False)
+    normalized = [normalize_endpoint_pcm_frame(frame, accept_legacy_ulaw=False) for frame in frames]
+    sample_sets = [struct.unpack("<1920h", frame) for frame in normalized]
+    mixed = bytearray(ENDPOINT_PCM_FRAME_BYTES)
+    for index, values in enumerate(zip(*sample_sets)):
+        sample = max(-32768, min(32767, sum(values)))
+        struct.pack_into("<h", mixed, index * 2, sample)
+    return bytes(mixed)
+
+
+def endpoint_module_audio_frame(module_name, audio_frame, internal_codec=None):
+    """Normalize a delivery to the configured endpoint-module contract.
+
+    Both source formats remain accepted at this boundary. New streams use
+    stereo S16LE at 48 kHz by default; legacy mode emits 8 kHz mono PCMU.
+    """
+    data = bytes(audio_frame or b"")
+    if internal_streaming_uses_pcm(internal_codec):
+        if len(data) == ENDPOINT_PCM_FRAME_BYTES:
+            return data
+        return ulaw_to_endpoint_pcm(data[:ULAW_FRAME_BYTES].ljust(ULAW_FRAME_BYTES, b"\xff"))
+    if len(data) == ENDPOINT_PCM_FRAME_BYTES:
+        return endpoint_pcm_to_ulaw(data)
+    return data[:ULAW_FRAME_BYTES].ljust(ULAW_FRAME_BYTES, b"\xff")
+
+
+def coerce_endpoint_pcm_audio(chunk):
+    """Accept native PCM and the former 160-byte PCMU input for compatibility."""
+    data = bytes(chunk or b"")
+    if not data:
+        return b""
+    if len(data) % ENDPOINT_PCM_FRAME_BYTES == 0:
+        return data
+    converted = bytearray()
+    for offset in range(0, len(data), ULAW_FRAME_BYTES):
+        frame = data[offset:offset + ULAW_FRAME_BYTES]
+        if len(frame) < ULAW_FRAME_BYTES:
+            frame = frame.ljust(ULAW_FRAME_BYTES, b"\xff")
+        converted.extend(ulaw_to_endpoint_pcm(frame))
+    return bytes(converted)
 
 
 def multicast_priority_value(metadata):
@@ -1304,8 +1537,6 @@ def install_multicast_gateway_sendto_patch():
         return
     original_sendto = socket.socket.sendto
 
-    # Forward packets to the gateway from a background worker so the RTP
-    # sender threads never block on locks, DNS lookups, or gateway sends.
     forward_queue = deque(maxlen=512)
     forward_wakeup = threading.Event()
 
@@ -1374,6 +1605,7 @@ def ensure_multicast_rtp_schema():
                 "`address` VARCHAR(100) NOT NULL DEFAULT '', "
                 "`port` INT NOT NULL DEFAULT 0, "
                 "`codec` VARCHAR(8) NOT NULL DEFAULT 'PCMU', "
+                "`payload_type` INT NULL DEFAULT NULL, "
                 "`packet_ms` INT NOT NULL DEFAULT 20, "
                 "`standby_mode` VARCHAR(16) NOT NULL DEFAULT 'stop', "
                 "`standby_sources` MEDIUMTEXT NULL, "
@@ -1395,6 +1627,7 @@ def ensure_multicast_rtp_schema():
                 "address": "`address` VARCHAR(100) NOT NULL DEFAULT ''",
                 "port": "`port` INT NOT NULL DEFAULT 0",
                 "codec": "`codec` VARCHAR(8) NOT NULL DEFAULT 'PCMU'",
+                "payload_type": "`payload_type` INT NULL DEFAULT NULL",
                 "packet_ms": "`packet_ms` INT NOT NULL DEFAULT 20",
                 "standby_mode": "`standby_mode` VARCHAR(16) NOT NULL DEFAULT 'stop'",
                 "standby_sources": "`standby_sources` MEDIUMTEXT NULL",
@@ -1446,6 +1679,23 @@ def multicast_rtp_clean_codec(value):
     return codec
 
 
+def multicast_rtp_clean_payload_type(value, codec):
+    codec = multicast_rtp_clean_codec(codec)
+    fixed = MULTICAST_RTP_STATIC_PAYLOAD_TYPES.get(codec)
+    raw = MULTICAST_RTP_CODECS[codec] if value in (None, "") else value
+    try:
+        payload_type = int(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Enter a valid RTP payload type.") from exc
+    if fixed is not None:
+        if payload_type != fixed:
+            raise ValueError(f"{multicast_rtp_codec_label(codec)} requires RTP payload type {fixed}.")
+        return fixed
+    if payload_type < 96 or payload_type > 127:
+        raise ValueError("Dynamic RTP payload type must be between 96 and 127.")
+    return payload_type
+
+
 def multicast_rtp_clean_packet_ms(value):
     raw = str(value if value not in (None, "") else MULTICAST_RTP_DEFAULT_PACKET_MS).strip()
     try:
@@ -1455,6 +1705,259 @@ def multicast_rtp_clean_packet_ms(value):
     if packet_ms < MULTICAST_RTP_MIN_PACKET_MS or packet_ms > MULTICAST_RTP_MAX_PACKET_MS or packet_ms % 20 != 0:
         raise ValueError("Packet size must be a 20 ms increment between 20 and 200 ms.")
     return packet_ms
+
+
+def multicast_rtp_codec_label(codec):
+    token = multicast_rtp_clean_codec(codec)
+    pcm_info = MULTICAST_RTP_PCM_FORMATS.get(token)
+    return str(pcm_info.get("label")) if pcm_info else token
+
+
+def multicast_rtp_codec_max_packet_ms(codec):
+    """Validate a codec and return the configurable aggregation ceiling.
+
+    PCM is split into MTU-sized RTP packets below this requested duration, so
+    even high-rate formats can retain the standard 20-200 ms UI contract.
+    """
+    multicast_rtp_clean_codec(codec)
+    return MULTICAST_RTP_MAX_PACKET_MS
+
+
+def _resample_multicast_pcm_samples(samples, source_rate, target_rate):
+    """Resample stereo integer samples while preserving an exact packet time.
+
+    Downsampling uses a box average to avoid the worst aliases. Upsampling uses
+    linear interpolation. Every supported rate contains an integer number of
+    samples in 20 ms, so packets do not accumulate timing drift.
+    """
+    source = list(samples or ())
+    source_rate = int(source_rate)
+    target_rate = int(target_rate)
+    if not source or source_rate <= 0 or target_rate <= 0:
+        return []
+    if source_rate == target_rate:
+        return source
+    target_count = int(round(len(source) * target_rate / source_rate))
+    if target_count <= 0:
+        return []
+
+    output = []
+    if target_rate < source_rate:
+        for output_index in range(target_count):
+            start = output_index * source_rate
+            end = (output_index + 1) * source_rate
+            first = start // target_rate
+            last = min(len(source) - 1, (end - 1) // target_rate)
+            left_total = 0
+            right_total = 0
+            total_weight = 0
+            for source_index in range(first, last + 1):
+                overlap_start = max(start, source_index * target_rate)
+                overlap_end = min(end, (source_index + 1) * target_rate)
+                weight = max(0, overlap_end - overlap_start)
+                if weight:
+                    left, right = source[source_index]
+                    left_total += int(left) * weight
+                    right_total += int(right) * weight
+                    total_weight += weight
+            if total_weight:
+                output.append((int(round(left_total / total_weight)), int(round(right_total / total_weight))))
+        return output
+
+    last_index = len(source) - 1
+    for output_index in range(target_count):
+        position = output_index * source_rate
+        source_index, remainder = divmod(position, target_rate)
+        source_index = min(last_index, source_index)
+        next_index = min(last_index, source_index + 1)
+        left, right = source[source_index]
+        next_left, next_right = source[next_index]
+        if remainder:
+            left = int(round((left * (target_rate - remainder) + next_left * remainder) / target_rate))
+            right = int(round((right * (target_rate - remainder) + next_right * remainder) / target_rate))
+        output.append((left, right))
+    return output
+
+
+def _pack_multicast_pcm_samples(info, samples):
+    """Pack target-rate S16 sample tuples into the selected RTP wire format."""
+    channels = int(info["channels"])
+    sample_format = info["sample_format"]
+    if sample_format == "s16le":
+        pack_format = "<h" if channels == 1 else "<hh"
+        return b"".join(struct.pack(pack_format, *sample) for sample in samples)
+    if sample_format == "s16be":
+        pack_format = ">h" if channels == 1 else ">hh"
+        return b"".join(struct.pack(pack_format, *sample) for sample in samples)
+    if sample_format == "u8":
+        return bytes((value + 32768) >> 8 for sample in samples for value in sample)
+    if sample_format in ("s24le", "s24be"):
+        byte_order = "little" if sample_format.endswith("le") else "big"
+        return b"".join(
+            (int(value) << 8).to_bytes(3, byte_order, signed=True)
+            for sample in samples for value in sample
+        )
+    if sample_format in ("s32le", "s32be"):
+        prefix = "<" if sample_format.endswith("le") else ">"
+        pack_format = prefix + ("i" if channels == 1 else "ii")
+        return b"".join(struct.pack(pack_format, *(int(value) << 16 for value in sample)) for sample in samples)
+    if sample_format in ("f32le", "f32be"):
+        prefix = "<" if sample_format.endswith("le") else ">"
+        pack_format = prefix + ("f" if channels == 1 else "ff")
+        return b"".join(struct.pack(pack_format, *(value / 32768.0 for value in sample)) for sample in samples)
+    if sample_format in ("f64le", "f64be"):
+        prefix = "<" if sample_format.endswith("le") else ">"
+        pack_format = prefix + ("d" if channels == 1 else "dd")
+        return b"".join(struct.pack(pack_format, *(value / 32768.0 for value in sample)) for sample in samples)
+    raise ValueError("Choose a valid PCM codec.")
+
+
+def encode_multicast_pcm_payload(codec, payload):
+    """Stateless fallback conversion for canonical endpoint PCM.
+
+    The live sender uses :class:`MulticastPcmTranscoder`, backed by
+    libswresample through PyAV. This fallback keeps isolated callers and
+    reduced installations functional if PyAV cannot be initialized.
+    """
+    token = multicast_rtp_clean_codec(codec)
+    info = MULTICAST_RTP_PCM_FORMATS.get(token)
+    if not info:
+        raise ValueError("Choose a valid PCM codec.")
+    data = normalize_endpoint_pcm_frame(payload, accept_legacy_ulaw=False)
+    channels = int(info["channels"])
+    if info["sample_rate"] == ENDPOINT_PCM_SAMPLE_RATE and info["sample_format"] == "s16le" and channels == 2:
+        return data
+    samples = _resample_multicast_pcm_samples(
+        struct.iter_unpack("<hh", data),
+        ENDPOINT_PCM_SAMPLE_RATE,
+        info["sample_rate"],
+    )
+    if channels == 1:
+        samples = [(int(round((left + right) / 2)),) for left, right in samples]
+    return _pack_multicast_pcm_samples(info, samples)
+
+
+class MulticastPcmTranscoder:
+    """Stateful, filtered conversion from canonical PCM to RTP PCM."""
+
+    def __init__(self, codec):
+        self.codec = multicast_rtp_clean_codec(codec)
+        self.info = MULTICAST_RTP_PCM_FORMATS[self.codec]
+        self.channels = int(self.info["channels"])
+        self.sample_rate = int(self.info["sample_rate"])
+        self._av = None
+        self._resampler = None
+        self._pts = 0
+        needs_resample = self.sample_rate != ENDPOINT_PCM_SAMPLE_RATE or self.channels != ENDPOINT_PCM_CHANNELS
+        if needs_resample:
+            try:
+                import av
+                from av.audio.resampler import AudioResampler
+
+                self._av = av
+                self._resampler = AudioResampler(
+                    format="s16",
+                    layout="mono" if self.channels == 1 else "stereo",
+                    rate=self.sample_rate,
+                )
+            except Exception as exc:
+                log(f"multicast pcm resampler init failed codec={self.codec}: {exc}")
+
+    def _pack_frames(self, frames):
+        encoded = bytearray()
+        unpack_format = "<h" if self.channels == 1 else "<hh"
+        for frame in frames:
+            byte_count = frame.samples * self.channels * 2
+            pcm = bytes(frame.planes[0])[:byte_count]
+            encoded.extend(_pack_multicast_pcm_samples(self.info, struct.iter_unpack(unpack_format, pcm)))
+        return bytes(encoded)
+
+    def feed(self, payload):
+        data = normalize_endpoint_pcm_frame(payload, accept_legacy_ulaw=False)
+        if self._resampler is None:
+            return encode_multicast_pcm_payload(self.codec, data)
+        frame = self._av.AudioFrame(
+            format="s16",
+            layout="stereo",
+            samples=ENDPOINT_PCM_SAMPLES_PER_CHANNEL,
+        )
+        frame.sample_rate = ENDPOINT_PCM_SAMPLE_RATE
+        frame.pts = self._pts
+        self._pts += ENDPOINT_PCM_SAMPLES_PER_CHANNEL
+        frame.planes[0].update(data)
+        return self._pack_frames(self._resampler.resample(frame))
+
+    def drain(self):
+        if self._resampler is None:
+            return b""
+        try:
+            return self._pack_frames(self._resampler.resample(None))
+        except Exception:
+            return b""
+
+    def close(self):
+        self._resampler = None
+        self._av = None
+
+
+def _multicast_float_to_s16(value):
+    if not math.isfinite(value):
+        return 0
+    return max(-32768, min(32767, int(round(float(value) * 32768.0))))
+
+
+def decode_multicast_pcm_payload(codec, payload):
+    """Convert a raw multicast PCM packet to canonical endpoint PCM."""
+    token = multicast_rtp_clean_codec(codec)
+    info = MULTICAST_RTP_PCM_FORMATS.get(token)
+    if not info:
+        raise ValueError("Choose a valid PCM codec.")
+    data = bytes(payload or b"")
+    channels = int(info["channels"])
+    sample_width = int(info["sample_width"])
+    frame_width = channels * sample_width
+    data = data[:len(data) - (len(data) % frame_width)]
+    sample_format = info["sample_format"]
+    if sample_format == "s16le":
+        samples = list(struct.iter_unpack("<h" if channels == 1 else "<hh", data))
+    elif sample_format == "s16be":
+        samples = list(struct.iter_unpack(">h" if channels == 1 else ">hh", data))
+    elif sample_format == "u8":
+        samples = [
+            tuple((data[index + channel] - 128) << 8 for channel in range(channels))
+            for index in range(0, len(data), channels)
+        ]
+    elif sample_format in ("s24le", "s24be"):
+        byte_order = "little" if sample_format.endswith("le") else "big"
+        samples = [
+            tuple(
+                int.from_bytes(
+                    data[index + channel * sample_width:index + (channel + 1) * sample_width],
+                    byte_order,
+                    signed=True,
+                ) >> 8
+                for channel in range(channels)
+            )
+            for index in range(0, len(data), frame_width)
+        ]
+    elif sample_format in ("s32le", "s32be"):
+        prefix = "<" if sample_format.endswith("le") else ">"
+        unpack_format = prefix + ("i" if channels == 1 else "ii")
+        samples = [tuple(value >> 16 for value in sample) for sample in struct.iter_unpack(unpack_format, data)]
+    elif sample_format in ("f32le", "f32be"):
+        prefix = "<" if sample_format.endswith("le") else ">"
+        unpack_format = prefix + ("f" if channels == 1 else "ff")
+        samples = [tuple(_multicast_float_to_s16(value) for value in sample) for sample in struct.iter_unpack(unpack_format, data)]
+    elif sample_format in ("f64le", "f64be"):
+        prefix = "<" if sample_format.endswith("le") else ">"
+        unpack_format = prefix + ("d" if channels == 1 else "dd")
+        samples = [tuple(_multicast_float_to_s16(value) for value in sample) for sample in struct.iter_unpack(unpack_format, data)]
+    else:
+        raise ValueError("Choose a valid PCM codec.")
+    if channels == 1:
+        samples = [(sample[0], sample[0]) for sample in samples]
+    samples = _resample_multicast_pcm_samples(samples, info["sample_rate"], ENDPOINT_PCM_SAMPLE_RATE)
+    return b"".join(struct.pack("<hh", left, right) for left, right in samples)
 
 
 def multicast_rtp_clean_standby_mode(value):
@@ -1543,14 +2046,14 @@ def apply_gain_ulaw_frame(frame, spec):
     """Apply a gain spec to a u-law frame, returning a new u-law frame. Fast
     paths for the common no-op (0 dB) and mute cases."""
     if spec == "mute":
-        return MULTICAST_RTP_SILENCE_FRAME
+        return ULAW_SILENCE_FRAME
     if spec in (None, "0", 0):
         return frame
     factor = multicast_rtp_gain_factor(spec)
     if factor == 1.0:
         return frame
     if factor == 0.0:
-        return MULTICAST_RTP_SILENCE_FRAME
+        return ULAW_SILENCE_FRAME
     out = bytearray(len(frame))
     for i in range(len(frame)):
         sample = int(ULAW_TO_LINEAR_TABLE[frame[i]] * factor)
@@ -1559,6 +2062,25 @@ def apply_gain_ulaw_frame(frame, spec):
         elif sample < -32768:
             sample = -32768
         out[i] = LINEAR_TO_ULAW_TABLE[sample & 0xFFFF]
+    return bytes(out)
+
+
+def apply_gain_endpoint_pcm_frame(frame, spec):
+    """Apply gain directly to canonical S16LE stereo endpoint audio."""
+    if spec == "mute":
+        return ENDPOINT_PCM_SILENCE_FRAME
+    frame = normalize_endpoint_pcm_frame(frame, accept_legacy_ulaw=False)
+    if spec in (None, "0", 0):
+        return frame
+    factor = multicast_rtp_gain_factor(spec)
+    if factor == 1.0:
+        return frame
+    if factor == 0.0:
+        return ENDPOINT_PCM_SILENCE_FRAME
+    out = bytearray(len(frame))
+    for index, (sample,) in enumerate(struct.iter_unpack("<h", frame)):
+        amplified = max(-32768, min(32767, int(sample * factor)))
+        struct.pack_into("<h", out, index * 2, amplified)
     return bytes(out)
 
 
@@ -1675,6 +2197,12 @@ def multicast_rtp_clean_values(values):
     standby_sources = multicast_rtp_clean_source_list(values.get("standby_sources"))
     msg_action = multicast_rtp_clean_msg_action(values.get("standby_msg_action"))
     emergency_sources = multicast_rtp_clean_source_list(values.get("emergency_sources"))
+    codec = multicast_rtp_clean_codec(values.get("codec"))
+    payload_type = multicast_rtp_clean_payload_type(values.get("payload_type"), codec)
+    packet_ms = multicast_rtp_clean_packet_ms(values.get("packet_ms"))
+    max_packet_ms = multicast_rtp_codec_max_packet_ms(codec)
+    if packet_ms > max_packet_ms:
+        raise ValueError(f"Packet size for {multicast_rtp_codec_label(codec)} must not exceed {max_packet_ms} ms.")
     if standby_mode == "rebroadcast" and not standby_sources:
         raise ValueError("Add at least one background audio source.")
     if standby_mode == "rebroadcast" and msg_action == "emergency" and not emergency_sources:
@@ -1683,8 +2211,9 @@ def multicast_rtp_clean_values(values):
         "name": name,
         "address": multicast_rtp_normalize_address(values.get("address")),
         "port": multicast_rtp_clean_port(values.get("port"), require_even=True),
-        "codec": multicast_rtp_clean_codec(values.get("codec")),
-        "packet_ms": multicast_rtp_clean_packet_ms(values.get("packet_ms")),
+        "codec": codec,
+        "payload_type": payload_type,
+        "packet_ms": packet_ms,
         "standby_mode": standby_mode,
         "standby_sources": json.dumps(standby_sources),
         "standby_msg_action": multicast_rtp_clean_msg_action(values.get("standby_msg_action")),
@@ -1701,11 +2230,14 @@ def multicast_rtp_clean_values(values):
 
 def multicast_rtp_form_values(form, row=None):
     row = row or {}
+    selected_codec = multicast_rtp_clean_codec(row.get("codec") or "PCMU")
+    selected_payload_type = multicast_rtp_clean_payload_type(row.get("payload_type"), selected_codec)
     defaults = {
         "name": str(row.get("name") or ""),
         "address": str(row.get("address") or ""),
         "port": str(row.get("port") or ""),
-        "codec": multicast_rtp_clean_codec(row.get("codec") or "PCMU"),
+        "codec": selected_codec,
+        "payload_type": str(selected_payload_type),
         "packet_ms": str(row.get("packet_ms") or MULTICAST_RTP_DEFAULT_PACKET_MS),
         "standby_mode": str(row.get("standby_mode") or "stop"),
         "standby_sources": json.dumps(multicast_rtp_clean_source_list(row.get("standby_sources"))) if row else "[]",
@@ -1721,14 +2253,12 @@ def multicast_rtp_form_values(form, row=None):
     }
     result = {key: str(form.get(key, defaults[key]) if form is not None else defaults[key]).strip() for key in defaults}
     if form is not None:
-        # An unchecked checkbox is simply absent from the POST body; treat that
-        # as disabled so the toggle can actually be turned off.
         result["mute_priority_enabled"] = "1" if str(form.get("mute_priority_enabled") or "").strip() else "0"
     return result
 
 
 MULTICAST_RTP_COLUMNS = (
-    "`id`, `name`, `address`, `port`, `codec`, `packet_ms`, "
+    "`id`, `name`, `address`, `port`, `codec`, `payload_type`, `packet_ms`, "
     "`standby_mode`, `standby_sources`, `standby_msg_action`, "
     "`standby_msg_priority`, `emergency_sources`, "
     "`amp_master`, `amp_page`, `amp_bell`, `amp_message`, "
@@ -2239,7 +2769,6 @@ def get_service_monitor_endpoint_status():
             if state not in ("online", "offline", "unchecked", "kuma_down"):
                 state = "unchecked"
         monitor_type = str(row.get("monitor_type") or "ping").strip().lower()
-        # kuma_down shows red like offline in the endpoints list but keeps its own label.
         css_state = "offline" if state == "kuma_down" else state
         endpoints.append(
             {
@@ -2283,8 +2812,6 @@ def service_monitor_endpoint_count():
         log(f"service monitor endpoint count error: {exc}")
         return 0
 
-
-# --- Probes -----------------------------------------------------------------
 
 def service_monitor_humanize_conn_error(exc):
     reason = exc
@@ -2398,7 +2925,6 @@ def service_monitor_probe_sip(host, port, timeout):
         first_line = data.decode("utf-8", "replace").splitlines()[0] if data else ""
         if "200" in first_line:
             return True, ""
-        # Any well-formed SIP response means the server is reachable/alive.
         if first_line.upper().startswith("SIP/2.0"):
             return False, first_line.strip()
         return False, "Unexpected SIP response"
@@ -2454,7 +2980,6 @@ def service_monitor_parse_kuma_status(metrics_text):
             value = float(value_part.split()[0])
         except (ValueError, IndexError):
             continue
-        # monitor_status: 1=up, 0=down, 2=pending, 3=maintenance
         monitors[name] = value == 1
     return monitors
 
@@ -2471,7 +2996,6 @@ def service_monitor_probe_kuma(base_url, api_key, monitor_name):
     try:
         metrics_text = service_monitor_fetch_kuma_metrics(base_url, api_key)
     except Exception:
-        # Uptime Kuma itself is unreachable — the monitor is considered down.
         return False, "Uptime Kuma is down", True
     statuses = service_monitor_parse_kuma_status(metrics_text)
     if monitor_name not in statuses:
@@ -2560,7 +3084,6 @@ def service_monitor_delete_draft(token):
     try:
         ensure_servicemonitor_draft_schema()
         sip_execute(f"DELETE FROM `{SERVICE_MONITOR_DRAFT_TABLE}` WHERE token=%s", (token,))
-        # Opportunistically prune drafts older than a day.
         sip_execute(
             f"DELETE FROM `{SERVICE_MONITOR_DRAFT_TABLE}` WHERE `updated_at` IS NOT NULL AND `updated_at` < %s",
             (datetime.now() - _timedelta(days=1),),
@@ -2630,6 +3153,7 @@ def get_multicast_rtp_endpoint_status():
         address = str(row.get("address") or "").strip()
         port = int(row.get("port") or 0)
         codec = multicast_rtp_clean_codec(row.get("codec") or "PCMU")
+        payload_type = multicast_rtp_clean_payload_type(row.get("payload_type"), codec)
         packet_ms = multicast_rtp_clean_packet_ms(row.get("packet_ms") or MULTICAST_RTP_DEFAULT_PACKET_MS)
         endpoints.append(
             {
@@ -2638,12 +3162,13 @@ def get_multicast_rtp_endpoint_status():
                 "address": f"{address}:{port}" if address and port else address,
                 "model": "",
                 "status": "",
-                "type": f"{codec} Stream",
+                "type": f"{multicast_rtp_codec_label(codec)} Stream",
                 "direction": "Output",
                 "input_type": "Output",
                 "output_capable": True,
                 "bell_capable": True,
                 "available": True,
+                "payload_type": payload_type,
                 "packet_ms": packet_ms,
                 "capabilities": ["output", "bells"],
             }
@@ -3246,6 +3771,8 @@ def sip_fetch_groups():
         rows = sip_query_all("SELECT `id`, `name` FROM `groups` ORDER BY CAST(`id` AS UNSIGNED), `id`")
     except Exception:
         rows = []
+    if all_recipients_disabled():
+        return list(rows)
     return [{"id": "0", "name": "All Recipients"}] + list(rows)
 
 
@@ -3273,7 +3800,7 @@ def sip_fetch_messages():
 def sip_dialplan_trigger(trigger_type, message_id):
     if trigger_type == "message":
         return "message:" + str(message_id or "").strip()
-    if trigger_type in {"page", "#testtone", "#echotest"}:
+    if trigger_type in {"page", "panic", "#testtone", "#echotest"}:
         return trigger_type
     return "page"
 
@@ -3282,7 +3809,7 @@ def sip_split_dialplan_trigger(value):
     value = str(value or "page").strip()
     if value.startswith("message:"):
         return "message", value.split(":", 1)[1]
-    if value in {"page", "#testtone", "#echotest"}:
+    if value in {"page", "panic", "#testtone", "#echotest"}:
         return value, ""
     return "page", ""
 
@@ -3315,20 +3842,21 @@ def sip_dialplan_fields(values):
     )
     trigger_options = "".join(
         f'<option value="{h(value)}"{" selected" if value == values["trigger_type"] else ""}>{h(label)}</option>'
-        for value, label in (("page", "Paging"), ("message", "Send Message"), ("#testtone", "Milliwatt Test Tone"), ("#echotest", "Echo Test"))
+        for value, label in (("page", "Paging"), ("message", "Send Message"), ("panic", "Panic Button"), ("#testtone", "Milliwatt Test Tone"), ("#echotest", "Echo Test"))
     )
     return f"""<div class="row"><label>Name</label><input class="control" name="name" value="{h(values["name"])}" required></div>
 <div class="row"><label>Extension</label><input class="control short-control" name="extension" id="extension" value="{h(values["extension"])}" required pattern="[0-9*#]*" inputmode="tel"></div>
 <div class="row"><label>Trigger</label><select class="control" name="trigger_type" id="triggerType">{trigger_options}</select></div>
 <div class="row trigger-extra" id="messageRow"><label>Message</label><select class="control" name="message_id"><option value="">Choose a message</option>{message_options}</select></div>
 <div class="row trigger-extra" id="groupRow"><label>Groups</label><input type="hidden" name="group" id="groupValue" value="{h(values["group"])}"><details class="dropdown-checklist" id="groupDropdown"><summary id="groupSummary">Select groups</summary><div class="dropdown-panel">{group_options}</div></details></div>
-<label class="switch-row"><span>Use a passcode</span><span class="switch"><input type="checkbox" name="require_passcode" value="1" id="requirePasscode"{" checked" if values.get("require_passcode") == "1" else ""}><span class="slider"></span></span></label>
+<label class="switch-row" id="passcodeToggleRow"><span>Use a passcode</span><span class="switch"><input type="checkbox" name="require_passcode" value="1" id="requirePasscode"{" checked" if values.get("require_passcode") == "1" else ""}><span class="slider"></span></span></label>
 <div class="row" id="passcodeRow"><label>Passcode</label><input class="control short-control" name="passcode" id="passcode" value="{h(values["passcode"])}" pattern="[0-9A-D]*" inputmode="text"></div>
 <script>
 const triggerType = document.getElementById('triggerType');
 const groupRow = document.getElementById('groupRow');
 const messageRow = document.getElementById('messageRow');
 const requirePasscode = document.getElementById('requirePasscode');
+const passcodeToggleRow = document.getElementById('passcodeToggleRow');
 const passcodeRow = document.getElementById('passcodeRow');
 const passcode = document.getElementById('passcode');
 const extension = document.getElementById('extension');
@@ -3337,8 +3865,13 @@ const groupChecks = Array.from(document.querySelectorAll('.group-check'));
 const groupSummary = document.getElementById('groupSummary');
 function syncTrigger() {{
   const value = triggerType.value;
-  groupRow.style.display = (value === 'page' || value === 'message') ? 'grid' : 'none';
+  const usesGroups = value === 'page' || value === 'message' || value === 'panic';
+  const isPanicButton = value === 'panic';
+  groupRow.style.display = usesGroups ? 'grid' : 'none';
   messageRow.style.display = value === 'message' ? 'grid' : 'none';
+  passcodeToggleRow.style.display = isPanicButton ? 'none' : 'flex';
+  if (isPanicButton) requirePasscode.checked = false;
+  syncPasscode();
 }}
 function syncPasscode() {{
   passcodeRow.style.display = requirePasscode.checked ? 'grid' : 'none';
@@ -3815,7 +4348,7 @@ class BuiltinSipTrunksWeb:
                 "label": "Outbound-Authenticated SIP Trunk",
                 "description": "Trunk Open Paging Server into a VoIP server or ITSP. Does not require SIP/RTP to be open to the internet on this server.",
             },
-            "dialplan": {"label": "Dial Plan Extension", "description": "Define where incoming calls from a SIP trunk go on a per DID basis. Paging, sending messages, test tone, and echo test."},
+            "dialplan": {"label": "Dial Plan Extension", "description": "Define where incoming calls from a SIP trunk go on a per DID basis. Paging, sending messages, panic buttons, test tone, and echo test."},
             "number": {"label": "Outbound Dial", "description": "Send broadcasts to any phone number or extension over a SIP trunk. Such as cellphones, POTS telephones, zone controllers, page groups, and more. Use outbound dial endpoints in any group."},
         }
 
@@ -3985,17 +4518,19 @@ class BuiltinSipTrunksWeb:
                 values["group"] = sip_clean_groups(values["group"] or request.form.getlist("group_item"))
                 values["passcode"] = values["passcode"].upper() if values["require_passcode"] == "1" else ""
                 trigger = sip_dialplan_trigger(values["trigger_type"], values["message_id"])
-                if values["trigger_type"] not in {"page", "message"}:
+                if values["trigger_type"] not in {"page", "message", "panic"}:
                     values["group"] = ""
+                if values["trigger_type"] == "panic":
+                    values["passcode"] = ""
                 if not values["name"] or not values["extension"]:
                     error = "Name and extension are required."
                 elif not re.fullmatch(r"[0-9*#]+", values["extension"]):
                     error = "Extension can only contain 0-9, *, and #."
-                elif values["trigger_type"] not in {"page", "message", "#testtone", "#echotest"}:
+                elif values["trigger_type"] not in {"page", "message", "panic", "#testtone", "#echotest"}:
                     error = "Choose a valid trigger."
                 elif values["trigger_type"] == "message" and not values["message_id"]:
                     error = "Choose a message."
-                elif values["trigger_type"] in {"page", "message"} and not values["group"]:
+                elif values["trigger_type"] in {"page", "message", "panic"} and not values["group"]:
                     error = "Choose at least one group."
                 elif values["passcode"] and not re.fullmatch(r"[0-9A-D]+", values["passcode"]):
                     error = "Passcode can only contain 0-9 and A-D."
@@ -4201,17 +4736,19 @@ class BuiltinSipTrunksWeb:
                 passcode = request.form.get("passcode", "").strip().upper() if request.form.get("require_passcode") else ""
                 trigger = sip_dialplan_trigger(trigger_type, message_id)
                 duplicate = sip_query_all(f"SELECT id FROM `{SIP_DIALPLAN_TABLE}` WHERE extension=%s AND id<>%s", (extension, row_id))
-                if trigger_type not in {"page", "message"}:
+                if trigger_type not in {"page", "message", "panic"}:
                     group = ""
+                if trigger_type == "panic":
+                    passcode = ""
                 if not name or not extension:
                     error = "Enter a name and extension."
                 elif not re.fullmatch(r"[0-9*#]+", extension):
                     error = "Extension can only contain 0-9, *, and #."
-                elif trigger_type not in {"page", "message", "#testtone", "#echotest"}:
+                elif trigger_type not in {"page", "message", "panic", "#testtone", "#echotest"}:
                     error = "Choose a valid trigger."
                 elif trigger_type == "message" and not message_id:
                     error = "Choose a message."
-                elif trigger_type in {"page", "message"} and not group:
+                elif trigger_type in {"page", "message", "panic"} and not group:
                     error = "Choose at least one group."
                 elif passcode and not re.fullmatch(r"[0-9A-D]+", passcode):
                     error = "Passcode can only contain 0-9 and A-D."
@@ -4355,7 +4892,7 @@ class SipBroadcastRecorder:
         self.finished = threading.Event()
         self.runtime_dir = Path(tempfile.gettempdir()) / "openpagingserver-runtime"
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
-        self.path = self.runtime_dir / f"sip-broadcast-{self.stream_id}.mulaw"
+        self.path = self.runtime_dir / f"sip-broadcast-{self.stream_id}.s16le"
         self.handle = open(self.path, "wb")
         self.bytes_written = 0
 
@@ -4379,7 +4916,7 @@ class SipBroadcastRecorder:
             if self.finished.is_set():
                 return
             if self.partial:
-                frame = bytes(self.partial).ljust(SIP_OUTPUT_FRAME_BYTES, b"\xff")
+                frame = bytes(self.partial).ljust(SIP_OUTPUT_FRAME_BYTES, b"\x00")
                 self.handle.write(frame)
                 self.bytes_written += len(frame)
                 self.partial.clear()
@@ -4496,19 +5033,23 @@ class SipRtpSender:
             return False
         codec = str(getattr(self.call, "negotiated_codec", "") or "PCMU").upper()
         codec_info = SIP_EDGE_CODEC_PAYLOADS.get(codec) or SIP_EDGE_CODEC_PAYLOADS["PCMU"]
+        try:
+            payload_type = int(getattr(self.call, "negotiated_payload_type", codec_info.get("payload_type", 0)))
+        except (TypeError, ValueError):
+            payload_type = int(codec_info.get("payload_type", 0))
+        if not 0 <= payload_type <= 127:
+            payload_type = int(codec_info.get("payload_type", 0))
         encoded, self.codec_encoder = encode_edge_rtp_payload(
             codec,
-            bytes(payload or SIP_OUTPUT_SILENCE_FRAME),
+            normalize_endpoint_pcm_frame(payload or SIP_OUTPUT_SILENCE_FRAME, accept_legacy_ulaw=True),
             encoder_state=self.codec_encoder,
         )
         if not encoded:
-            # Encoder still priming (first G722/Opus frame): frame consumed,
-            # nothing to put on the wire yet.
             return True
         packet = struct.pack(
             "!BBHII",
             0x80,
-            int(codec_info.get("payload_type", 0)) & 0x7F,
+            payload_type & 0x7F,
             int(self.call.rtp_sequence) & 0xFFFF,
             int(self.call.rtp_timestamp) & 0xFFFFFFFF,
             int(self.call.rtp_ssrc) & 0xFFFFFFFF,
@@ -4530,8 +5071,17 @@ class SipRtpSender:
                 f"remote={self.call.remote_media_ip}:{int(self.call.remote_media_port)} bytes={len(packet)}"
             )
         self.call.rtp_sequence = (int(self.call.rtp_sequence) + 1) & 0xFFFF
-        self.call.rtp_timestamp = (int(self.call.rtp_timestamp) + int(codec_info.get("samples_per_frame", SIP_OUTPUT_FRAME_BYTES))) & 0xFFFFFFFF
+        self.call.rtp_timestamp = (int(self.call.rtp_timestamp) + int(codec_info.get("samples_per_frame", 160))) & 0xFFFFFFFF
         return True
+
+    def close(self):
+        codec = str(getattr(self.call, "negotiated_codec", "") or "PCMU").upper()
+        if codec == "G722" and self.codec_encoder is not None and not self.call_finished():
+            self.send_frame(SIP_OUTPUT_SILENCE_FRAME)
+        closer = getattr(self.codec_encoder, "close", None)
+        if callable(closer):
+            closer()
+        self.codec_encoder = None
 
 
 class SipOutputSession:
@@ -4558,14 +5108,14 @@ class SipOutputSession:
     def receive_audio(self, chunk):
         if self.mode != SIP_OUTPUT_MODE_PAGE or self.stop_event.is_set():
             return
-        data = bytes(chunk or b"")
+        data = coerce_endpoint_pcm_audio(chunk)
         if not data:
             return
         with self.live_lock:
             for offset in range(0, len(data), SIP_OUTPUT_FRAME_BYTES):
                 frame = data[offset:offset + SIP_OUTPUT_FRAME_BYTES]
                 if len(frame) < SIP_OUTPUT_FRAME_BYTES:
-                    frame = frame.ljust(SIP_OUTPUT_FRAME_BYTES, b"\xff")
+                    frame = frame.ljust(SIP_OUTPUT_FRAME_BYTES, b"\x00")
                 self.live_frames.append(frame)
 
     def finish_input_stream(self):
@@ -4597,17 +5147,18 @@ class SipOutputSession:
     def amd_average_energy(self, payload):
         if len(payload) < SIP_OUTPUT_FRAME_BYTES:
             return 0.0
-        total = 0
-        for byte in payload[:SIP_OUTPUT_FRAME_BYTES]:
-            total += abs(ULAW_TO_LINEAR_TABLE[byte])
-        return total / SIP_OUTPUT_FRAME_BYTES
+        samples = self.amd_linear_samples(payload)
+        return (sum(abs(sample) for sample in samples) / len(samples)) if samples else 0.0
 
     def amd_linear_samples(self, payload):
         if len(payload) < SIP_OUTPUT_FRAME_BYTES:
             return []
-        return [ULAW_TO_LINEAR_TABLE[byte] for byte in payload[:SIP_OUTPUT_FRAME_BYTES]]
+        return [
+            int((left + right) / 2)
+            for left, right in struct.iter_unpack("<hh", payload[:SIP_OUTPUT_FRAME_BYTES])
+        ]
 
-    def amd_goertzel_power(self, samples, frequency, sample_rate=8000.0):
+    def amd_goertzel_power(self, samples, frequency, sample_rate=float(ENDPOINT_PCM_SAMPLE_RATE)):
         if not samples:
             return 0.0
         coeff = 2.0 * math.cos((2.0 * math.pi * float(frequency)) / float(sample_rate))
@@ -4671,9 +5222,6 @@ class SipOutputSession:
                 or total_speech_ms >= SIP_AMD_MACHINE_TOTAL_MS
             )
 
-        # AMD analysis operates on 8 kHz u-law samples. Inbound RTP may use any
-        # negotiated codec (PCMA, G722, OPUS, ...), so decode every payload to
-        # u-law first; without this AMD only ever worked on PCMU.
         codec = str(getattr(call, "negotiated_codec", "") or "PCMU")
         decoder_state = None
         try:
@@ -4765,6 +5313,7 @@ class SipOutputSession:
                 time.sleep(sleep_for)
             else:
                 next_send = time.monotonic()
+        sender.close()
 
     def playback_recording(self, call):
         sender = SipRtpSender(call)
@@ -4776,8 +5325,6 @@ class SipOutputSession:
                     if not sender.send_frame(frame):
                         break
                 elif self.recorder.finished.is_set():
-                    # Drain any frames written between our read and the
-                    # finished flag being set to avoid cutting off the tail.
                     while not self.stop_event.is_set():
                         tail = handle.read(SIP_OUTPUT_FRAME_BYTES)
                         if len(tail) == SIP_OUTPUT_FRAME_BYTES:
@@ -4791,7 +5338,7 @@ class SipOutputSession:
                                 next_send = time.monotonic()
                         else:
                             if tail:
-                                sender.send_frame(tail.ljust(SIP_OUTPUT_FRAME_BYTES, b"\xff"))
+                                sender.send_frame(tail.ljust(SIP_OUTPUT_FRAME_BYTES, b"\x00"))
                             break
                     break
                 else:
@@ -4803,12 +5350,12 @@ class SipOutputSession:
                     time.sleep(sleep_for)
                 else:
                     next_send = time.monotonic()
+        sender.close()
 
     def place_call(self, answer_timeout):
         import sip.index as sip_index
 
         cid_number, cnam_name = sip_output_caller_values(self.row, self.metadata)
-<<<<<<< HEAD
         trunk_id = str(self.row.get("trunk_id") or "").strip()
         if not trunk_id:
             raise RuntimeError("SIP output row is missing trunk_id")
@@ -4816,9 +5363,6 @@ class SipOutputSession:
             f"siptrunks place_call row_id={self.row.get('id')} trunk_id={trunk_id} "
             f"number={self.row.get('number')} mode={self.mode}"
         )
-=======
-        trunk_id = self.row.get("trunk_id")
->>>>>>> e68d55eca441e857c5354cca8b59252ee3ad0c6d
         trunk_fallback = {
             "id": trunk_id,
             "name": self.row.get("trunk_name"),
@@ -4833,7 +5377,6 @@ class SipOutputSession:
             "connected_server": self.row.get("trunk_connected_server"),
             "connected_transport": self.row.get("trunk_connected_transport"),
         }
-<<<<<<< HEAD
         place = sip_index.sip_server.place_outbound_call
         supports_fallback = True
         try:
@@ -4842,17 +5385,11 @@ class SipOutputSession:
         except (TypeError, ValueError):
             supports_fallback = True
         kwargs = dict(
-=======
-        return sip_index.sip_server.place_outbound_call(
-            trunk_id,
-            self.row.get("number"),
->>>>>>> e68d55eca441e857c5354cca8b59252ee3ad0c6d
             caller_id_number=cid_number,
             caller_id_name=cnam_name,
             alert_info_value=sip_output_alert_value(self.row),
             custom_headers=sip_output_headers(self.row),
             answer_timeout=answer_timeout,
-            trunk_fallback=trunk_fallback,
         )
         if supports_fallback:
             kwargs["trunk_fallback"] = trunk_fallback
@@ -4890,13 +5427,6 @@ class SipOutputSession:
                     time.sleep(timeout_delay)
                     continue
                 return
-            # Signal readiness as soon as the call is answered so the broadcast
-            # delivery starts feeding the shared recorder immediately. Without
-            # this the stream is never marked ready and deliver_broadcast holds
-            # all audio until its ~10s fallback deadline, which on longer
-            # messages plays back as a large startup delay / dead air. Firing
-            # here (before AMD) also gives the recorder a head start so playback
-            # has a jitter cushion instead of underrunning at the first frame.
             if not self.ready_sent:
                 self.ready_sent = True
                 self.on_ready(self)
@@ -4941,11 +5471,6 @@ class SipTrunksStreamState:
     def add_session(self, session):
         with self.lock:
             self.sessions.append(session)
-            # Only page-mode sessions gate stream readiness. Telephone-mode
-            # dials are independent: the broadcast must start immediately and
-            # play on other endpoints while the phone rings, so they never
-            # block (and a phone that is never answered must not fail or stall
-            # the broadcast).
             if session.mode == SIP_OUTPUT_MODE_PAGE:
                 self.page_pending += 1
 
@@ -4973,9 +5498,6 @@ class SipTrunksStreamState:
         empty = False
         should_mark = False
         with self.lock:
-            # A page-mode session that finishes without ever becoming ready
-            # (e.g. the page zone never answered) must release its hold so the
-            # broadcast is not blocked forever.
             if session.mode == SIP_OUTPUT_MODE_PAGE and not session.ready_sent and self.page_pending > 0:
                 self.page_pending -= 1
                 if not self.ready_marked and self.page_pending <= 0:
@@ -4990,11 +5512,14 @@ class SipTrunksStreamState:
             self.on_empty(self.stream_id)
 
     def receive_audio(self, chunk):
-        self.recorder.write_audio(chunk)
+        pcm = coerce_endpoint_pcm_audio(chunk)
+        if not pcm:
+            return
+        self.recorder.write_audio(pcm)
         with self.lock:
             sessions = list(self.sessions)
         for session in sessions:
-            session.receive_audio(chunk)
+            session.receive_audio(pcm)
 
     def finish_input(self):
         self.recorder.finish_input()
@@ -5250,13 +5775,29 @@ MULTICAST_RTP_FORM_SCRIPT = r"""<script>
   var mutePriority = document.getElementById('mutePriority');
   var mutePriorityOrHigher = document.getElementById('mutePriorityOrHigher');
   var multicastCodec = document.getElementById('multicastCodec');
+  var multicastPayloadType = document.getElementById('multicastPayloadType');
   var codecChangeWarn = document.getElementById('codecChangeWarn');
   var codecHdInfo = document.getElementById('codecHdInfo');
   var codecHdInfoText = document.getElementById('codecHdInfoText');
 
-  function syncCodecNotes() {
+  function selectedCodecMaxPacketMs() {
+    var codec = String(multicastCodec && multicastCodec.value || 'PCMU').toUpperCase();
+    return Number(MC_CODEC_MAX_MS[codec] || MC_MAX_MS);
+  }
+
+  function syncCodecNotes(codecChanged) {
     if (!multicastCodec) return;
     var codec = String(multicastCodec.value || '').toUpperCase();
+    var hasStaticPayload = Object.prototype.hasOwnProperty.call(MC_CODEC_STATIC_PT, codec);
+    if (multicastPayloadType) {
+      if (hasStaticPayload) {
+        multicastPayloadType.value = String(MC_CODEC_STATIC_PT[codec]);
+        multicastPayloadType.readOnly = true;
+      } else {
+        multicastPayloadType.readOnly = false;
+        if (codecChanged) multicastPayloadType.value = String(MC_CODEC_DEFAULT_PT[codec] || 96);
+      }
+    }
     var isHd = codec !== 'PCMU' && codec !== 'PCMA';
     if (codecHdInfoText) {
       codecHdInfoText.textContent = MC_SHOW_DOCS
@@ -5264,11 +5805,14 @@ MULTICAST_RTP_FORM_SCRIPT = r"""<script>
         : "Many telephony endpoints don't support HD audio for multicast streams";
     }
     if (codecHdInfo) codecHdInfo.style.display = isHd ? '' : 'none';
-    var changed = codec !== String(MC_ORIGINAL_CODEC || '').toUpperCase();
+    if (packetMs) packetMs.max = String(selectedCodecMaxPacketMs());
+    var changed = codec !== String(MC_ORIGINAL_CODEC || '').toUpperCase()
+      || Number(multicastPayloadType && multicastPayloadType.value) !== Number(MC_ORIGINAL_PT)
+      || Number(packetMs && packetMs.value) !== Number(MC_ORIGINAL_PACKET_MS);
     if (codecChangeWarn) codecChangeWarn.style.display = (changed && MC_STREAM_ACTIVE) ? '' : 'none';
   }
-  if (multicastCodec) multicastCodec.addEventListener('change', syncCodecNotes);
-  syncCodecNotes();
+  if (multicastCodec) multicastCodec.addEventListener('change', function() { syncCodecNotes(true); syncMulticastForm(); });
+  syncCodecNotes(false);
 
   var standbyList = setupStreamList('standbyStreamList', 'standbySourcesInput');
   var emergencyList = setupStreamList('emergencyStreamList', 'emergencySourcesInput');
@@ -5288,7 +5832,20 @@ MULTICAST_RTP_FORM_SCRIPT = r"""<script>
   }
   function isMulticastAddress(value) { return isIpv4Multicast(value) || isIpv6Multicast(value); }
   function isValidPort(value) { var p = Number(value); return Number.isInteger(p) && p >= 2 && p <= 65534 && p % 2 === 0; }
-  function isValidPacketMs(value) { var ms = Number(value); return Number.isInteger(ms) && ms >= MC_MIN_MS && ms <= MC_MAX_MS && ms % 20 === 0; }
+  function isValidPayloadType(value) {
+    var pt = Number(value);
+    if (!Number.isInteger(pt)) return false;
+    var codec = String(multicastCodec && multicastCodec.value || 'PCMU').toUpperCase();
+    if (Object.prototype.hasOwnProperty.call(MC_CODEC_STATIC_PT, codec)) return pt === Number(MC_CODEC_STATIC_PT[codec]);
+    return pt >= 96 && pt <= 127;
+  }
+  function isValidPacketMs(value) { var ms = Number(value); return Number.isInteger(ms) && ms >= MC_MIN_MS && ms <= selectedCodecMaxPacketMs() && ms % 20 === 0; }
+  function packetSizeError() {
+    var maxMs = selectedCodecMaxPacketMs();
+    return maxMs < MC_MAX_MS
+      ? 'Packet size must be a 20 ms increment between 20 and ' + maxMs + ' ms for the selected format.'
+      : 'Packet size must be a 20 ms increment between 20 and 200 ms.';
+  }
 
   function syncStandbyVisibility() {
     var mode = getStandbyMode();
@@ -5305,7 +5862,8 @@ MULTICAST_RTP_FORM_SCRIPT = r"""<script>
     var errors = [];
     if (!isMulticastAddress(multicastAddress.value)) errors.push('Enter a multicast address.');
     if (!isValidPort(multicastPort.value)) errors.push('Enter an even UDP port.');
-    if (!isValidPacketMs(packetMs.value)) errors.push('Packet size must be a 20 ms increment between 20 and 200 ms.');
+    if (!isValidPayloadType(multicastPayloadType.value)) errors.push('Use the assigned static RTP payload type or a dynamic value between 96 and 127.');
+    if (!isValidPacketMs(packetMs.value)) errors.push(packetSizeError());
     var mode = getStandbyMode();
     if (mode === 'rebroadcast') {
       if (standbyList && standbyList.count() === 0) errors.push('Add at least one background audio source.');
@@ -5317,14 +5875,15 @@ MULTICAST_RTP_FORM_SCRIPT = r"""<script>
     }
     multicastAddress.setCustomValidity(errors.some(function(e) { return e.indexOf('multicast') >= 0; }) ? 'Enter a multicast address.' : '');
     multicastPort.setCustomValidity(errors.some(function(e) { return e.indexOf('port') >= 0; }) ? 'Enter an even UDP port.' : '');
-    packetMs.setCustomValidity(errors.some(function(e) { return e.indexOf('Packet size') >= 0; }) ? 'Packet size must be a 20 ms increment between 20 and 200 ms.' : '');
+    multicastPayloadType.setCustomValidity(errors.some(function(e) { return e.indexOf('payload type') >= 0; }) ? 'Enter a valid RTP payload type.' : '');
+    packetMs.setCustomValidity(errors.some(function(e) { return e.indexOf('Packet size') >= 0; }) ? packetSizeError() : '');
     multicastClientError.textContent = errors.join(' ');
     multicastClientError.style.display = errors.length ? 'block' : 'none';
     saveMulticastRtp.disabled = errors.length > 0;
     return errors.length === 0;
   }
 
-  [multicastAddress, multicastPort, packetMs].forEach(function(input) { input.addEventListener('input', syncMulticastForm); });
+  [multicastAddress, multicastPort, multicastPayloadType, packetMs].forEach(function(input) { input.addEventListener('input', function() { syncCodecNotes(false); syncMulticastForm(); }); });
   Array.prototype.forEach.call(standbyModeRadios, function(radio) {
     radio.addEventListener('change', function() { syncStandbyVisibility(); syncMulticastForm(); });
   });
@@ -5431,9 +5990,11 @@ def multicast_rtp_form_html(values, error, submit_label, stream_active=False):
     error_html = f'<div class="error">{h(error)}</div>' if error else ""
     show_docs = multicast_rtp_show_online_docs()
     selected_codec = str(values.get("codec") or "PCMU").strip().upper()
+    selected_payload_type = multicast_rtp_clean_payload_type(values.get("payload_type"), selected_codec)
+    payload_type_readonly = " readonly" if selected_codec in MULTICAST_RTP_STATIC_PAYLOAD_TYPES else ""
     codec_options = "".join(
-        f'<option value="{h(codec)}"{" selected" if selected_codec == codec else ""}>{h(codec)}</option>'
-        for codec in ("PCMU", "PCMA", "G722", "G7221C", "G726-32", "OPUS")
+        f'<option value="{h(codec)}"{" selected" if selected_codec == codec else ""}>{h(label)}</option>'
+        for codec, label in MULTICAST_RTP_CODEC_OPTIONS
     )
     standby_mode = str(values.get("standby_mode") or "stop").strip().lower()
     if standby_mode not in MULTICAST_RTP_STANDBY_MODES:
@@ -5510,7 +6071,12 @@ def multicast_rtp_form_html(values, error, submit_label, stream_active=False):
         f"const STANDBY_PORT_CONFLICTS = {json.dumps(conflicts)};\n"
         f"const MC_MIN_MS = {MULTICAST_RTP_MIN_PACKET_MS};\n"
         f"const MC_MAX_MS = {MULTICAST_RTP_MAX_PACKET_MS};\n"
+        f"const MC_CODEC_MAX_MS = {json.dumps({codec: multicast_rtp_codec_max_packet_ms(codec) for codec in MULTICAST_RTP_CODECS})};\n"
+        f"const MC_CODEC_DEFAULT_PT = {json.dumps(MULTICAST_RTP_CODECS)};\n"
+        f"const MC_CODEC_STATIC_PT = {json.dumps(MULTICAST_RTP_STATIC_PAYLOAD_TYPES)};\n"
         f"const MC_ORIGINAL_CODEC = {json.dumps(str(values.get('codec') or 'PCMU').strip().upper())};\n"
+        f"const MC_ORIGINAL_PT = {json.dumps(selected_payload_type)};\n"
+        f"const MC_ORIGINAL_PACKET_MS = {json.dumps(multicast_rtp_clean_packet_ms(values.get('packet_ms') or MULTICAST_RTP_DEFAULT_PACKET_MS))};\n"
         f"const MC_STREAM_ACTIVE = {json.dumps(bool(stream_active))};\n"
         f"const MC_SHOW_DOCS = {json.dumps(bool(show_docs))};\n"
         "</script>"
@@ -5521,7 +6087,7 @@ def multicast_rtp_form_html(values, error, submit_label, stream_active=False):
 <div class="row"><label>Multicast Address</label><input class="control" name="address" id="multicastAddress" value="{h(values.get("address"))}" required></div>
 <div class="row"><label>Port</label><input class="control short-control" type="number" name="port" id="multicastPort" value="{h(values.get("port"))}" min="2" max="65534" step="2" required></div>
 <div class="row"><label>Codec</label><select class="control short-control" name="codec" id="multicastCodec">{codec_options}</select></div>
-<div class="codec-note warn" id="codecChangeWarn" style="display:none"><span class="codec-note-icon">&#9888;</span><span>Changing codec will cause audio to stop momentarily</span></div>
+<div class="codec-note warn" id="codecChangeWarn" style="display:none"><span class="codec-note-icon">&#9888;</span><span>Changing codec, payload type, or packet size will cause audio to stop momentarily</span></div>
 <div class="codec-note info" id="codecHdInfo" style="display:none"><span class="codec-note-icon">&#9432;</span><span id="codecHdInfoText"></span></div>
 <div class="row"><label>On standby</label><div class="mdc-radio-group standby-mode-control" id="standbyMode">{standby_mode_radios}</div></div>
 <div class="standby-block{rebroadcast_show}" id="standbyRebroadcast">
@@ -5550,7 +6116,10 @@ def multicast_rtp_form_html(values, error, submit_label, stream_active=False):
     <span>priority <span id="mutePriorityOrHigher"{mute_or_higher_style}>or higher </span></span>
   </div>
 </div>
-<details class="advanced"><summary>Advanced options</summary><div class="advanced-body"><div class="row"><label>Packet Size (ms)</label><input class="control short-control" type="number" name="packet_ms" id="packetMs" value="{h(values.get("packet_ms") or MULTICAST_RTP_DEFAULT_PACKET_MS)}" min="{MULTICAST_RTP_MIN_PACKET_MS}" max="{MULTICAST_RTP_MAX_PACKET_MS}" step="20" required></div></div></details>
+<details class="advanced"><summary>Advanced options</summary><div class="advanced-body">
+<div class="row"><label>RTP Payload Type</label><input class="control short-control" type="number" name="payload_type" id="multicastPayloadType" value="{selected_payload_type}" min="0" max="127" step="1" required{payload_type_readonly}></div>
+<div class="row"><label>Maximum Packet Duration (ms)</label><input class="control short-control" type="number" name="packet_ms" id="packetMs" value="{h(values.get("packet_ms") or MULTICAST_RTP_DEFAULT_PACKET_MS)}" min="{MULTICAST_RTP_MIN_PACKET_MS}" max="{MULTICAST_RTP_MAX_PACKET_MS}" step="20" required></div>
+</div></details>
 <div class="error" id="multicastClientError" style="display:none"></div>
 <button class="button" id="saveMulticastRtp" type="submit">{h(submit_label)}</button>
 </form>"""
@@ -5579,8 +6148,8 @@ class BuiltinMulticastRTPWeb:
                 if duplicate:
                     raise ValueError("That multicast address and port already exists.")
                 sip_execute(
-                    f"INSERT INTO `{MULTICAST_RTP_TABLE}` (`name`, `address`, `port`, `codec`, `packet_ms`, `standby_mode`, `standby_sources`, `standby_msg_action`, `standby_msg_priority`, `emergency_sources`, `amp_master`, `amp_page`, `amp_bell`, `amp_message`, `mute_priority_enabled`, `mute_priority`) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                    (clean["name"], clean["address"], clean["port"], clean["codec"], clean["packet_ms"], clean["standby_mode"], clean["standby_sources"], clean["standby_msg_action"], clean["standby_msg_priority"], clean["emergency_sources"], clean["amp_master"], clean["amp_page"], clean["amp_bell"], clean["amp_message"], clean["mute_priority_enabled"], clean["mute_priority"]),
+                    f"INSERT INTO `{MULTICAST_RTP_TABLE}` (`name`, `address`, `port`, `codec`, `payload_type`, `packet_ms`, `standby_mode`, `standby_sources`, `standby_msg_action`, `standby_msg_priority`, `emergency_sources`, `amp_master`, `amp_page`, `amp_bell`, `amp_message`, `mute_priority_enabled`, `mute_priority`) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (clean["name"], clean["address"], clean["port"], clean["codec"], clean["payload_type"], clean["packet_ms"], clean["standby_mode"], clean["standby_sources"], clean["standby_msg_action"], clean["standby_msg_priority"], clean["emergency_sources"], clean["amp_master"], clean["amp_page"], clean["amp_bell"], clean["amp_message"], clean["mute_priority_enabled"], clean["mute_priority"]),
                 )
                 multicast_rtp_notify_config_changed()
                 return page("Endpoint Saved", "<script>window.top.location.href='/admin/manage-endpoints'</script><p>Endpoint saved.</p>", "endpoints", user)
@@ -5613,8 +6182,8 @@ class BuiltinMulticastRTPWeb:
                 if duplicate:
                     raise ValueError("That multicast address and port already exists.")
                 sip_execute(
-                    f"UPDATE `{MULTICAST_RTP_TABLE}` SET `name`=%s, `address`=%s, `port`=%s, `codec`=%s, `packet_ms`=%s, `standby_mode`=%s, `standby_sources`=%s, `standby_msg_action`=%s, `standby_msg_priority`=%s, `emergency_sources`=%s, `amp_master`=%s, `amp_page`=%s, `amp_bell`=%s, `amp_message`=%s, `mute_priority_enabled`=%s, `mute_priority`=%s WHERE id=%s",
-                    (clean["name"], clean["address"], clean["port"], clean["codec"], clean["packet_ms"], clean["standby_mode"], clean["standby_sources"], clean["standby_msg_action"], clean["standby_msg_priority"], clean["emergency_sources"], clean["amp_master"], clean["amp_page"], clean["amp_bell"], clean["amp_message"], clean["mute_priority_enabled"], clean["mute_priority"], row_id),
+                    f"UPDATE `{MULTICAST_RTP_TABLE}` SET `name`=%s, `address`=%s, `port`=%s, `codec`=%s, `payload_type`=%s, `packet_ms`=%s, `standby_mode`=%s, `standby_sources`=%s, `standby_msg_action`=%s, `standby_msg_priority`=%s, `emergency_sources`=%s, `amp_master`=%s, `amp_page`=%s, `amp_bell`=%s, `amp_message`=%s, `mute_priority_enabled`=%s, `mute_priority`=%s WHERE id=%s",
+                    (clean["name"], clean["address"], clean["port"], clean["codec"], clean["payload_type"], clean["packet_ms"], clean["standby_mode"], clean["standby_sources"], clean["standby_msg_action"], clean["standby_msg_priority"], clean["emergency_sources"], clean["amp_master"], clean["amp_page"], clean["amp_bell"], clean["amp_message"], clean["mute_priority_enabled"], clean["mute_priority"], row_id),
                 )
                 multicast_rtp_notify_config_changed()
                 return page("Endpoint Saved", "<script>window.top.location.href='/admin/manage-endpoints'</script><p>Endpoint saved.</p>", "endpoints", user)
@@ -5641,11 +6210,30 @@ class MulticastRTPSender:
         self.port = multicast_rtp_clean_port(row.get("port"))
         self.codec = multicast_rtp_clean_codec(row.get("codec") or "PCMU")
         self.packet_ms = multicast_rtp_clean_packet_ms(row.get("packet_ms") or MULTICAST_RTP_DEFAULT_PACKET_MS)
-        self.payload_type = MULTICAST_RTP_CODECS[self.codec]
+        max_packet_ms = multicast_rtp_codec_max_packet_ms(self.codec)
+        if self.packet_ms > max_packet_ms:
+            raise ValueError(f"Packet size for {multicast_rtp_codec_label(self.codec)} must not exceed {max_packet_ms} ms.")
+        self.payload_type = multicast_rtp_clean_payload_type(row.get("payload_type"), self.codec)
         self.frames_per_packet = max(1, self.packet_ms // MULTICAST_RTP_FRAME_MS)
         self.pending_payload = bytearray()
         self.pending_frames = 0
         self.codec_encoder = None
+        self.pcm_transcoder = MulticastPcmTranscoder(self.codec) if self.codec in MULTICAST_RTP_PCM_FORMATS else None
+        self.codec_info = MULTICAST_RTP_PCM_FORMATS.get(self.codec) or SIP_EDGE_CODEC_PAYLOADS.get(self.codec, {})
+        self.clock_rate = int(self.codec_info.get("sample_rate", 0) or 0)
+        if not self.clock_rate:
+            self.clock_rate = int(self.codec_info.get("samples_per_frame", 160)) * 50
+        self.samples_per_frame = self.clock_rate * MULTICAST_RTP_FRAME_MS // 1000
+        self.pcm_sample_bytes = 0
+        self.pcm_packet_samples = 0
+        if self.codec in MULTICAST_RTP_PCM_FORMATS:
+            self.pcm_sample_bytes = int(self.codec_info["channels"]) * int(self.codec_info["sample_width"])
+            duration_samples = max(1, self.clock_rate * self.packet_ms // 1000)
+            mtu_samples = max(1, MULTICAST_RTP_TARGET_MEDIA_BYTES // self.pcm_sample_bytes)
+            self.pcm_packet_samples = min(duration_samples, mtu_samples)
+        self.marker_next = True
+        self.suppressed = False
+        self.next_packet_send = time.monotonic()
         self.sequence = random.randrange(0, 65536)
         self.timestamp = random.randrange(0, 4294967296)
         self.ssrc = random.randrange(0, 4294967296)
@@ -5666,7 +6254,9 @@ class MulticastRTPSender:
             self.destination = (self.address, self.port, 0, 0)
 
     def encode_frame(self, payload):
-        payload = bytes(payload or b"")[:MULTICAST_RTP_FRAME_SIZE].ljust(MULTICAST_RTP_FRAME_SIZE, b"\xff")
+        payload = normalize_endpoint_pcm_frame(payload, accept_legacy_ulaw=True)
+        if self.pcm_transcoder is not None:
+            return self.pcm_transcoder.feed(payload)
         encoded, self.codec_encoder = encode_edge_rtp_payload(
             self.codec,
             payload,
@@ -5675,36 +6265,93 @@ class MulticastRTPSender:
         return encoded
 
     def send_frame(self, payload):
+        self.suppressed = False
         frame = self.encode_frame(payload)
         if not frame:
-            # Encoder is still priming (first G722/Opus frame); don't emit an
-            # empty RTP packet or advance the frame count.
             return
         self.pending_payload.extend(frame)
+        if self.pcm_sample_bytes:
+            packet_bytes = self.pcm_packet_samples * self.pcm_sample_bytes
+            while len(self.pending_payload) >= packet_bytes:
+                packet = bytes(self.pending_payload[:packet_bytes])
+                del self.pending_payload[:packet_bytes]
+                self._send_packet(packet, self.pcm_packet_samples)
+            return
         self.pending_frames += 1
         if self.pending_frames >= self.frames_per_packet:
             self.flush()
 
-    def flush(self):
-        if self.pending_frames <= 0:
-            return
-        header = struct.pack("!BBHII", 0x80, self.payload_type, self.sequence, self.timestamp, self.ssrc)
-        self.sock.sendto(header + bytes(self.pending_payload), self.destination)
+    def _send_packet(self, payload, timestamp_samples):
+        if self.pcm_sample_bytes:
+            now = time.monotonic()
+            wait_for = self.next_packet_send - now
+            if wait_for > 0:
+                time.sleep(wait_for)
+                now = time.monotonic()
+            elif wait_for < -0.1:
+                self.next_packet_send = now
+        marker = 0x80 if self.marker_next else 0
+        header = struct.pack(
+            "!BBHII",
+            0x80,
+            marker | self.payload_type,
+            self.sequence,
+            self.timestamp,
+            self.ssrc,
+        )
+        self.sock.sendto(header + bytes(payload), self.destination)
+        self.marker_next = False
         self.sequence = (self.sequence + 1) & 0xFFFF
-        codec_info = SIP_EDGE_CODEC_PAYLOADS.get(self.codec, {})
-        # Multicast listeners have no SDP, so they expect the RTP timestamp to
-        # advance at the codec's true sample rate (e.g. 320/frame for G722's
-        # 16 kHz), not the RFC 3551 8 kHz signalling-only clock.
-        samples_per_frame = int(codec_info.get("sample_rate_wire", 0) or 0) // 50 or int(codec_info.get("samples_per_frame", MULTICAST_RTP_FRAME_SIZE))
-        self.timestamp = (self.timestamp + (self.pending_frames * samples_per_frame)) & 0xFFFFFFFF
+        self.timestamp = (self.timestamp + int(timestamp_samples)) & 0xFFFFFFFF
+        if self.pcm_sample_bytes:
+            self.next_packet_send += int(timestamp_samples) / float(self.clock_rate)
+
+    def flush(self):
+        if not self.pending_payload:
+            return
+        if self.pcm_sample_bytes:
+            sample_count = len(self.pending_payload) // self.pcm_sample_bytes
+            payload_bytes = sample_count * self.pcm_sample_bytes
+            if sample_count:
+                self._send_packet(bytes(self.pending_payload[:payload_bytes]), sample_count)
+        elif self.pending_frames > 0:
+            self._send_packet(
+                bytes(self.pending_payload),
+                self.pending_frames * self.samples_per_frame,
+            )
         self.pending_payload.clear()
         self.pending_frames = 0
 
+    def suppress_frame(self):
+        """Advance the RTP media clock without incrementing the sequence."""
+        if not self.suppressed:
+            if self.pcm_transcoder is not None:
+                self.pending_payload.extend(self.pcm_transcoder.drain())
+            self.flush()
+            if self.pcm_transcoder is not None:
+                self.pcm_transcoder.close()
+                self.pcm_transcoder = MulticastPcmTranscoder(self.codec)
+            self.suppressed = True
+        self.timestamp = (self.timestamp + self.samples_per_frame) & 0xFFFFFFFF
+        self.marker_next = True
+        self.next_packet_send = time.monotonic()
+
     def close(self):
         try:
+            if self.pcm_transcoder is not None:
+                self.pending_payload.extend(self.pcm_transcoder.drain())
             self.flush()
         finally:
-            self.sock.close()
+            try:
+                closer = getattr(self.codec_encoder, "close", None)
+                if callable(closer):
+                    closer()
+            finally:
+                try:
+                    if self.pcm_transcoder is not None:
+                        self.pcm_transcoder.close()
+                finally:
+                    self.sock.close()
 
 
 class MulticastRTPSource:
@@ -5716,9 +6363,6 @@ class MulticastRTPSource:
         self.ready_sent = False
         self.priority = priority if priority in VALID_MESSAGE_PRIORITIES else "Normal"
         self.klass = klass if klass in ("message", "page", "bell") else "message"
-        # When the multicast group is already primed (a resident standby channel
-        # is broadcasting), skip the preroll wait so message audio interrupts the
-        # background instantly instead of buffering behind the ready gate.
         self.instant_ready = bool(instant_ready)
         self.had_audio = False
 
@@ -5740,7 +6384,7 @@ class MulticastRTPSource:
                     return None, False
                 return frame, False
             if self.closed and self.partial_frame:
-                frame = bytes(self.partial_frame).ljust(MULTICAST_RTP_FRAME_SIZE, b"\xff")
+                frame = bytes(self.partial_frame).ljust(MULTICAST_RTP_FRAME_SIZE, b"\x00")
                 self.partial_frame.clear()
                 self.had_audio = True
                 if discard:
@@ -5769,15 +6413,18 @@ class MulticastRTPSource:
             self.closed = True
 
 
-# --- Standby (background audio) subsystem -----------------------------------
-# These provide a continuous background stream for a multicast endpoint while no
-# message is in effect (the "On standby" behaviour). Audio is normalised to
-# 8 kHz mono u-law 160-byte frames so it can be mixed with message audio and
-# encoded by the endpoint's configured codec.
-STANDBY_BUFFER_FRAMES = 50            # ~1s of jitter buffer per source
-STANDBY_HEALTHY_WINDOW = 2.0          # seconds since last frame to be "healthy"
-STANDBY_RECONNECT_BACKOFF = 1.0       # seconds between reconnect attempts
-MULTICAST_RTP_PT_TO_CODEC = {payload: codec for codec, payload in MULTICAST_RTP_CODECS.items()}
+STANDBY_BUFFER_FRAMES = 50
+STANDBY_HEALTHY_WINDOW = 2.0
+STANDBY_RECONNECT_BACKOFF = 1.0
+MULTICAST_RTP_PT_TO_CODEC = {
+    0: "PCMU",
+    8: "PCMA",
+    9: "G722",
+    10: "L16-441",
+    11: "L16-44M",
+    111: "OPUS",
+    121: "G7221C",
+}
 
 
 class StandbyReaderBase:
@@ -5803,8 +6450,8 @@ class StandbyReaderBase:
     def _run(self):
         raise NotImplementedError
 
-    def _push_ulaw(self, buffer):
-        """Split a growing bytearray into 160-byte frames, pushing complete
+    def _push_pcm(self, buffer):
+        """Split a growing bytearray into canonical PCM frames, pushing complete
         ones. Returns the buffer trimmed to the trailing partial frame."""
         while len(buffer) >= MULTICAST_RTP_FRAME_SIZE:
             frame = bytes(buffer[:MULTICAST_RTP_FRAME_SIZE])
@@ -5838,7 +6485,8 @@ class StandbyHttpReader(StandbyReaderBase):
                         "ffmpeg", "-v", "quiet", "-nostdin",
                         "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
                         "-i", self.url,
-                        "-ar", "8000", "-ac", "1", "-f", "mulaw", "-flush_packets", "1", "pipe:1",
+                        "-ar", str(ENDPOINT_PCM_SAMPLE_RATE), "-ac", str(ENDPOINT_PCM_CHANNELS),
+                        "-f", "s16le", "-flush_packets", "1", "pipe:1",
                     ],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
@@ -5858,7 +6506,7 @@ class StandbyHttpReader(StandbyReaderBase):
                         if not chunk:
                             break
                         buffer.extend(chunk)
-                        buffer = self._push_ulaw(buffer)
+                        buffer = self._push_pcm(buffer)
                 finally:
                     try:
                         proc.stdout.close()
@@ -5925,7 +6573,7 @@ class StandbyRtpReader(StandbyReaderBase):
             try:
                 while not self.stop_event.is_set():
                     try:
-                        packet, addr = sock.recvfrom(4096)
+                        packet, addr = sock.recvfrom(65535)
                     except socket.timeout:
                         continue
                     except OSError:
@@ -5940,14 +6588,19 @@ class StandbyRtpReader(StandbyReaderBase):
                     payload = packet[header_len:]
                     if not payload:
                         continue
-                    codec = MULTICAST_RTP_PT_TO_CODEC.get(payload_type, "PCMU")
+                    codec = MULTICAST_RTP_PT_TO_CODEC.get(payload_type)
+                    if codec is None:
+                        continue
                     try:
-                        ulaw, decoder_state = decode_edge_rtp_payload(codec, payload, decoder_state)
+                        if codec in MULTICAST_RTP_PCM_FORMATS:
+                            pcm = decode_multicast_pcm_payload(codec, payload)
+                        else:
+                            pcm, decoder_state = decode_edge_rtp_payload(codec, payload, decoder_state)
                     except Exception:
-                        ulaw = b""
-                    if ulaw:
-                        buffer.extend(ulaw)
-                        buffer = self._push_ulaw(buffer)
+                        pcm = b""
+                    if pcm:
+                        buffer.extend(pcm)
+                        buffer = self._push_pcm(buffer)
             finally:
                 try:
                     sock.close()
@@ -6197,29 +6850,36 @@ class MulticastRTPEndpointChannel:
         the source chains themselves) rebuild the engine. Setting standby to
         None (mode 'stop') lets the channel idle-close once no message is in
         effect."""
-        # A codec change requires rebuilding the RTP sender. Detect it up front
-        # (the codec is not part of standby_config_key, so the early-returns
-        # below would otherwise miss it) and hand the new row to the run thread,
-        # which owns self.sender: it stops the stream for a few seconds, then
-        # rebuilds the sender with the new codec.
         try:
             new_codec = multicast_rtp_clean_codec(row.get("codec") or "PCMU")
+            new_signature = (
+                new_codec,
+                multicast_rtp_clean_payload_type(row.get("payload_type"), new_codec),
+                multicast_rtp_clean_packet_ms(row.get("packet_ms") or MULTICAST_RTP_DEFAULT_PACKET_MS),
+            )
         except Exception:
-            new_codec = None
-        if new_codec is not None:
+            new_signature = None
+        if new_signature is not None:
             with self.lock:
                 sender = self.sender
                 pending = self.pending_sender_row
-            pending_codec = None
             if pending is not None:
                 try:
                     pending_codec = multicast_rtp_clean_codec(pending.get("codec") or "PCMU")
+                    current_signature = (
+                        pending_codec,
+                        multicast_rtp_clean_payload_type(pending.get("payload_type"), pending_codec),
+                        multicast_rtp_clean_packet_ms(pending.get("packet_ms") or MULTICAST_RTP_DEFAULT_PACKET_MS),
+                    )
                 except Exception:
-                    pending_codec = None
-                current_codec = pending_codec
+                    current_signature = None
             else:
-                current_codec = getattr(sender, "codec", None)
-            if current_codec is not None and new_codec != current_codec:
+                current_signature = (
+                    getattr(sender, "codec", None),
+                    getattr(sender, "payload_type", None),
+                    getattr(sender, "packet_ms", None),
+                )
+            if current_signature is not None and current_signature[0] is not None and new_signature != current_signature:
                 with self.lock:
                     self.pending_sender_row = dict(row)
                     self.codec_restart_until = time.monotonic() + MULTICAST_RTP_CODEC_RESTART_SECONDS
@@ -6275,9 +6935,6 @@ class MulticastRTPEndpointChannel:
             return
         meta = metadata or {}
         expires_at = sip_parse_datetime_value(meta.get("expires"))
-        # Probe the store now so a broadcast that is already active (the common
-        # case — records are written before dispatch) is confirmed immediately
-        # and tracked for its whole lifetime.
         try:
             record = fetch_active_broadcast(broadcast_id)
         except Exception:
@@ -6293,8 +6950,6 @@ class MulticastRTPEndpointChannel:
                 "confirmed": confirmed or bool(existing and existing.get("confirmed")),
             }
             self.idle_since = None
-            # Force a fresh store re-check on the next frame so a just-attached
-            # broadcast is validated promptly.
             self.active_check_at = 0.0
         if existing is None:
             log(f"multicast rtp standby track broadcast={broadcast_id} channel={self.key} "
@@ -6327,11 +6982,8 @@ class MulticastRTPEndpointChannel:
                 try:
                     record = fetch_active_broadcast(bid)
                 except Exception:
-                    record = False  # store error: keep, retry next time
+                    record = False
                 if record is None:
-                    # Not in the store. Keep briefly if we have never seen it
-                    # confirmed (dispatch may beat the store write); otherwise it
-                    # is genuinely gone -> restore the audio.
                     grace = (now_mono - info.get("registered_at", now_mono)) < 15.0
                     if info.get("confirmed") or not grace:
                         drop.append(bid)
@@ -6387,7 +7039,7 @@ class MulticastRTPEndpointChannel:
         """
         has_audio = bool(message_frames)
         if standby is None or standby.mode != "rebroadcast":
-            return mix_ulaw_frames(message_frames) if has_audio else MULTICAST_RTP_SILENCE_FRAME
+            return mix_endpoint_pcm_frames(message_frames) if has_audio else MULTICAST_RTP_SILENCE_FRAME
 
         threshold = MESSAGE_PRIORITY_ORDER.get(standby.msg_priority, 2)
         action_triggered = msg_lifetime_priority is not None and msg_lifetime_priority >= threshold
@@ -6396,15 +7048,10 @@ class MulticastRTPEndpointChannel:
 
         gain = standby.amp.get("master", "0")
         muted = gain == "mute"
-        # Stop / silence actions: hold the background silenced for the whole
-        # message lifetime, even between/after the message audio frames.
-        # "stop" additionally sends no RTP at all (the stream truly stops);
-        # "silence" keeps emitting silence frames.
         stop_action = in_effect and standby.msg_action == "stop" and action_triggered
         silence_action = in_effect and standby.msg_action == "silence" and action_triggered
         if stop_action or silence_action:
             muted = True
-        # Mute-during-broadcast checkbox: only while message audio is playing.
         if has_audio and standby.mute_priority_enabled:
             mute_thr = MESSAGE_PRIORITY_ORDER.get(standby.mute_priority, 2)
             if audio_msg_priority is not None and audio_msg_priority >= mute_thr:
@@ -6416,16 +7063,15 @@ class MulticastRTPEndpointChannel:
             else:
                 gain = multicast_rtp_combine_gain(gain, type_amp)
 
-        background_out = MULTICAST_RTP_SILENCE_FRAME if muted else apply_gain_ulaw_frame(background, gain)
+        background_out = MULTICAST_RTP_SILENCE_FRAME if muted else apply_gain_endpoint_pcm_frame(background, gain)
         if not has_audio:
-            # The stop action stops the stream entirely: emit nothing.
             if stop_action:
                 return None
             return background_out
-        message_mix = mix_ulaw_frames(message_frames)
+        message_mix = mix_endpoint_pcm_frames(message_frames)
         if background_out == MULTICAST_RTP_SILENCE_FRAME:
             return message_mix
-        return mix_ulaw_frames([background_out, message_mix])
+        return mix_endpoint_pcm_frames([background_out, message_mix])
 
     def run(self):
         next_send = time.monotonic()
@@ -6441,9 +7087,6 @@ class MulticastRTPEndpointChannel:
                 best_any_order = None
                 best_any_class = None
                 now = time.monotonic()
-                # Codec change: stop the stream during the restart window, then
-                # rebuild the RTP sender with the new codec. The run thread is
-                # the sole owner of self.sender, so the swap happens here.
                 with self.lock:
                     pending_row = self.pending_sender_row
                     restart_until = self.codec_restart_until
@@ -6482,10 +7125,6 @@ class MulticastRTPEndpointChannel:
                         if frame is not None:
                             message_frames.append(frame)
                         order = MESSAGE_PRIORITY_ORDER.get(source.priority, 1)
-                        # The stop / emergency / mute logic keys off broadcast
-                        # PRIORITY for any broadcast in effect — independent of
-                        # the page/bell/message class (which only selects the
-                        # amplify-ducking value below).
                         if msg_lifetime_priority is None or order > msg_lifetime_priority:
                             msg_lifetime_priority = order
                         if frame is not None and (audio_msg_priority is None or order > audio_msg_priority):
@@ -6502,11 +7141,6 @@ class MulticastRTPEndpointChannel:
                             finished_stream_ids.append(stream_id)
                     if dominant_class is None:
                         dominant_class = best_any_class
-                # A qualifying message keeps the standby *action* (stop / switch
-                # to emergency) in effect for its whole server lifetime — during
-                # its audio and afterwards until it is no longer active. This is
-                # separate from the mute-during-broadcast checkbox, which only
-                # tracks live audio (audio_msg_priority above).
                 if standby is not None:
                     for info in self.current_active_broadcasts():
                         in_effect = True
@@ -6516,15 +7150,15 @@ class MulticastRTPEndpointChannel:
                 mixed_frame = self.compose_frame(
                     standby, message_frames, in_effect, dominant_class, audio_msg_priority, msg_lifetime_priority
                 )
-                # During a codec restart the stream is stopped; emit nothing.
-                # A None frame means the standby stop action wants the stream
-                # silenced with no RTP either.
                 if not in_codec_restart and mixed_frame is not None:
                     try:
                         self.sender.send_frame(mixed_frame)
                     except OSError as exc:
-                        # Transient network errors must not kill the channel
-                        # thread mid-broadcast; skip the frame and keep pacing.
+                        log(f"multicast rtp send error channel={self.key}: {exc}")
+                elif not in_codec_restart:
+                    try:
+                        self.sender.suppress_frame()
+                    except OSError as exc:
                         log(f"multicast rtp send error channel={self.key}: {exc}")
                 for stream_id in ready_sources:
                     self.on_idle("ready", self.key, stream_id, self)
@@ -6534,9 +7168,6 @@ class MulticastRTPEndpointChannel:
                             source = self.sources.get(stream_id)
                             if source is not None and source.closed:
                                 self.sources.pop(stream_id, None)
-                # A channel with standby configured stays resident and keeps
-                # broadcasting background audio; only non-standby channels idle
-                # out once their message finishes.
                 if standby is None:
                     with self.lock:
                         if not self.sources:
@@ -6575,10 +7206,13 @@ class MulticastRTPStreamState:
             self.sources.append((channel_key, source))
 
     def receive_audio(self, chunk):
+        pcm = coerce_endpoint_pcm_audio(chunk)
+        if not pcm:
+            return
         with self.lock:
             sources = [source for _channel_key, source in self.sources]
         for source in sources:
-            source.receive_audio(chunk)
+            source.receive_audio(pcm)
 
     def mark_source_ready(self, channel_key):
         with self.lock:
@@ -6688,8 +7322,6 @@ class BuiltinMulticastRTPModule:
                 source = channel.attach_source(stream_id, priority=priority, klass=klass)
                 if source is not None:
                     break
-                # Channel was shutting down between lookup and attach — drop
-                # it so ensure_channel builds a fresh one.
                 with self.lock:
                     if self.channels.get(channel.key) is channel:
                         self.channels.pop(channel.key, None)
@@ -6706,11 +7338,6 @@ class BuiltinMulticastRTPModule:
                 previous.close()
             except Exception as exc:
                 log(f"multicast rtp stream replace error stream={stream_id}: {exc}")
-        # Do not mark ready here: readiness is gated on the channel preroll
-        # (handle_channel_event -> mark_source_ready) so the call is not
-        # answered until the multicast group has been primed and the
-        # receiving devices have had time to join. Only short-circuit when
-        # there is nothing to wait for.
         if not state.sources:
             mark_ready(MULTICAST_RTP_MODULE, stream_id)
 
@@ -7012,8 +7639,6 @@ document.addEventListener('keydown', function(e) {{ if (e.key === 'Escape') clos
 </script>"""
 
 
-
-
 def http_request_space_value(text, space_format="%20"):
     raw_text = str(text or "")
     token = str(space_format or "%20").strip().lower() or "%20"
@@ -7172,7 +7797,6 @@ class BuiltinHttpRequestModule:
     def handle_dispatch(self, action, stream_id, msg_id, sub_targets, metadata=None):
         if action in {"prepare_audio", "prepare_livepage"}:
             mark_ready(HTTP_REQUEST_MODULE, stream_id)
-        # Always ignore live pages
         if action == "prepare_livepage":
             return
         if action not in {"prepare_audio", "sendmsg"}:
@@ -7194,11 +7818,9 @@ class BuiltinHttpRequestModule:
         if msg_type_lower in {"page", "liveaudio"}:
             mark_ready(HTTP_REQUEST_MODULE, stream_id)
             return
-        # Detect bells: AudioMessage type with no visual text — always skip
         has_text = bool(str(metadata.get("shortmessage") or "").strip() or str(metadata.get("longmessage") or "").strip())
         if msg_type_lower == "audiomessage" and not has_text:
             return
-        # Check if this is an audio-only message (no visual/text component)
         is_audio_only = msg_type_lower in ("audio", "audiomessage") or (
             is_audio_type(msg_type) and not has_text
         )
@@ -7208,7 +7830,6 @@ class BuiltinHttpRequestModule:
             conn = get_db_connection()
             with conn.cursor() as cur:
                 for row in rows:
-                    # Skip audio-only messages if the endpoint has include_audio_only disabled
                     iao = row.get("include_audio_only")
                     if is_audio_only and not int(iao if iao is not None else 1):
                         continue
@@ -7481,7 +8102,7 @@ def service_monitor_collect_message(form):
         "priority": str(form.get("priority") or "Normal"),
         "vendor_specific": vendor_specific_from_form(form),
         "expires": message_expiration_from_form(form),
-        "send_all": "1" if form.get("send_all") else "0",
+        "send_all": "1" if form.get("send_all") and not all_recipients_disabled() else "0",
         "groups": [str(g).strip() for g in form.getlist("groups[]") if str(g).strip()],
     }
 
@@ -7544,6 +8165,7 @@ def service_monitor_row_values_from_draft(draft):
         "uk_api_key": uk_key,
         "uk_monitor": uk_mon,
     }
+    disable_all_recipients = all_recipients_disabled()
     for direction in ("down", "up"):
         enabled = 1 if str(draft.get(f"{direction}_enabled")) == "1" else 0
         msg = draft.get(direction) or {}
@@ -7556,7 +8178,7 @@ def service_monitor_row_values_from_draft(draft):
             has_audio = bool(msg.get("audio"))
             if not has_text and not has_audio:
                 raise ValueError(f"Add a message or audio for the monitor {direction} notification.")
-            send_all = str(msg.get("send_all")) == "1"
+            send_all = str(msg.get("send_all")) == "1" and not disable_all_recipients
             groups = list(msg.get("groups") or [])
             if not send_all and not groups:
                 raise ValueError(f"Choose recipients for the monitor {direction} notification.")
@@ -7602,7 +8224,7 @@ def service_monitor_message_summary(draft, direction):
     has_audio = bool(msg.get("audio"))
     if not has_text and not has_audio:
         return "No message configured yet."
-    if str(msg.get("send_all")) == "1":
+    if str(msg.get("send_all")) == "1" and not all_recipients_disabled():
         who = "All recipients"
     else:
         count = len(msg.get("groups") or [])
@@ -7849,7 +8471,8 @@ def service_monitor_message_editor_html(direction, token, draft, user, error):
     priority = str(msg.get("priority") or "Normal")
     expires = str(msg.get("expires") or "manual")
     vendor = str(msg.get("vendor_specific") or "")
-    send_all = str(msg.get("send_all")) == "1"
+    disable_all_recipients = all_recipients_disabled()
+    send_all = str(msg.get("send_all")) == "1" and not disable_all_recipients
     sel_groups = {str(g) for g in (msg.get("groups") or [])}
     try:
         group_rows = webapp.filter_group_rows_for_user(
@@ -7895,6 +8518,7 @@ def service_monitor_message_editor_html(direction, token, draft, user, error):
         f'<option value="{h(p)}"{" selected" if priority == p else ""}>{h(p)}</option>'
         for p in SERVICE_MONITOR_PRIORITIES
     )
+    all_recipient_option = "" if disable_all_recipients else f'<label class="md-checkbox-container"><input type="checkbox" name="send_all" id="send_all" value="1" onchange="toggleRecipients()"{" checked" if send_all else ""}><span class="md-checkmark"></span><span class="text" style="font-weight:bold;color:var(--ops-accent);">All Recipients</span></label>'
     return f"""<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet"/>
 <style>{MESSAGE_FORM_STYLE}
 body,html{{overflow:visible;height:auto;}}
@@ -7923,7 +8547,7 @@ html.sm-modal-active .message-icon-picker-backdrop.open{{visibility:visible !imp
 <div class="form-group">
 <label class="main-label">Recipients</label>
 <div class="checkbox-row">
-<label class="md-checkbox-container"><input type="checkbox" name="send_all" id="send_all" value="1" onchange="toggleRecipients()"{" checked" if send_all else ""}><span class="md-checkmark"></span><span class="text" style="font-weight:bold;color:var(--ops-accent);">All Recipients</span></label>
+{all_recipient_option}
 {rows_html}
 </div>
 </div>
@@ -7950,7 +8574,8 @@ html.sm-modal-active .message-icon-picker-backdrop.open{{visibility:visible !imp
 </div>
 <script>{MESSAGE_FORM_SCRIPT}
 function toggleRecipients(){{
-  var all = document.getElementById('send_all').checked;
+  var allInput = document.getElementById('send_all');
+  var all = !!(allInput && allInput.checked);
   document.querySelectorAll('.group-checkbox').forEach(function(cb){{ cb.disabled = all; if (all) cb.checked = false; }});
 }}
 toggleRecipients();
@@ -8117,16 +8742,11 @@ class BuiltinServiceMonitorModule:
         self.stop_event = threading.Event()
         self.inflight = set()
         self.inflight_lock = threading.Lock()
-        # Monitors that have been confirmed ONLINE at least once in THIS process.
-        # A "went down" alert is only ever sent for a monitor in this set, so a
-        # stale DB last_state, a skipped boot reset, retries=0, or a flaky first
-        # probe can never fire a false "server is down" broadcast on startup.
         self.seen_online = set()
         self.seen_online_lock = threading.Lock()
         self.boot_monotonic = time.monotonic()
         try:
             ensure_servicemonitor_schema()
-            # On boot every monitor is "Unchecked" until it has been probed once.
             sip_execute(
                 f"UPDATE `{SERVICE_MONITOR_TABLE}` SET `last_state`='unchecked', `last_checked`=NULL, `fail_count`=0"
             )
@@ -8137,14 +8757,6 @@ class BuiltinServiceMonitorModule:
         self.thread.start()
 
     def _clear_stale_monitor_broadcasts(self):
-        # Neutralise any Service Monitor broadcast left in the active store by a
-        # previous run. The broadcast watcher re-delivers every record whose
-        # delivery is '' or 'pending', and a monitor down message (manual / "on
-        # monitor up" expiration) never time-expires — so without this a stale
-        # "went down" message is re-broadcast on EVERY server restart. On boot
-        # the poll loop hasn't run yet, so any monitor-sender broadcast still
-        # sitting here is stale and must be stopped + expired. Fresh alerts are
-        # re-created by the poll loop as needed.
         try:
             from broadcasts import list_active_broadcasts, mark_active_broadcast_delivery
 
@@ -8171,7 +8783,6 @@ class BuiltinServiceMonitorModule:
         return get_service_monitor_endpoint_status()
 
     def handle_dispatch(self, action, stream_id, msg_id, sub_targets, metadata=None):
-        # Service Monitor is an input-only module; it never receives broadcasts.
         if action in {"prepare_audio", "prepare_livepage"}:
             mark_ready(SERVICE_MONITOR_MODULE, stream_id)
 
@@ -8231,11 +8842,6 @@ class BuiltinServiceMonitorModule:
             log(f"service monitor down-broadcast store error id={row_id}: {exc}")
 
     def _maybe_expire_down_broadcast(self, row):
-        # When the down message's expiration is "On monitor up", tear down the
-        # active down broadcast now that the monitor has recovered. If it is
-        # still mid-broadcast we must first STOP the live playback (so the down
-        # audio/message is cut off on the endpoints), then expire the record,
-        # and only after that does the caller send the "up" message.
         row_id = str(row.get("id"))
         broadcast_id = str(row.get("down_broadcast_id") or "").strip()
         expires = str(row.get("down_expires") or "")
@@ -8250,15 +8856,8 @@ class BuiltinServiceMonitorModule:
                         child_id = str(record.get("id") or "").strip()
                         if child_id and child_id not in related_ids:
                             related_ids.append(child_id)
-                # 1) Signal the live delivery loops to stop feeding audio. They
-                #    poll active_broadcast_stop_requested (~every 0.5s) and break.
                 for token in related_ids:
                     request_active_broadcast_stop(token)
-                # 2) Wait (bounded) for any in-progress delivery of these ids to
-                #    actually finish before removing the records. We must NOT
-                #    expire first: expiring deletes the stop-control row, which
-                #    would clear the stop flag before the delivery loop ever
-                #    observed it, so the down audio would keep playing to the end.
                 deadline = time.monotonic() + 3.0
                 while time.monotonic() < deadline:
                     with broadcast_delivery_lock:
@@ -8266,7 +8865,6 @@ class BuiltinServiceMonitorModule:
                     if not still_running:
                         break
                     time.sleep(0.1)
-                # 3) Now that playback has stopped, expire (remove) the records.
                 for token in related_ids:
                     mark_active_broadcast_delivery(token, "expired")
                 log(f"service monitor down message stopped+auto-expired id={row_id} broadcast={broadcast_id}")
@@ -8290,8 +8888,6 @@ class BuiltinServiceMonitorModule:
             detail_text = str(detail or "")[:2000]
 
             if is_up:
-                # Recovery debounce: if we were down and a Wait for Up window is set,
-                # wait it out and re-probe. Only recover if the service is still up.
                 if old_state in ("offline", "kuma_down") and wait_for_up > 0:
                     self.stop_event.wait(wait_for_up)
                     if self.stop_event.is_set():
@@ -8301,7 +8897,6 @@ class BuiltinServiceMonitorModule:
                     except Exception as exc:
                         is_up2, detail2, _down2 = False, str(exc) or "Probe error", "offline"
                     if not is_up2:
-                        # Flapped back down during the wait: stay down, no messages.
                         self._store_state(row_id, old_state, datetime.now(), str(detail2 or detail_text), fail_count)
                         return
                     detail_text = str(detail2 or detail_text)[:2000]
@@ -8310,44 +8905,22 @@ class BuiltinServiceMonitorModule:
                     self.seen_online.add(row_id)
                 if old_state in ("offline", "kuma_down"):
                     fresh = service_monitor_row(row_id) or row
-                    # Only announce recovery if we actually announced the
-                    # outage. A monitor can reach "offline" silently on boot
-                    # (the startup race that turns unchecked -> offline without
-                    # an alert); firing "back up" there would be a false
-                    # recovery broadcast on every startup.
                     had_down_alert = bool(str(fresh.get("down_broadcast_id") or "").strip())
                     self._maybe_expire_down_broadcast(fresh)
                     if had_down_alert and not int(fresh.get("disabled") or 0):
                         self.send_monitor_message(fresh, "up", detail_text)
                 return
 
-            # Probe failed.
             fail_count += 1
-            # Startup warmup: absorb failures for a short window after boot
-            # without latching offline or alerting. We hold the CURRENT state
-            # (never advancing an online/unchecked monitor to offline), so the
-            # down "edge" is preserved — a real outage that begins during the
-            # window still alerts once the window elapses.
             if old_state in ("online", "unchecked") and (time.monotonic() - self.boot_monotonic) < SERVICE_MONITOR_STARTUP_GRACE_SECONDS:
                 self._store_state(row_id, old_state, now, detail_text, fail_count)
                 return
             if fail_count <= retries and old_state in ("online", "unchecked"):
-                # Still inside the retries grace period — hold the current state, no alert.
                 self._store_state(row_id, old_state, now, detail_text, fail_count)
                 return
             new_state = down_state or "offline"
             already_down = old_state in ("offline", "kuma_down")
             self._store_state(row_id, new_state, now, detail_text, fail_count)
-            # Fire the "went down" alert exactly once, on the TRANSITION into a
-            # down state (edge-triggered) — never again while it stays down, or
-            # every failed check would re-alert forever.
-            #
-            # It is additionally gated on the monitor having been confirmed
-            # ONLINE at least once in THIS process (seen_online). That gate can't
-            # be fooled by a stale DB last_state carried over from a previous
-            # run, a skipped boot reset, retries=0, or a flaky first probe while
-            # the server is still starting up — all of which otherwise blast a
-            # false "server is down" broadcast on startup.
             if already_down:
                 return
             with self.seen_online_lock:
@@ -8372,7 +8945,11 @@ class BuiltinServiceMonitorModule:
         if not has_text and not has_audio:
             log(f"service monitor {direction} message skipped id={row.get('id')}: no content")
             return
-        if int(row.get(f"{direction}_send_all") or 0):
+        send_all_requested = int(row.get(f"{direction}_send_all") or 0)
+        if send_all_requested and all_recipients_disabled():
+            groups_value = str(row.get(f"{direction}_groups") or "").strip()
+            log(f"service monitor {direction} ignored all-recipients target id={row.get('id')}")
+        elif send_all_requested:
             groups_value = service_monitor_all_groups_value()
         else:
             groups_value = str(row.get(f"{direction}_groups") or "").strip()
@@ -8618,6 +9195,75 @@ def audio_frames(audio_files_str):
         ffmpeg.wait()
 
 
+def endpoint_pcm_audio_frames(audio_files_str):
+    """Yield source audio in the recommended high-quality internal contract."""
+    for audio_file in split_audio_entries(audio_files_str):
+        if not audio_file:
+            continue
+        if audio_file.startswith("%silence(") and audio_file.endswith(")"):
+            try:
+                duration = float(audio_file[9:-1])
+            except ValueError:
+                continue
+            for _ in range(int(duration * 1000 / ENDPOINT_PCM_FRAME_MS)):
+                yield ENDPOINT_PCM_SILENCE_FRAME
+            continue
+        tts_payload = decode_tts_token(audio_file)
+        if tts_payload:
+            yield from iter_tts_ffmpeg_chunks(
+                tts_payload,
+                [
+                    "-ar", str(ENDPOINT_PCM_SAMPLE_RATE),
+                    "-ac", str(ENDPOINT_PCM_CHANNELS),
+                    "-f", "s16le",
+                    "-flush_packets", "1",
+                    "pipe:1",
+                ],
+                chunk_size=ENDPOINT_PCM_FRAME_BYTES,
+                pad_byte=b"\x00",
+            )
+            continue
+        file_path = resolve_audio_file(audio_file)
+        if not file_path:
+            continue
+        ffmpeg = subprocess.Popen(
+            [
+                "ffmpeg",
+                "-v",
+                "quiet",
+                "-i",
+                file_path,
+                "-ar",
+                str(ENDPOINT_PCM_SAMPLE_RATE),
+                "-ac",
+                str(ENDPOINT_PCM_CHANNELS),
+                "-f",
+                "s16le",
+                "-flush_packets",
+                "1",
+                "pipe:1",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        while True:
+            chunk = ffmpeg.stdout.read(ENDPOINT_PCM_FRAME_BYTES)
+            if not chunk:
+                break
+            yield chunk.ljust(ENDPOINT_PCM_FRAME_BYTES, b"\x00")
+        ffmpeg.stdout.close()
+        ffmpeg.wait()
+
+
+def internal_stream_audio_frames(audio_files_str, internal_codec=None):
+    """Yield 20 ms frames directly in the selected internal stream format."""
+    selected = configured_internal_streaming_codec() if internal_codec is None else internal_codec
+    if internal_streaming_uses_pcm(selected):
+        yield from endpoint_pcm_audio_frames(audio_files_str)
+    else:
+        yield from audio_frames(audio_files_str)
+
+
 def fetch_broadcast(broadcast_id):
     return fetch_active_broadcast(broadcast_id)
 
@@ -8651,6 +9297,39 @@ class BroadcastRecordingWriter:
             self.wave_file.close()
         finally:
             self.closed = True
+
+
+def apply_broadcast_recipient_policy(record, disabled=None):
+    updated = dict(record or {})
+    policy_enabled = all_recipients_disabled() if disabled is None else bool(disabled)
+    if not policy_enabled:
+        return updated, False, False
+
+    groups, removed_group_all = apply_all_recipients_policy(
+        updated.get("groups"),
+        disabled=True,
+    )
+    changed = groups != str(updated.get("groups") or "").strip()
+    updated["groups"] = groups
+
+    explicit = updated.get("explicit_targets")
+    explicit_present = isinstance(explicit, (list, tuple, set)) or bool(explicit)
+    filtered_explicit = []
+    if explicit_present:
+        source = explicit if isinstance(explicit, (list, tuple, set)) else str(explicit).replace(",", " ").split()
+        for item in source:
+            token = str(item or "").strip()
+            if not token or is_all_recipients_target(token):
+                changed = True
+                continue
+            if token not in filtered_explicit:
+                filtered_explicit.append(token)
+        updated["explicit_targets"] = filtered_explicit
+
+    should_drop = (explicit_present and not filtered_explicit) or (
+        not explicit_present and removed_group_all and not groups
+    )
+    return updated, should_drop, changed
 
 
 def broadcast_target_tokens(record):
@@ -8749,15 +9428,28 @@ def mark_broadcast_history_delivery(broadcast_id, status):
         conn.close()
 
 
+def update_broadcast_history_groups(broadcast_id, groups):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE broadcasts SET `groups`=%s WHERE id=%s", (groups, broadcast_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def resolve_group_targets(group_id):
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
+            groups_value, _removed_all = apply_all_recipients_policy(group_id, cursor=cur)
             group_ids = []
-            for gid in str(group_id or "").split("."):
+            for gid in groups_value.split("."):
                 token = gid.strip()
                 if token and token not in group_ids:
                     group_ids.append(token)
+            if not group_ids:
+                return []
             rows = fetch_group_rows(cur, None if "0" in group_ids else group_ids)
             targets = regular_group_targets(rows)
             if targets:
@@ -8782,21 +9474,6 @@ def normalize_module_name(value):
     return "".join(ch for ch in str(value).lower() if ch.isalnum())
 
 
-def module_type_tokens(value):
-    normalized = str(value or "").strip().lower()
-    if not normalized:
-        return set()
-    return set(re.findall(r"input|output", normalized))
-
-
-def module_type_has_input(value):
-    return "input" in module_type_tokens(value)
-
-
-def module_type_has_output(value):
-    return "output" in module_type_tokens(value)
-
-
 def resolve_module_name(module_name, discovered=None):
     if discovered is None:
         discovered = discover_modules()
@@ -8819,6 +9496,14 @@ def module_info_type(module_name):
         return "Output"
     if module_name == SERVICE_MONITOR_MODULE:
         return "Input"
+    package = discover_endpoint_packages(extract_if_trusted=False).get(module_name)
+    if package and package.get("trusted"):
+        manifest = package.get("manifest") or {}
+        try:
+            return normalize_module_type(manifest.get("input_type") or manifest.get("type"))
+        except ValueError as exc:
+            log(f"manifest module type error in {module_name}: {exc}")
+            return ""
     discovered = discover_modules()
     entry = discovered.get(module_name)
     if entry is None:
@@ -9220,6 +9905,7 @@ def clean_group_value(value):
 
 def validate_group_value(cursor, value):
     groups = clean_group_value(value)
+    groups, _removed_all = apply_all_recipients_policy(groups, cursor=cursor)
     if not groups:
         raise ValueError("group_id is required")
     if groups == "0":
@@ -9533,8 +10219,17 @@ def shutdown_all():
             pass
 
 
+def is_all_recipients_target(target):
+    token = str(target or "").strip().lower()
+    if not token:
+        return False
+    endpoint_id = token.split("/", 1)[1].strip() if "/" in token else token
+    return endpoint_id in {"0", "all"}
+
+
 def normalize_targets(targets):
     target_map = {}
+    block_all_recipients = all_recipients_disabled()
     with loaded_modules_lock:
         module_names = list(loaded_modules.keys())
     discovered = discover_modules()
@@ -9545,6 +10240,9 @@ def normalize_targets(targets):
         for target in normalize_target_entry(raw_target):
             target = target.strip()
             if not target:
+                continue
+            if block_all_recipients and is_all_recipients_target(target):
+                log(f"normalize_targets ignored all-recipients target={target!r}")
                 continue
             if "/" in target:
                 module_name, sub_target = target.split("/", 1)
@@ -9663,8 +10361,6 @@ def finish_stream(stream_id):
 
 
 def recv_line(conn, limit=65536):
-    # Never consume bytes past the newline: audio data can follow the
-    # command line on the same socket (PREPARE/PREPARELIVE streams).
     data = bytearray()
     while len(data) < limit:
         try:
@@ -9711,7 +10407,16 @@ def start_ipc_server():
         threading.Thread(target=handle_ipc_client, args=(conn,), daemon=True).start()
 
 
-def pump_ipc_audio_stream(conn, deliver_frame, on_chunk=None, frame_size=SIP_OUTPUT_FRAME_BYTES, pad_final=True):
+def pump_ipc_audio_stream(
+    conn,
+    deliver_frame,
+    on_chunk=None,
+    frame_size=ULAW_FRAME_BYTES,
+    pad_final=True,
+    pad_byte=None,
+):
+    if pad_byte is None:
+        pad_byte = b"\x00" if frame_size == ENDPOINT_PCM_FRAME_BYTES else b"\xff"
     pending = bytearray()
     chunk_count = 0
     byte_count = 0
@@ -9732,22 +10437,29 @@ def pump_ipc_audio_stream(conn, deliver_frame, on_chunk=None, frame_size=SIP_OUT
             deliver_frame(frame)
             frame_count += 1
     if pad_final and pending:
-        deliver_frame(bytes(pending).ljust(frame_size, b"\xff"))
+        deliver_frame(bytes(pending).ljust(frame_size, pad_byte))
         frame_count += 1
         partial_flushed = True
     return chunk_count, byte_count, frame_count, partial_flushed
 
 
-def handle_prepare(conn, parts):
+def handle_prepare(conn, parts, frame_size=ULAW_FRAME_BYTES):
     if len(parts) < 4:
         conn.sendall(b"ERROR\n")
         return
     stream_id = parts[1]
     msg_id = parts[2]
     targets = parts[3:]
+    internal_codec = configured_internal_streaming_codec()
     target_map = normalize_targets(targets)
     state = create_stream_state(stream_id, target_map)
-    dispatch("prepare_audio", stream_id, msg_id, targets)
+    dispatch(
+        "prepare_audio",
+        stream_id,
+        msg_id,
+        targets,
+        metadata=internal_stream_audio_metadata(internal_codec),
+    )
     ready = state.ready_event.wait(10.0)
     log(f"handle_prepare waited stream={stream_id} ready={ready}")
     conn.sendall(b"OK\n")
@@ -9757,7 +10469,10 @@ def handle_prepare(conn, parts):
                 mod = loaded_modules.get(module_name)
             if mod and hasattr(mod, "receive_audio"):
                 try:
-                    mod.receive_audio(frame, stream_id)
+                    mod.receive_audio(
+                        endpoint_module_audio_frame(module_name, frame, internal_codec),
+                        stream_id,
+                    )
                 except Exception as exc:
                     log(f"receive_audio error in {module_name}: {exc}")
     def log_chunk(chunk_count, byte_count, last_chunk_size):
@@ -9769,6 +10484,7 @@ def handle_prepare(conn, parts):
         conn,
         deliver_frame,
         on_chunk=log_chunk,
+        frame_size=frame_size,
     )
     log(
         f"handle_prepare stream_end stream={stream_id} chunks={chunk_count} bytes={byte_count} "
@@ -9777,7 +10493,13 @@ def handle_prepare(conn, parts):
     finish_stream(stream_id)
 
 
-def handle_stream_prepare(conn, parts, action_name):
+def handle_stream_prepare(
+    conn,
+    parts,
+    action_name,
+    frame_size=ULAW_FRAME_BYTES,
+    internal_codec=None,
+):
     page_debug(f"handle_stream_prepare_start action={action_name} parts={parts}")
     if len(parts) < 4:
         page_debug(f"handle_stream_prepare_bad_parts action={action_name} parts={parts}")
@@ -9786,6 +10508,14 @@ def handle_stream_prepare(conn, parts, action_name):
     stream_id = parts[1]
     msg_id = parts[2]
     targets = parts[3:]
+    if internal_codec is None:
+        internal_codec = (
+            INTERNAL_STREAMING_CODEC_PCM
+            if frame_size == ENDPOINT_PCM_FRAME_BYTES
+            else INTERNAL_STREAMING_CODEC_PCMU
+        )
+    else:
+        internal_codec = normalize_internal_streaming_codec(internal_codec)
     try:
         sync_modules()
     except Exception as exc:
@@ -9798,7 +10528,18 @@ def handle_stream_prepare(conn, parts, action_name):
         conn.sendall(b"ERROR\n")
         return
     state = create_stream_state(stream_id, target_map)
-    dispatch(action_name, stream_id, msg_id, targets)
+    audio_metadata = internal_stream_audio_metadata(internal_codec)
+    page_debug(
+        f"handle_stream_prepare_contract action={action_name} stream={stream_id} "
+        f"metadata={audio_metadata}"
+    )
+    dispatch(
+        action_name,
+        stream_id,
+        msg_id,
+        targets,
+        metadata=audio_metadata,
+    )
     ready = state.ready_event.wait(10.0)
     log(f"handle_stream_prepare action={action_name} waited stream={stream_id} ready={ready}")
     page_debug(
@@ -9829,7 +10570,10 @@ def handle_stream_prepare(conn, parts, action_name):
                 mod = loaded_modules.get(module_name)
             if mod and hasattr(mod, "receive_audio"):
                 try:
-                    mod.receive_audio(frame, stream_id)
+                    mod.receive_audio(
+                        endpoint_module_audio_frame(module_name, frame, internal_codec),
+                        stream_id,
+                    )
                 except Exception as exc:
                     log(f"receive_audio error in {module_name}: {exc}")
                     page_debug(f"receive_audio_error module={module_name} stream={stream_id} error={exc.__class__.__name__}: {exc}")
@@ -9847,6 +10591,7 @@ def handle_stream_prepare(conn, parts, action_name):
         conn,
         deliver_frame,
         on_chunk=log_chunk,
+        frame_size=frame_size,
     )
     page_debug(
         f"handle_stream_prepare_end action={action_name} stream={stream_id} "
@@ -9877,6 +10622,15 @@ def deliver_broadcast(stream_id, broadcast_id):
     if not broadcast:
         log(f"handle_broadcast missing broadcast={broadcast_id}")
         return "failed"
+    broadcast, should_drop, recipients_changed = apply_broadcast_recipient_policy(broadcast)
+    if recipients_changed:
+        try:
+            update_broadcast_history_groups(broadcast_id, broadcast.get("groups") or "")
+        except Exception as exc:
+            log(f"broadcast recipient policy history update error broadcast={broadcast_id}: {exc}")
+    if should_drop:
+        log(f"handle_broadcast dropped broadcast={broadcast_id}: sending to all recipients is disabled")
+        return "dropped"
     if active_broadcast_stop_requested(broadcast_id):
         return "stopped"
     targets = broadcast_target_tokens(broadcast)
@@ -9905,7 +10659,10 @@ def deliver_broadcast(stream_id, broadcast_id):
         "color": broadcast.get("color") or "",
     }
     if is_audio_type(msg_type):
-        gen = audio_frames(audio_files)
+        internal_codec = configured_internal_streaming_codec()
+        use_pcm = internal_streaming_uses_pcm(internal_codec)
+        metadata.update(internal_stream_audio_metadata(internal_codec))
+        gen = internal_stream_audio_frames(audio_files, internal_codec)
         try:
             first_frame = next(gen)
             has_audio = True
@@ -9913,15 +10670,12 @@ def deliver_broadcast(stream_id, broadcast_id):
             has_audio = False
         if has_audio:
             target_map = normalize_targets(targets)
-            # Kick off endpoint module preparation in background — don't block
-            # desktop delivery on the up-to-10-second ready wait.
             endpoint_state = None
             endpoint_wait_deadline = time.perf_counter() + 10.0
             endpoints_ready = not bool(target_map)
             if target_map:
                 endpoint_state = create_stream_state(stream_id, target_map)
                 dispatch("prepare_audio", stream_id, broadcast_id, targets, metadata)
-            # Open desktop IPC immediately (before endpoint modules are ready)
             desktop_sock = None
             desktop_result = {}
             try:
@@ -9932,7 +10686,6 @@ def deliver_broadcast(stream_id, broadcast_id):
                     broadcast=broadcast,
                 )
                 if desktop_sock is not None:
-                    # Never let a stalled desktop pipe starve endpoint audio.
                     desktop_sock.settimeout(1.0)
             except Exception as exc:
                 desktop_sock = None
@@ -9949,13 +10702,6 @@ def deliver_broadcast(stream_id, broadcast_id):
                 recording = BroadcastRecordingWriter(broadcast_id)
             except Exception as exc:
                 log(f"broadcast recording start error broadcast={broadcast_id}: {exc}")
-            # Unified paced frame loop — desktop gets audio immediately;
-            # endpoint modules receive frames once they signal ready. Frames
-            # produced before readiness are buffered and flushed so multicast
-            # endpoints receive the full audio from the first frame.
-            # The loop runs slightly ahead of real time (delivery_lead) so the
-            # self-pacing endpoint senders always have a jitter cushion and
-            # never underrun into audible dropouts.
             frame_duration = 160 / 8000
             delivery_lead = MULTICAST_DELIVERY_LEAD_SECONDS
             next_send_time = time.perf_counter() - delivery_lead
@@ -9969,12 +10715,16 @@ def deliver_broadcast(stream_id, broadcast_id):
                         mod = loaded_modules.get(module_name)
                     if mod and hasattr(mod, "receive_audio"):
                         try:
-                            mod.receive_audio(endpoint_frame, stream_id)
+                            mod.receive_audio(
+                                endpoint_module_audio_frame(module_name, endpoint_frame, internal_codec),
+                                stream_id,
+                            )
                         except Exception as exc:
                             log(f"receive_audio error in {module_name}: {exc}")
 
             pending_endpoint_frames = []
             for frame in itertools.chain([first_frame], gen):
+                legacy_frame = endpoint_pcm_to_ulaw(frame) if use_pcm else bytes(frame)
                 if frames_since_stop_check <= 0:
                     frames_since_stop_check = stop_check_interval
                     if active_broadcast_stop_requested(broadcast_id):
@@ -9983,7 +10733,7 @@ def deliver_broadcast(stream_id, broadcast_id):
                 frames_since_stop_check -= 1
                 if recording is not None:
                     try:
-                        recording.write_frame(frame)
+                        recording.write_frame(legacy_frame)
                     except Exception as exc:
                         log(f"broadcast recording write error broadcast={broadcast_id}: {exc}")
                         try:
@@ -9991,14 +10741,12 @@ def deliver_broadcast(stream_id, broadcast_id):
                         except Exception:
                             pass
                         recording = None
-                # Desktop: always deliver with no readiness gate
                 if desktop_sock is not None:
                     try:
-                        send_stream_frame(desktop_sock, frame)
+                        send_stream_frame(desktop_sock, legacy_frame)
                     except Exception as exc:
                         log(f"desktop broadcast frame error broadcast={broadcast_id}: {exc}")
                         desktop_sock = None
-                # Endpoint modules: buffer until ready, then flush + deliver
                 if target_map:
                     if not endpoints_ready:
                         if endpoint_state.ready_event.is_set() or time.perf_counter() >= endpoint_wait_deadline:
@@ -10017,15 +10765,12 @@ def deliver_broadcast(stream_id, broadcast_id):
                 if sleep_time > 0:
                     time.sleep(sleep_time)
                 elif sleep_time < -0.5:
-                    # Stall detected: resync rather than bursting the backlog.
                     next_send_time = time.perf_counter() - delivery_lead
             try:
                 if desktop_sock is not None:
                     desktop_sock.close()
             except Exception:
                 pass
-            # Short clips can finish before modules signal ready — wait for
-            # readiness (bounded) and flush the buffered frames so nothing is lost.
             if target_map and pending_endpoint_frames and not stopped:
                 if not endpoints_ready:
                     remaining = endpoint_wait_deadline - time.perf_counter()
@@ -10076,6 +10821,10 @@ def finish_claimed_broadcast_delivery(stream_id, broadcast_id, source):
             mark_broadcast_history_delivery(broadcast_id, "stopped" if persistent else "cancelled")
             mark_active_broadcast_delivery(broadcast_id, "stopped")
             log(f"{source} stopped broadcast={broadcast_id} stream={stream_id} persistent={persistent}")
+        elif status == "dropped":
+            mark_broadcast_history_delivery(broadcast_id, "cancelled")
+            mark_active_broadcast_delivery(broadcast_id, "cancelled")
+            log(f"{source} dropped broadcast={broadcast_id}: sending to all recipients is disabled")
         else:
             mark_broadcast_history_delivery(broadcast_id, "failed")
             mark_active_broadcast_delivery(broadcast_id, "failed")
@@ -10436,12 +11185,17 @@ def module_info_from_manifest(module_name, entry):
     except Exception as exc:
         log(f"manifest.json parse error in {module_name}: {exc}")
         return None
+    try:
+        input_type = normalize_module_type(manifest.get("input_type") or manifest.get("type"))
+    except ValueError as exc:
+        log(f"manifest module type error in {module_name}: {exc}")
+        return None
     info = {
         "module": module_name,
         "name": manifest.get("name") or module_name,
         "developer": manifest.get("developer") or manifest.get("author") or "",
         "description": manifest.get("description") or manifest.get("desp") or "",
-        "input_type": manifest.get("input_type") or manifest.get("type") or "Output",
+        "input_type": input_type,
         "minimum_ops_version": manifest.get("minimum_ops_version") or OPS_VERSION,
         "requirements": manifest.get("requirements") or [],
     }
@@ -10540,12 +11294,27 @@ def handle_ipc_client(conn):
             return
         command = parts[0]
         log(f"handle_ipc_client command={command} parts={parts}")
-        if command == "PREPARELIVE":
+        if command in {"PREPARELIVE", "PREPARELIVEPCM"}:
             page_debug(f"ipc_preparelive_received parts={parts}")
         if command == "PREPARE":
             handle_prepare(conn, parts)
+        elif command == "PREPAREPCM":
+            handle_prepare(conn, parts, frame_size=ENDPOINT_PCM_FRAME_BYTES)
         elif command == "PREPARELIVE":
-            handle_stream_prepare(conn, parts, "prepare_livepage")
+            handle_stream_prepare(
+                conn,
+                parts,
+                "prepare_livepage",
+                internal_codec=INTERNAL_STREAMING_CODEC_PCMU,
+            )
+        elif command == "PREPARELIVEPCM":
+            handle_stream_prepare(
+                conn,
+                parts,
+                "prepare_livepage",
+                frame_size=ENDPOINT_PCM_FRAME_BYTES,
+                internal_codec=INTERNAL_STREAMING_CODEC_PCM,
+            )
         elif command == "SENDMSG":
             handle_sendmsg(conn, parts)
         elif command == "BROADCAST":
