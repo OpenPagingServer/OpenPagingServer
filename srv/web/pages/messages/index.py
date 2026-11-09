@@ -49,7 +49,7 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 .btn-send:hover { background:#1B5E20; }
 .dropbtn:hover,.dropbtn:focus { background:transparent; color:#555; }
 @media(max-width:767px){ .header-actions { flex-direction: column; align-items: stretch; } .header-actions > div { display: flex; flex-direction: column; gap: 8px; } .btn-primary, .btn-custom-send { justify-content: center; font-size: 14px; padding: 10px 14px; } }
-@media(prefers-color-scheme:dark){ .btn-primary { background:#8AB4F8; color:#10233A; } .btn-primary:hover { background:#9CC0FA; } .btn-custom-send { background:#81C784; color:#000; } .btn-custom-send:hover { background:#66BB6A; } }
+@media(prefers-color-scheme:dark){ .btn-primary { background:var(--ops-accent); color:#FFF; } .btn-primary:hover { background:var(--ops-accent-hover); } .btn-custom-send { background:#81C784; color:#000; } .btn-custom-send:hover { background:#66BB6A; } }
 .msg-type { font-size: 0.8em; color: #777; font-weight: 400; display: block; }
 .dropdown { position: relative; display: inline-block; }
 .dropbtn { background: none; border: none; font-size: 1.2em; cursor: pointer; color: #777; padding: 5px 10px; }

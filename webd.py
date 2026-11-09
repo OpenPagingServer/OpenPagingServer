@@ -673,6 +673,9 @@ class FrontServer:
                 handle_desktop_websocket_client(wrapped_client, addr, head)
                 return
             upstream = socket.create_connection(("127.0.0.1", self.internal_port), timeout=10)
+            if path == "/desktop/session/chromeos":
+                # The handler may need a Google token and an API call before responding.
+                upstream.settimeout(30)
             upstream.sendall(
                 rewrite_request_head(
                     head,
@@ -784,7 +787,10 @@ def server_ports(label, configured_port):
 def build_servers(settings):
     servers = []
     if enabled(settings.get("webserver_enable")):
-        from srv.web.app import app as web_app
+        from srv.web.app import app as web_app, ensure_identity_access_schema, start_ldap_sync_worker
+
+        ensure_identity_access_schema()
+        start_ldap_sync_worker()
 
         web_app = DemoModeQueryMiddleware(web_app, enabled(os.getenv("DEMO_MODE")))
         https_enabled = enabled(settings.get("webserver_https_enable"))

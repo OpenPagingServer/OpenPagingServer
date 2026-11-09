@@ -2000,7 +2000,7 @@ class SipServer:
                 host = normalized_host
         return host or call.get("remote_sip_ip"), int(port or 5060), (transport or call.get("transport") or "udp").lower()
 
-    def parse_sdp_offer(self, body, fallback_ip, nat_mode=None):
+    def parse_sdp_offer(self, body, fallback_ip, nat_mode=None, codec_preferences=None):
         session_ip = str(fallback_ip or "").strip()
         audio_ip = ""
         media_port = None
@@ -2072,7 +2072,7 @@ class SipServer:
                 continue
             if 0 <= payload_type <= 127:
                 offered_codec_payloads.append((codec_name, payload_type))
-        negotiated_codec = self.negotiate_sip_codec(offered_codecs)
+        negotiated_codec = self.negotiate_sip_codec(offered_codecs, preferred_codecs=codec_preferences)
         negotiated_payload_type = int(SIP_CODEC_PAYLOADS[negotiated_codec]["payload_type"])
         for codec_name, payload_type in offered_codec_payloads:
             if codec_name == negotiated_codec:
@@ -2476,7 +2476,7 @@ class SipServer:
         )
         return preferred
 
-    def negotiate_sip_codec(self, offered_codecs):
+    def negotiate_sip_codec(self, offered_codecs, preferred_codecs=None):
         offered = []
         seen = set()
         for codec in offered_codecs or []:
@@ -2487,7 +2487,7 @@ class SipServer:
         if not offered:
             sip_debug("codec negotiate offered=[] selected=PCMU reason=no_offered_codecs")
             return "PCMU"
-        preferred = self.sip_codec_preferences()
+        preferred = list(preferred_codecs) if preferred_codecs is not None else self.sip_codec_preferences()
         for codec in preferred:
             if codec in seen:
                 sip_debug(f"codec negotiate offered={offered} preferred={preferred} selected={codec}")
@@ -2497,6 +2497,35 @@ class SipServer:
             f"codec negotiate offered={offered} preferred={preferred} selected={selected} reason=no_preferred_match"
         )
         return selected
+
+    def cisco_cucm_headers(self, headers):
+        for header_name in ("User-Agent", "Server"):
+            value = str(self.get_first(headers, header_name) or "").strip()
+            if value.lower().startswith("cisco-cucm"):
+                return True
+        return False
+
+    def cisco_cucm_response(self, response):
+        headers = (response or {}).get("headers") or {}
+        if not isinstance(headers, dict):
+            return self.cisco_cucm_headers(headers)
+        return any(
+            self.cisco_cucm_agent(headers.get(header_name))
+            for header_name in ("user-agent", "server")
+        )
+
+    def cisco_cucm_agent(self, value):
+        candidate = " ".join(str(value or "").split()).strip().strip("'\"")
+        if candidate.lower().startswith("cisco-cucm"):
+            return candidate
+        for quoted in re.findall(r"['\"]([^'\"]+)['\"]", candidate):
+            if quoted.strip().lower().startswith("cisco-cucm"):
+                return quoted.strip()
+        return ""
+
+    def cucm_intercept_codecs(self):
+        # **CUCM does not play it's intercept after wideband calls**
+        return [codec for codec in self.sip_codec_preferences() if codec in {"PCMU", "PCMA"}] or ["PCMU"]
 
     def build_invite_sdp(
         self,
@@ -2957,6 +2986,7 @@ class SipServer:
                         "send_lock": threading.Lock(),
                         "public_signaling_ip": "",
                         "public_signaling_port": 0,
+                        "cucm_narrowband": False,
                     }
                     self.outbound_trunks[trunk_id] = state
                 else:
@@ -2978,6 +3008,7 @@ class SipServer:
                     state["active_route"] = None
                     state["trusted_ips"] = set()
                     state["route_aliases"] = set()
+                    state["cucm_narrowband"] = False
         now = time.time()
         for state in list(self.outbound_trunks.values()):
             if state.get("next_register_at", 0.0) > now:
@@ -2988,6 +3019,7 @@ class SipServer:
                 state["active_route"] = None
                 state["trusted_ips"] = set()
                 state["route_aliases"] = set()
+                state["cucm_narrowband"] = False
                 self.update_outbound_trunk_row(state["id"], self.outbound_status_text("Error", "No SIP server configured"), "", "")
                 continue
             error_text = self.outbound_status_text("Offline")
@@ -3009,6 +3041,8 @@ class SipServer:
                         state["auth_failure_count"] = 0
                         state["active_route"] = dict(route)
                         state["server_index"] = index
+                        state["server_agent"] = self.response_server_agent(response)
+                        state["cucm_narrowband"] = self.cisco_cucm_response(response)
                         alias_values = {
                             str(route.get("host") or "").strip(),
                             str(route.get("domain") or "").strip(),
@@ -3042,6 +3076,8 @@ class SipServer:
             if not connected:
                 state["registered_until"] = 0.0
                 state["active_route"] = None
+                state["server_agent"] = ""
+                state["cucm_narrowband"] = False
                 state["trusted_ips"] = set()
                 state["route_aliases"] = set()
                 backoff_failures = safe_int(state.get("auth_failure_count"), 0)
@@ -3109,7 +3145,8 @@ class SipServer:
         call.to_h = to_h
         call.invite_branch = uuid.uuid4().hex[:10]
         call.invite_route_headers = self.initial_route_headers(route)
-        sdp = self.build_invite_sdp(call.advertised_media_ip, call.advertised_media_port)
+        codec_names = self.cucm_intercept_codecs() if getattr(call, "cucm_narrowband", False) else None
+        sdp = self.build_invite_sdp(call.advertised_media_ip, call.advertised_media_port, codec_names=codec_names)
         lines = [
             f"INVITE {target_uri} SIP/2.0",
             f"Via: SIP/2.0/{route_transport.upper()} {local_ip}:{call.local_sip_port};branch=z9hG4bK{call.invite_branch}{self.sip_via_params(route_transport)}",
@@ -3710,6 +3747,9 @@ class SipServer:
             local_sip_ip,
             local_sip_port,
         )
+        peer_agent = state.get("server_agent") if state is not None else ""
+        call.peer_agent = self.cisco_cucm_agent(peer_agent) or self.cisco_cucm_agent(trunk.get("status"))
+        call.cucm_narrowband = bool(state.get("cucm_narrowband")) if state is not None else bool(call.peer_agent)
         call.invite_route = dict(route)
         sip_debug(
             f"outbound rtp offer call={call.call_id} local={sip_sockname(local_media_socket)} "
@@ -4247,9 +4287,17 @@ class SipServer:
             session = call["session"]
             nat_mode = call.get("nat_mode")
 
+        cucm_narrowband = bool(call.get("cucm_narrowband")) or self.cisco_cucm_headers(headers)
+        codec_preferences = self.cucm_intercept_codecs() if cucm_narrowband else None
+
         hold = self.sdp_offer_is_hold(body) if body else False
         hold_behavior = self.sip_trunk_hold_behavior(source_ip, headers) if hold else "passrtp"
-        remote_media_ip, remote_media_port, has_video, negotiated_codec, negotiated_payload_type = self.parse_sdp_offer(body, source_ip, nat_mode=nat_mode) if body else (None, None, False, "PCMU", 0)
+        remote_media_ip, remote_media_port, has_video, negotiated_codec, negotiated_payload_type = self.parse_sdp_offer(
+            body,
+            source_ip,
+            nat_mode=nat_mode,
+            codec_preferences=codec_preferences,
+        ) if body else (None, None, False, "PCMU", 0)
         rtp_latching_enabled = self.sdp_media_needs_latching(body, source_ip, nat_mode=nat_mode) if body else False
 
         with self.lock:
@@ -4261,6 +4309,7 @@ class SipServer:
             call["remote_sip_port"] = source_port
             call["transport"] = transport
             call["conn"] = conn
+            call["cucm_narrowband"] = cucm_narrowband
             call["cseq"] = self.get_first(headers, "CSeq")
             contact = self.get_first(headers, "Contact")
             if contact:
@@ -4351,6 +4400,8 @@ class SipServer:
         user = self.request_user_from_uri(uri)
         
         db_status, trigger, passcode, trigger_groups = self.get_endpoint_trigger(user)
+        cucm_narrowband = self.cisco_cucm_headers(headers)
+        codec_preferences = self.cucm_intercept_codecs() if cucm_narrowband else None
 
         generator = None
         early_media_status = None
@@ -4389,7 +4440,12 @@ class SipServer:
                 )
             passcode_str = str(passcode).strip() if passcode is not None else ""
             if passcode_str:
-                remote_media_ip, remote_media_port, has_video, negotiated_codec, negotiated_payload_type = self.parse_sdp_offer(body, source_ip, nat_mode=nat_mode)
+                remote_media_ip, remote_media_port, has_video, negotiated_codec, negotiated_payload_type = self.parse_sdp_offer(
+                    body,
+                    source_ip,
+                    nat_mode=nat_mode,
+                    codec_preferences=codec_preferences,
+                )
                 rtp_latching_enabled = self.sdp_media_needs_latching(body, source_ip, nat_mode=nat_mode)
                 if not remote_media_port:
                     return self.build_response(headers, "400 Bad Request")
@@ -4463,6 +4519,7 @@ class SipServer:
                         "nat_mode": nat_mode,
                         "codec": negotiated_codec,
                         "codec_payload_type": negotiated_payload_type,
+                        "cucm_narrowband": cucm_narrowband,
                     }
                     self.calls[call_id] = call
                 self.prime_inbound_media_path(call)
@@ -4480,7 +4537,12 @@ class SipServer:
         if session_class is None:
             session_class = RTPSession
 
-        remote_media_ip, remote_media_port, has_video, negotiated_codec, negotiated_payload_type = self.parse_sdp_offer(body, source_ip, nat_mode=nat_mode)
+        remote_media_ip, remote_media_port, has_video, negotiated_codec, negotiated_payload_type = self.parse_sdp_offer(
+            body,
+            source_ip,
+            nat_mode=nat_mode,
+            codec_preferences=codec_preferences,
+        )
         rtp_latching_enabled = self.sdp_media_needs_latching(body, source_ip, nat_mode=nat_mode)
         if not remote_media_port:
             return self.build_response(headers, "400 Bad Request")
@@ -4557,6 +4619,7 @@ class SipServer:
                     "nat_mode": nat_mode,
                     "codec": negotiated_codec,
                     "codec_payload_type": negotiated_payload_type,
+                    "cucm_narrowband": cucm_narrowband,
                 }
                 self.calls[call_id] = call
 

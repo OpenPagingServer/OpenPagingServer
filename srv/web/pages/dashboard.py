@@ -1,4 +1,5 @@
 from srv.web.app import *
+from active_broadcast_store import mark_immediate_broadcasts_seen
 import base64
 import hashlib
 import json
@@ -62,6 +63,11 @@ def _active_records_for(user_id):
         if expires and expires <= now_text:
             continue
         if not user_in_broadcast(user_id, record):
+            continue
+        if (
+            any(token.strip().lower() == "0m" for token in str(record.get("expires_rule") or "").split("|"))
+            and str(user_id) in {str(item) for item in record.get("seen_user_ids") or []}
+        ):
             continue
         records.append(record)
     records.sort(key=_sort_key)
@@ -207,6 +213,7 @@ var dashAudioButton = null;
 var dashLiveBid = '';
 var dashLivePaused = false;
 var dashLiveQueue = [];
+var dashLivePrimed = false;
 var dashLiveCodec = 'mulaw';
 var dashLiveSampleRate = 8000;
 var dashAudioCtx = null;
@@ -262,6 +269,7 @@ function stopDashLiveAudio() {
   if (dashLiveBid) dashLiveManuallyPaused[dashLiveBid] = true;
   dashLivePaused = true;
   dashLiveQueue = [];
+  dashLivePrimed = false;
   updateAllDashButtons();
 }
 function ulawByteToFloat(byte) {
@@ -317,11 +325,16 @@ function ensureLiveAudioContext() {
   if (dashAudioCtx || !window.AudioContext) return;
   try {
     dashAudioCtx = new AudioContext({sampleRate: dashLiveSampleRate});
-    dashAudioNode = dashAudioCtx.createScriptProcessor(1024, 0, 1);
+    var callbackSamples = dashLiveSampleRate <= 8000 ? 256 : 1024;
+    dashAudioNode = dashAudioCtx.createScriptProcessor(callbackSamples, 0, 1);
     dashAudioNode.onaudioprocess = function(event) {
       var output = event.outputBuffer.getChannelData(0);
       output.fill(0);
       if (!dashLiveBid || dashLivePaused) return;
+      if (!dashLivePrimed) {
+        if (dashLiveQueue.length < 3) return;
+        dashLivePrimed = true;
+      }
       var offset = 0;
       while (offset < output.length && dashLiveQueue.length > 0) {
         var frame = dashLiveQueue[0];
@@ -334,6 +347,7 @@ function ensureLiveAudioContext() {
           dashLiveQueue[0] = frame.slice(take);
         }
       }
+      if (!dashLiveQueue.length) dashLivePrimed = false;
     };
     dashAudioNode.connect(dashAudioCtx.destination);
   } catch (_e) {
@@ -368,7 +382,7 @@ function queueLiveFrame(bid, payload) {
   if (!dashAudioCtx) return;
   if (dashAudioCtx.state === 'suspended') dashAudioCtx.resume().catch(function(){});
   dashLiveQueue.push(decodeLiveFrame(payload));
-  if (dashLiveQueue.length > 120) dashLiveQueue.splice(0, dashLiveQueue.length - 120);
+  if (dashLiveQueue.length > 12) dashLiveQueue.splice(0, dashLiveQueue.length - 5);
 }
 function isDesktopBridge() {
   return !!(window.__OPS_DESKTOP_CLIENT__ || window.pywebview);
@@ -549,6 +563,7 @@ function onRtpStreamControl(message) {
     if (!dashLiveBid || dashLiveBid === bid) {
       dashLiveBid = bid;
       dashLivePaused = false;
+      dashLivePrimed = false;
     }
     tryUnlockAudio('rtp-start');
     updateAllDashButtons();
@@ -559,6 +574,7 @@ function onRtpStreamControl(message) {
     delete dashLiveManuallyPaused[bid];
     if (dashLiveBid === bid) {
       dashLiveQueue = [];
+      dashLivePrimed = false;
       dashLivePaused = true;
     }
     updateAllDashButtons();
@@ -584,6 +600,7 @@ function onBroadcastFrame(decoded) {
     delete dashLiveManuallyPaused[decoded.bid];
     if (dashLiveBid === decoded.bid) {
       dashLiveQueue = [];
+      dashLivePrimed = false;
       dashLivePaused = true;
     }
     updateAllDashButtons();
@@ -685,11 +702,15 @@ def handle_request():
         heading = "Welcome"
     records = _active_records_for(user_id)
     digest = _records_digest(records)
+    cards = _cards_html(records)
+    mark_immediate_broadcasts_seen(
+        [record.get("id") for record in records],
+        user_id,
+    )
     if request.args.get("poll") == "1":
         if str(request.args.get("hash") or "").strip() == digest:
             return jsonify(hash=digest)
-        return jsonify(hash=digest, html=_cards_html(records))
-    cards = _cards_html(records)
+        return jsonify(hash=digest, html=cards)
     content = f'<h1>{heading}</h1>\n<div id="dash-messages">{cards}</div>'
     desktop_mode = (
         str(request.args.get("desktop_client") or "").strip().lower() in {"1", "true", "yes", "on"}

@@ -25,7 +25,7 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .filter-link { color:var(--ops-accent); text-decoration:none; padding:8px 10px; border-radius:4px; border:1px solid #EEE; font-size:0.9em; }
 .filter-link.active { background:var(--ops-accent); color:#FFF; border-color:var(--ops-accent); }
 .settings-button { color:var(--ops-accent); text-decoration:none; padding:9px 12px; border-radius:4px; border:1px solid var(--ops-accent); font-size:0.9em; display:inline-flex; align-items:center; gap:7px; }
-.settings-button:hover { background:rgba(25,118,210,0.08); }
+.settings-button:hover { background:rgba(200,101,76,0.08); }
 .add-button { width:40px; height:40px; border-radius:50%; background:var(--ops-accent); color:#FFF; display:inline-flex; align-items:center; justify-content:center; text-decoration:none; box-shadow:0 2px 5px rgba(0,0,0,0.24); transition:background-color 0.2s, box-shadow 0.2s; }
 .add-button:hover { background:var(--ops-accent-hover); box-shadow:0 4px 8px rgba(0,0,0,0.28); }
 .info-card{ background:#FFF; padding:0; border:1px solid #EEE; border-radius:8px; box-shadow:0 2px 4px rgba(0,0,0,0.1); margin-bottom:16px; overflow:hidden; }
@@ -51,7 +51,7 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .status-triangle::after { content:"!"; position:absolute; left:50%; top:60%; transform:translate(-50%, -50%); color:#FFF; font-size:8px; font-weight:700; line-height:1; clip-path:none; }
 .endpoint-actions { display:flex; align-items:center; gap:4px; flex:0 0 auto; }
 .icon-action { width:36px; height:36px; border-radius:50%; color:#555; display:inline-flex; align-items:center; justify-content:center; text-decoration:none; transition:background-color 0.2s, color 0.2s; }
-.icon-action:hover { background:rgba(25,118,210,0.08); color:var(--ops-accent); }
+.icon-action:hover { background:rgba(200,101,76,0.08); color:var(--ops-accent); }
 .icon-action.delete:hover { background:rgba(198,40,40,0.08); color:#C62828; }
 .success { background:#E8F5E9; border:1px solid #A5D6A7; color:#1B5E20; padding:12px; border-radius:8px; margin-bottom:16px; }
 .error { background:#FFEBEE; border:1px solid #EF9A9A; color:#B71C1C; padding:12px; border-radius:8px; margin-bottom:16px; }
@@ -67,19 +67,19 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 #content{ background-color:#121212; }
 .info-card,.summary-item{ border:1px solid #333; background-color:#1E1E1E; }
 .muted{ color:#BBB; }
-.filter-link { color:#BB86FC; border-color:#333; }
-.filter-link.active { background:#BB86FC; color:#000; border-color:#BB86FC; }
-.settings-button { color:#BB86FC; border-color:#BB86FC; }
-.settings-button:hover { background:rgba(187,134,252,0.1); }
-.add-button { background:#BB86FC; color:#000; }
-.add-button:hover { background:#A370F7; }
+.filter-link { color:var(--ops-accent); border-color:#333; }
+.filter-link.active { background:var(--ops-accent); color:#FFF; border-color:var(--ops-accent); }
+.settings-button { color:var(--ops-accent); border-color:var(--ops-accent); }
+.settings-button:hover { background:rgba(200,101,76,0.1); }
+.add-button { background:var(--ops-accent); color:#FFF; }
+.add-button:hover { background:var(--ops-accent-hover); }
 .endpoint-item { background:#1E1E1E; border-bottom:1px solid #333; }
 .endpoint-item:hover { background:#242424; }
 .endpoint-name { color:#EDEDED; }
 .endpoint-meta { color:#CCC; }
 .endpoint-status { color:#BBB; }
 .icon-action { color:#BBB; }
-.icon-action:hover { background:rgba(187,134,252,0.1); color:#BB86FC; }
+.icon-action:hover { background:rgba(200,101,76,0.1); color:var(--ops-accent); }
 .icon-action.delete:hover { background:rgba(244,67,54,0.12); color:#EF9A9A; }
 .success { background:#14351A; border-color:#2E7D32; color:#C8E6C9; }
 .error { background:#3B1515; border-color:#6D2A2A; color:#FFCDD2; }

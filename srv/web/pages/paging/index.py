@@ -46,7 +46,7 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .md-checkmark:after{ content:""; position:absolute; display:none; left:6px; top:2px; width:4px; height:10px; border:solid white; border-width:0 2px 2px 0; transform:rotate(45deg); }
 .md-checkbox-container input:checked ~ .md-checkmark:after{ display:block; }
 .page-control{ display:flex; flex-direction:column; align-items:center; gap:14px; padding:10px 0; }
-.mic-button{ width:132px; height:132px; border-radius:50%; border:none; background:var(--ops-accent); color:#FFF; cursor:pointer; box-shadow:0 8px 18px rgba(25,118,210,0.28); transition:transform 0.18s ease, background 0.18s ease, box-shadow 0.18s ease; display:flex; align-items:center; justify-content:center; }
+.mic-button{ width:132px; height:132px; border-radius:50%; border:none; background:var(--ops-accent); color:#FFF; cursor:pointer; box-shadow:0 8px 18px rgba(200,101,76,0.28); transition:transform 0.18s ease, background 0.18s ease, box-shadow 0.18s ease; display:flex; align-items:center; justify-content:center; }
 .mic-button i{ font-size:48px; }
 .mic-button:hover{ transform:translateY(-1px); background:var(--ops-accent-hover); }
 .mic-button:disabled{ background:#9E9E9E; cursor:not-allowed; box-shadow:none; transform:none; }
@@ -83,7 +83,7 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 .field select{ background:#121212; color:#E0E0E0; border-color:#444; }
 .md-checkmark{ border-color:#9AA0A6; background-color:#1E1E1E; }
 .md-checkbox-container:hover input ~ .md-checkmark{ border-color:#E8EAED; }
-.md-checkbox-container input:checked ~ .md-checkmark{ background-color:#8AB4F8; border-color:#8AB4F8; }
+.md-checkbox-container input:checked ~ .md-checkmark{ background-color:var(--ops-accent); border-color:var(--ops-accent); }
 .md-checkmark:after{ border-color:#1E1E1E; }
 .meter{ background:#333; }
 }

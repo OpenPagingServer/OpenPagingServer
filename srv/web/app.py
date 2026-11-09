@@ -15,16 +15,15 @@ import ssl
 import subprocess
 import string
 import sys
-import tempfile
 import threading
 import time
 import traceback
-import urllib.error
-import urllib.request
 import uuid
 from collections import deque
-from datetime import date as date_value_type, datetime, time as time_value_type, timedelta
+from datetime import date as date_value_type, datetime, time as time_value_type, timedelta, timezone
 from pathlib import Path
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from urllib.parse import urlencode, urlparse
 
 import pymysql
@@ -83,8 +82,10 @@ from group_features import all_recipients_disabled, ensure_group_feature_schema,
 from flask import (
     Flask,
     Response,
+    after_this_request,
     abort,
     g,
+    has_request_context,
     jsonify,
     redirect,
     render_template_string,
@@ -104,6 +105,7 @@ WEB_PAGES_DIR = WEB_ROOT_DIR / "pages"
 WEB_STATIC_DIR = WEB_ROOT_DIR / "assets"
 WEB_ERROR_DIR = WEB_ROOT_DIR / "errors"
 DEMO_MODE_HTML_PATH = WEB_ROOT_DIR / "demomode.html"
+ACKNOWLEDGMENTS_PATH = BASE_DIR / "ACKNOWLEDGMENTS.md"
 ENDPOINT_MODULES_DIR = endpoints.MODULE_STORE_DIR
 ASSET_DIR = Path(os.getenv("ASSET_PATH", "/var/lib/openpagingserver/assets"))
 CERTIFICATE_DIR = Path(os.getenv("OPS_CERTIFICATE_PATH", "/var/lib/openpagingserver/certificates"))
@@ -117,12 +119,25 @@ APP_DEBUG = str(os.getenv("DEBUG", "")).strip().lower() in {"1", "true", "yes", 
 ALLOW_SEARCH_INDEX = str(os.getenv("ALLOW_SEARCH_INDEX", "")).strip().lower() == "yes"
 TRACEBACKS = {}
 API_TOKEN_LABEL_LENGTH = 120
+ACCENT_COLOR_COOKIE = "ops_last_accent"
+ACCENT_COLORS = {
+    "orange": ("#C8654C", "#B0553E", "#FFFFFF"),
+    "blue": ("#1976D2", "#1565C0", "#FFFFFF"),
+    "blue-green": ("#00897B", "#00796B", "#FFFFFF"),
+    "green": ("#388E3C", "#2E7D32", "#FFFFFF"),
+    "yellow": ("#F9A825", "#F57F17", "#202124"),
+    "red": ("#D32F2F", "#C62828", "#FFFFFF"),
+    "red-violet": ("#C2185B", "#AD1457", "#FFFFFF"),
+    "violet": ("#7B1FA2", "#6A1B9A", "#FFFFFF"),
+    "blue-violet": ("#5E35B1", "#512DA8", "#FFFFFF"),
+}
 ENDPOINT_IPC_TIMEOUT = max(2.0, float(os.getenv("OPS_ENDPOINT_IPC_TIMEOUT", "5")))
 API_TOKEN_HASHER = PasswordHasher() if PasswordHasher is not None else None
 MESSAGE_VENDOR_SCHEMA_READY = False
 CERTIFICATE_SCHEMA_READY = False
 CERTIFICATE_SCHEMA_LOCK = threading.Lock()
 IDENTITY_ACCESS_SCHEMA_READY = False
+IDENTITY_ACCESS_SCHEMA_LOCK = threading.Lock()
 WEB_RATE_LIMIT_BUCKETS = {}
 WEB_RATE_LIMIT_LOCK = threading.Lock()
 WEB_RATE_LIMIT_EXEMPT_PREFIXES = ("/bundled-assets/", "/assets/file/", "/favicon.ico", "/robots.txt")
@@ -145,9 +160,6 @@ DESKTOP_SSO_REQUEST_TTL_SECONDS = _positive_int_env("OPS_DESKTOP_SSO_REQUEST_TTL
 
 USER_SESSION_TOUCH_INTERVAL_SECONDS = _positive_int_env("OPS_USER_SESSION_TOUCH_INTERVAL_SECONDS", 60)
 EXTERNAL_IDENTITY_CHECK_INTERVAL_SECONDS = _positive_int_env("OPS_EXTERNAL_IDENTITY_CHECK_INTERVAL_SECONDS", 3600)
-SCIM_RECONCILE_INTERVAL_SECONDS = max(120, _positive_int_env("OPS_SCIM_RECONCILE_INTERVAL_SECONDS", 300))
-SCIM_RECONCILE_THREAD = None
-SCIM_RECONCILE_LOCK = threading.Lock()
 
 
 def generate_runtime_fallback_secret_seed(length=256):
@@ -201,8 +213,9 @@ ACCOUNT_EXPIRATION_NOTIFY_SETTING = "notify_users_about_account_expiration"
 GUEST_RECEIVER_SETTING = "guest_receiver_enabled"
 ACCOUNT_EXPIRATION_WARNING_WINDOW_DAYS = 14
 LDAP_ROLE_MAPPING_SETTING = "ldap_role_mappings"
-OIDC_ROLE_MAPPING_SETTING = "oidc_role_mappings"
-SAML_ROLE_MAPPING_SETTING = "saml_role_mappings"
+IDENTITY_SETUP_REMINDER_DISABLED_SETTING = "identity_setup_reminder_disabled"
+IDENTITY_SETUP_REMINDER_COOKIE = "ops_identity_setup_reminder_dismissed"
+IDENTITY_SETUP_REMINDER_DISMISS_SECONDS = 3 * 24 * 60 * 60
 USER_PERMISSION_LABELS = [
     ("paging", "Send Pages"),
     ("messages", "Send Messages"),
@@ -240,62 +253,60 @@ LDAP_SETTING_DEFAULTS = {
     "ldap_user_search_filter": "({field}={username})",
     "ldap_display_name_field": "cn",
     "ldap_email_field": "mail",
+    "ldap_directory_access": "read_write",
+    "ldap_disabled_attribute": "",
+    "ldap_disabled_rule": "",
+    "ldap_password_expired_attribute": "",
+    "ldap_password_expired_rule": "",
+    "ldap_password_change_method": "",
     "ldap_required_group": "",
     "ldap_admin_group": "",
     "ldap_auto_create_users": "0",
     "ldap_local_login_fallback": "1",
     "ldap_connection_timeout": "5",
+    "ldap_sync_interval": "60",
     "ldap_failure_behavior": "deny",
     "ldap_group_sync": "1",
     "ldap_default_role": "receiver",
     LDAP_ROLE_MAPPING_SETTING: "[]",
 }
+LDAP_STATUS_TEMPLATES = {
+    "active-directory": {
+        "ldap_disabled_attribute": "userAccountControl",
+        "ldap_disabled_rule": "mask:2",
+        "ldap_password_expired_attribute": "msDS-User-Account-Control-Computed",
+        "ldap_password_expired_rule": "mask:8388608",
+        "ldap_password_change_method": "active_directory",
+    },
+    "openldap": {
+        "ldap_disabled_attribute": "pwdAccountLockedTime",
+        "ldap_disabled_rule": "000001010000Z",
+        "ldap_password_expired_attribute": "pwdReset",
+        "ldap_password_expired_rule": "true",
+        "ldap_password_change_method": "standard",
+    },
+}
 SSO_SETTING_DEFAULTS = {
     "identity_redirect_auto": "1",
     "identity_allow_local_login": "0",
+    "identity_setup_complete": "0",
 }
 OIDC_SETTING_DEFAULTS = {
     "oidc_discovery_url": "",
     "oidc_client_id": "",
     "oidc_client_secret": "",
     "oidc_password_change_url": "",
-    "oidc_scim_enabled": "0",
-    "oidc_scim_base_url": "",
-    "oidc_scim_bearer_token": "",
-    "oidc_scim_timeout": "5",
-    "oidc_scim_sync_groups": "1",
     "oidc_scope": "openid profile email",
     "oidc_username_claim": "preferred_username",
-    "oidc_display_name_claim": "name",
     "oidc_email_claim": "email",
-    "oidc_groups_claim": "groups",
-    "oidc_required_group": "",
-    "oidc_admin_group": "",
-    "oidc_auto_create_users": "0",
-    "oidc_group_sync": "1",
-    "oidc_default_role": "receiver",
-    OIDC_ROLE_MAPPING_SETTING: "[]",
 }
 SAML_SETTING_DEFAULTS = {
     "saml_idp_entity_id": "",
     "saml_sso_url": "",
     "saml_x509_certificate": "",
     "saml_password_change_url": "",
-    "saml_scim_enabled": "0",
-    "saml_scim_base_url": "",
-    "saml_scim_bearer_token": "",
-    "saml_scim_timeout": "5",
-    "saml_scim_sync_groups": "1",
     "saml_username_attribute": "uid",
-    "saml_display_name_attribute": "displayName",
     "saml_email_attribute": "mail",
-    "saml_groups_attribute": "groups",
-    "saml_required_group": "",
-    "saml_admin_group": "",
-    "saml_auto_create_users": "0",
-    "saml_group_sync": "1",
-    "saml_default_role": "receiver",
-    SAML_ROLE_MAPPING_SETTING: "[]",
 }
 LOGIN_SETTING_DEFAULTS = {
     ACCOUNT_EXPIRATION_NOTIFY_SETTING: "1",
@@ -370,22 +381,6 @@ def identity_access_denied_message(data=None):
     return f"You don't have access to {product}. Contact your system administrator for more information."
 
 
-def scim_provider_supported(provider):
-    return str(provider or "").strip().lower() in REDIRECT_IDENTITY_PROVIDER_VALUES
-
-
-def scim_provider_enabled(provider, data=None):
-    normalized = str(provider or "").strip().lower()
-    if normalized not in REDIRECT_IDENTITY_PROVIDER_VALUES:
-        return False
-    config = identity_provider_settings(data)
-    return (
-        config.get(f"{normalized}_scim_enabled") == "1"
-        and bool(str(config.get(f"{normalized}_scim_base_url") or "").strip())
-        and bool(str(config.get(f"{normalized}_scim_bearer_token") or "").strip())
-    )
-
-
 def parse_account_expiration_value(value, date_only_end_of_day=True):
     if value in (None, ""):
         return None
@@ -415,6 +410,8 @@ def user_account_expiration_at(user, date_only_end_of_day=True):
 
 
 def user_account_is_expired(user, now=None):
+    if truthy((user or {}).get("ldap_account_disabled")):
+        return True
     expires_at = user_account_expiration_at(user)
     return bool(expires_at and expires_at <= (now or datetime.now()))
 
@@ -735,7 +732,7 @@ def enforce_web_page_permissions():
     path = request.path or ""
     if not path:
         return None
-    if path.startswith("/api/") or path.startswith("/bundled-assets/") or path.startswith("/demo-mode"):
+    if path.startswith("/api/") or path.startswith("/bundled-assets/") or path.startswith("/demo-mode") or path == "/assets/file/login-background":
         return None
     if path in {"/", "/index", "/login", "/logout", "/login/basic-captcha.svg", "/favicon.ico", "/robots.txt"}:
         return None
@@ -838,14 +835,34 @@ def db(cursorclass=pymysql.cursors.DictCursor):
     )
 
 
-def query_all(sql, params=None):
+IDENTITY_TRANSACTION = ContextVar("identity_transaction", default=None)
+
+
+@contextmanager
+def identity_transaction():
     conn = db()
+    token = IDENTITY_TRANSACTION.set(conn)
+    try:
+        yield
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        IDENTITY_TRANSACTION.reset(token)
+        conn.close()
+
+
+def query_all(sql, params=None):
+    transaction = IDENTITY_TRANSACTION.get()
+    conn = transaction or db()
     try:
         with conn.cursor() as cur:
             cur.execute(sql, params or ())
             return cur.fetchall()
     finally:
-        conn.close()
+        if transaction is None:
+            conn.close()
 
 
 def query_one(sql, params=None):
@@ -854,31 +871,40 @@ def query_one(sql, params=None):
 
 
 def execute(sql, params=None):
-    conn = db()
+    transaction = IDENTITY_TRANSACTION.get()
+    conn = transaction or db()
     try:
         with conn.cursor() as cur:
             cur.execute(sql, params or ())
             lastrowid = cur.lastrowid
-        conn.commit()
+        if transaction is None:
+            conn.commit()
         return lastrowid
     finally:
-        conn.close()
+        if transaction is None:
+            conn.close()
 
 
 def execute_many(statements):
-    conn = db()
+    transaction = IDENTITY_TRANSACTION.get()
+    conn = transaction or db()
     try:
         with conn.cursor() as cur:
             for sql, params in statements:
                 cur.execute(sql, params or ())
-        conn.commit()
+        if transaction is None:
+            conn.commit()
     finally:
-        conn.close()
+        if transaction is None:
+            conn.close()
 
 
 def settings():
     rows = query_all("SELECT parameter, value FROM systemsettings")
-    return {str(row["parameter"]): "" if row["value"] is None else str(row["value"]) for row in rows}
+    data = {str(row["parameter"]): "" if row["value"] is None else str(row["value"]) for row in rows}
+    if has_request_context() and (truthy(data.get("ldap_enabled")) or data.get("identity_provider") == "ldap"):
+        start_ldap_sync_worker()
+    return data
 
 
 def save_setting(parameter, value, description):
@@ -1479,6 +1505,13 @@ def ensure_identity_access_schema():
     global IDENTITY_ACCESS_SCHEMA_READY
     if IDENTITY_ACCESS_SCHEMA_READY:
         return
+    with IDENTITY_ACCESS_SCHEMA_LOCK:
+        if not IDENTITY_ACCESS_SCHEMA_READY:
+            _upgrade_identity_access_schema()
+            IDENTITY_ACCESS_SCHEMA_READY = True
+
+
+def _upgrade_identity_access_schema():
     execute_many(
         [
             (
@@ -1579,8 +1612,16 @@ def ensure_identity_access_schema():
         statements.append(("ALTER TABLE users ADD COLUMN restrict_messages TINYINT(1) NOT NULL DEFAULT 0 AFTER restrict_groups", ()))
     if "restrict_bell_schedules" not in user_columns:
         statements.append(("ALTER TABLE users ADD COLUMN restrict_bell_schedules TINYINT(1) NOT NULL DEFAULT 0 AFTER restrict_messages", ()))
+    if "ldap_account_disabled" not in user_columns:
+        statements.append(("ALTER TABLE users ADD COLUMN ldap_account_disabled TINYINT(1) NOT NULL DEFAULT 0", ()))
     if "require_password_change" not in user_columns:
         statements.append(("ALTER TABLE users ADD COLUMN require_password_change TINYINT(1) NOT NULL DEFAULT 0 AFTER restrict_bell_schedules", ()))
+    if "theme" not in user_columns:
+        statements.append(("ALTER TABLE users ADD COLUMN theme VARCHAR(16) NOT NULL DEFAULT 'system' AFTER require_password_change", ()))
+    if "accent_color" not in user_columns:
+        statements.append(("ALTER TABLE users ADD COLUMN accent_color VARCHAR(32) NOT NULL DEFAULT 'orange' AFTER theme", ()))
+    if "CSS" not in user_columns:
+        statements.append(("ALTER TABLE users ADD COLUMN `CSS` LONGTEXT DEFAULT NULL AFTER accent_color", ()))
     if "owner_user_id" not in group_columns:
         statements.append(("ALTER TABLE `groups` ADD COLUMN owner_user_id INT DEFAULT NULL", ()))
     if "owner_user_id" not in message_columns:
@@ -1609,9 +1650,19 @@ def ensure_identity_access_schema():
         for defaults in (SSO_SETTING_DEFAULTS, OIDC_SETTING_DEFAULTS, SAML_SETTING_DEFAULTS)
         for parameter, value in defaults.items()
     )
-    if setting_statements:
-        execute_many(setting_statements)
-    IDENTITY_ACCESS_SCHEMA_READY = True
+    execute_many(setting_statements + [
+        (
+            "INSERT IGNORE INTO systemsettings (`parameter`, `value`, `description`) VALUES ('allow_user_custom_css','1','Allow users to set their own custom CSS (0/1)')",
+            (),
+        ),
+        (
+            """UPDATE systemsettings AS ldap
+               JOIN systemsettings AS provider ON provider.parameter='identity_provider'
+               SET ldap.value='1', provider.value='local'
+               WHERE ldap.parameter='ldap_enabled' AND LOWER(TRIM(provider.value))='ldap'""",
+            (),
+        ),
+    ])
 
 
 def db_datetime_value(value):
@@ -1718,6 +1769,8 @@ def _session_datetime(value):
 def session_soft_logged_out(record):
     if not record:
         return False
+    if record.get("auth_provider") == "chrome_verified_access":
+        return True
     session_type = str(record.get("session_type") or "web").strip().lower()
     limit = SOFT_LOGOUT_AFTER_SECONDS_DESKTOP if session_type == "desktop" else SOFT_LOGOUT_AFTER_SECONDS_WEB
     reference = _session_datetime(record.get("last_full_activity")) or _session_datetime(record.get("created_at"))
@@ -2242,27 +2295,9 @@ def ldap_role_mappings(data=None):
     return normalize_ldap_role_mappings((source or {}).get(LDAP_ROLE_MAPPING_SETTING))
 
 
-def provider_role_mapping_setting(provider):
-    normalized = str(provider or "").strip().lower()
-    if normalized == "ldap":
-        return LDAP_ROLE_MAPPING_SETTING
-    if normalized == "oidc":
-        return OIDC_ROLE_MAPPING_SETTING
-    if normalized == "saml":
-        return SAML_ROLE_MAPPING_SETTING
-    return ""
-
-
-def provider_role_mappings(config, provider):
-    setting_name = provider_role_mapping_setting(provider)
-    if not setting_name:
-        return []
-    return normalize_ldap_role_mappings((config or {}).get(setting_name))
-
-
 def provider_role_mapping_for_identity(config, provider, raw_groups, claims_source=None):
     fallback_mapping = None
-    for mapping in provider_role_mappings(config, provider):
+    for mapping in ldap_role_mappings(config) if provider == "ldap" else []:
         if str(mapping.get("fallback") or "0") == "1":
             fallback_mapping = mapping
             continue
@@ -2348,21 +2383,25 @@ def group_member_token_list(value):
 
 
 def serialize_group_member_tokens(values):
-    return ",".join(group_member_token_list(values))
+    return ",".join(values)
 
 
 def remove_desktop_member_from_all_groups(user_id):
     member_token = desktop_member_token(user_id)
     if not member_token:
         return
-    rows = query_all("SELECT id, members, monitor_members FROM `groups`")
+    fields = ["members"]
+    if "monitor_members" in table_columns("groups"):
+        fields.append("monitor_members")
+    lock_clause = " FOR UPDATE" if IDENTITY_TRANSACTION.get() is not None else ""
+    rows = query_all(f"SELECT id, {', '.join(fields)} FROM `groups`" + lock_clause)
     for row in rows:
         updates = {}
-        for field_name in ("members", "monitor_members"):
-            tokens = [token for token in group_member_token_list(row.get(field_name)) if token != member_token]
-            serialized = serialize_group_member_tokens(tokens)
-            if serialized != str(row.get(field_name) or ""):
-                updates[field_name] = serialized or None
+        for field_name in fields:
+            tokens = group_member_token_list(row.get(field_name))
+            if member_token in tokens:
+                tokens.remove(member_token)
+                updates[field_name] = serialize_group_member_tokens(tokens) or None
         if updates:
             execute(
                 f"UPDATE `groups` SET {', '.join('`' + key + '`=%s' for key in updates)} WHERE id=%s",
@@ -2406,7 +2445,7 @@ def identity_user_select_clause():
             id, username, email, role, auth_provider, external_id, display_name, ldap_groups, identity_recipient_groups,
             accountexpire,
             adminperm, userperm, msgsendperm, restrict_groups, restrict_messages, restrict_bell_schedules,
-            require_password_change
+            require_password_change, ldap_account_disabled, theme, accent_color, `CSS`
         FROM users
     """
 
@@ -2415,46 +2454,14 @@ def fetch_identity_user_by_id(user_id):
     return query_one(identity_user_select_clause() + " WHERE id=%s LIMIT 1", (user_id,))
 
 
-def fetch_synced_identity_user(provider, external_id, username, email):
-    provider = str(provider or "").strip().lower()
-    if not is_external_auth_provider(provider):
-        return None
-    external_id = str(external_id or "").strip()
-    username = str(username or "").strip()
-    email = str(email or "").strip()
-    conditions = []
-    params = []
-    if external_id:
-        conditions.append("(auth_provider=%s AND external_id=%s)")
-        params.extend([provider, external_id])
-    if username:
-        conditions.append("(auth_provider=%s AND username=%s)")
-        params.extend([provider, username])
-    if email:
-        conditions.append("(auth_provider=%s AND email=%s)")
-        params.extend([provider, email])
-    if not conditions:
-        return None
-    order_parts = []
-    order_params = []
-    if external_id:
-        order_parts.append("WHEN auth_provider=%s AND external_id=%s THEN 0")
-        order_params.extend([provider, external_id])
-    if username:
-        order_parts.append("WHEN auth_provider=%s AND username=%s THEN 1")
-        order_params.extend([provider, username])
-    if email:
-        order_parts.append("WHEN auth_provider=%s AND email=%s THEN 2")
-        order_params.extend([provider, email])
-    sql = (
+def fetch_synced_ldap_user(external_id, username):
+    return query_one(
         identity_user_select_clause()
-        + " WHERE "
-        + " OR ".join(conditions)
-        + " ORDER BY CASE "
-        + " ".join(order_parts)
-        + " ELSE 9 END LIMIT 1"
+        + " WHERE auth_provider='ldap' AND (external_id=%s "
+        "OR (COALESCE(external_id, '')='' AND username=%s)) "
+        "ORDER BY (external_id=%s) DESC LIMIT 1",
+        (external_id, username, external_id),
     )
-    return query_one(sql, tuple(params + order_params))
 
 
 def normalized_external_username(value, provider, external_id=""):
@@ -2464,10 +2471,11 @@ def normalized_external_username(value, provider, external_id=""):
     return (text or f"{provider}-user")[:100]
 
 
-def unique_external_username(provider, preferred_username, email="", external_id="", ignore_user_id=None):
+def unique_external_username(provider, preferred_username, email="", external_id="", ignore_user_id=None, domain=""):
     base = normalized_external_username(preferred_username or email, provider, external_id)
-    base_with_provider = base if base.lower().endswith(f"@{provider}") else (base[: max(0, 100 - len(provider) - 1)] + f"@{provider}")
-    candidates = [base, base_with_provider]
+    suffix = f"@{domain or provider}"
+    qualified = base if base.lower().endswith(suffix.lower()) else base[:100 - len(suffix)] + suffix
+    candidates = [base, qualified]
     seen = set()
     for candidate in candidates:
         trimmed = candidate[:100]
@@ -2478,8 +2486,8 @@ def unique_external_username(provider, preferred_username, email="", external_id
                 return trimmed
     for suffix in range(2, 1000):
         suffix_text = f"-{suffix}"
-        stem = base[: max(0, 100 - len(suffix_text))]
-        candidate = f"{stem}{suffix_text}"
+        stem = base[:100 - len(suffix_text) - len(suffix)]
+        candidate = f"{stem}{suffix_text}{suffix}"
         row = query_one("SELECT id FROM users WHERE username=%s LIMIT 1", (candidate,))
         if not row or str(row.get("id")) == str(ignore_user_id or ""):
             return candidate
@@ -2496,258 +2504,11 @@ def unique_external_email(email, ignore_user_id=None):
     return None
 
 
-def scim_timeout_value(config, provider):
-    try:
-        timeout_value = int(str((config or {}).get(f"{provider}_scim_timeout") or "5").strip() or "5")
-    except ValueError:
-        timeout_value = 5
-    return min(120, max(1, timeout_value))
-
-
-def scim_users_endpoint(base_url):
-    normalized = str(base_url or "").strip().rstrip("/")
-    if not normalized:
-        return ""
-    if normalized.lower().endswith("/users"):
-        return normalized
-    return normalized + "/Users"
-
-
-def scim_filter_value(value):
-    return '"' + str(value or "").replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
-def scim_request_json(url, bearer_token, timeout_seconds):
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/scim+json, application/json",
-            "Authorization": f"Bearer {bearer_token}",
-            "User-Agent": "OpenPagingServer/SCIM",
-        },
-        method="GET",
-    )
-    with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
-        return json.loads(response.read().decode("utf-8", errors="replace"))
-
-
-def scim_extract_user_email(resource):
-    if not isinstance(resource, dict):
-        return ""
-    emails = resource.get("emails")
-    if isinstance(emails, (list, tuple)):
-        for item in emails:
-            if isinstance(item, dict):
-                value = str(item.get("value") or "").strip()
-                if value:
-                    return value
-    return str(resource.get("email") or "").strip()
-
-
-def scim_extract_group_values(resource):
-    if not isinstance(resource, dict):
-        return []
-    return normalize_identity_group_values(resource.get("groups") or [])
-
-
-def scim_user_is_active(resource):
-    if not isinstance(resource, dict):
-        return False
-    if "active" not in resource:
-        return True
-    value = resource.get("active")
-    if isinstance(value, bool):
-        return value
-    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def scim_identity_reference(source):
-    if isinstance(source, dict):
-        return {
-            "external_id": str(source.get("external_id") or "").strip(),
-            "username": str(source.get("username") or "").strip(),
-            "email": str(source.get("email") or "").strip(),
-            "display_name": str(source.get("display_name") or "").strip(),
-        }
-    return {"external_id": "", "username": "", "email": "", "display_name": ""}
-
-
-def scim_identity_with_resource(provider, config, source, resource):
-    identity = dict(source or {}) if isinstance(source, dict) else {}
-    if not isinstance(resource, dict):
-        return identity
-    merged_groups = normalize_identity_group_values(identity.get("groups") or [])
-    if (config or {}).get(f"{provider}_scim_sync_groups") == "1":
-        if "groups" in resource:
-            merged_groups = normalize_identity_group_values(merged_groups + scim_extract_group_values(resource))
-        else:
-            identity["scim_sync_incomplete"] = True
-    elif not merged_groups:
-        merged_groups = scim_extract_group_values(resource)
-    identity["groups"] = merged_groups
-    identity["username"] = (
-        str(identity.get("username") or "").strip()
-        or str(resource.get("userName") or "").strip()
-        or str(resource.get("externalId") or "").strip()
-    )
-    identity["email"] = str(identity.get("email") or "").strip() or scim_extract_user_email(resource)
-    identity["display_name"] = (
-        str(identity.get("display_name") or "").strip()
-        or str(resource.get("displayName") or "").strip()
-        or identity.get("username")
-        or identity.get("email")
-    )
-    identity["external_id"] = (
-        str(identity.get("external_id") or "").strip()
-        or str(resource.get("externalId") or "").strip()
-        or str(resource.get("id") or "").strip()
-    )
-    identity["scim_resource"] = resource
-    return identity
-
-
-def scim_lookup_user_resource(provider, config, source):
-    normalized_provider = str(provider or "").strip().lower()
-    if not scim_provider_enabled(normalized_provider, config):
-        return "disabled", None
-    endpoint = scim_users_endpoint((config or {}).get(f"{normalized_provider}_scim_base_url"))
-    bearer_token = str((config or {}).get(f"{normalized_provider}_scim_bearer_token") or "").strip()
-    if not endpoint or not bearer_token:
-        return "disabled", None
-    identity = scim_identity_reference(source)
-    filters = []
-    external_id = identity.get("external_id")
-    username = identity.get("username")
-    email = identity.get("email")
-    if external_id:
-        filters.extend(
-            [
-                f"externalId eq {scim_filter_value(external_id)}",
-                f"id eq {scim_filter_value(external_id)}",
-            ]
-        )
-    if username:
-        filters.append(f"userName eq {scim_filter_value(username)}")
-    if email:
-        filters.append(f'emails.value eq {scim_filter_value(email)}')
-    timeout_seconds = scim_timeout_value(config, normalized_provider)
-    seen_filters = set()
-    try:
-        for filter_text in filters:
-            if filter_text in seen_filters:
-                continue
-            seen_filters.add(filter_text)
-            url = endpoint + "?" + urlencode({"filter": filter_text})
-            payload = scim_request_json(url, bearer_token, timeout_seconds)
-            resources = payload.get("Resources") if isinstance(payload, dict) else None
-            if isinstance(resources, list) and resources:
-                for resource in resources:
-                    if scim_user_is_active(resource):
-                        return "found", resource
-                return "missing", None
-        return "missing", None
-    except (OSError, urllib.error.URLError, urllib.error.HTTPError, ValueError, json.JSONDecodeError):
-        return "error", None
-
-
-def scim_identity_result(provider, config, source):
-    identity = dict(source or {}) if isinstance(source, dict) else {}
-    status, resource = scim_lookup_user_resource(provider, config, identity)
-    if status == "missing":
-        raise IdentityAccessDenied(identity_access_denied_message(config))
-    if status != "found" or not isinstance(resource, dict):
-        if status == "error":
-            identity["scim_sync_incomplete"] = True
-        return identity
-    return scim_identity_with_resource(provider, config, identity, resource)
-
-
-def identity_groups_text(groups):
-    return "\n".join(normalize_identity_group_values(groups or []))
-
-
-def external_identity_claim_source(source):
-    if not isinstance(source, dict):
-        return {}
-    merged = {}
-    for key in ("userinfo", "attributes", "scim_resource"):
-        value = source.get(key)
-        if isinstance(value, dict):
-            for claim_key, claim_value in value.items():
-                if claim_key not in merged:
-                    merged[claim_key] = claim_value
-    for claim_key, claim_value in source.items():
-        if claim_key in {"userinfo", "attributes", "scim_resource"}:
-            continue
-        if claim_key not in merged:
-            merged[claim_key] = claim_value
-    if isinstance(source.get("scim_resource"), dict):
-        merged.setdefault("scim", source.get("scim_resource"))
-    return merged or dict(source)
-
-
-def sync_redirect_identity_user(user_id, provider, config, identity_result):
-    source = identity_result if isinstance(identity_result, dict) else {}
-    if scim_provider_enabled(provider, config) and not isinstance(source.get("scim_resource"), dict):
-        source = scim_identity_result(provider, config, source)
-    groups = normalize_identity_group_values(source.get("groups") or [])
-    if source.get("scim_sync_incomplete") and not groups:
-        stored = query_one("SELECT ldap_groups FROM users WHERE id=%s LIMIT 1", (user_id,)) or {}
-        groups = normalize_identity_group_values(str(stored.get("ldap_groups") or "").splitlines())
-    groups_text = identity_groups_text(groups)
-    external_id = str(source.get("external_id") or source.get("sub") or source.get("name_id") or "").strip()
-    username = str(source.get("username") or "").strip() or external_id or "external-user"
-    email = str(source.get("email") or "").strip()
-    display_name = str(source.get("display_name") or "").strip() or username or email
-    claims_source = external_identity_claim_source(source)
-    access_profile = identity_access_profile(provider, config, groups, claims_source)
-    role_value = normalize_identity_mapping_role(access_profile.get("role") or "receiver")
-    if role_value == "none":
-        raise IdentityAccessDenied(identity_access_denied_message(config))
-    target_username = unique_external_username(provider, username, email, external_id, user_id)
-    safe_email = unique_external_email(email, user_id)
-    return apply_identity_access_profile_to_user(
-        user_id,
-        provider,
-        target_username,
-        safe_email,
-        display_name,
-        external_id,
-        groups_text,
-        access_profile,
-    )
-
-
-def refresh_redirect_identity_user(user, config):
-    provider = str((user or {}).get("auth_provider") or "").strip().lower()
-    if provider not in REDIRECT_IDENTITY_PROVIDER_VALUES:
-        return user
-    if not scim_provider_enabled(provider, config):
-        return user
-    source = {
-        "external_id": str((user or {}).get("external_id") or "").strip(),
-        "username": str((user or {}).get("username") or "").strip(),
-        "email": str((user or {}).get("email") or "").strip(),
-        "display_name": str((user or {}).get("display_name") or "").strip(),
-    }
-    try:
-        status, resource = scim_lookup_user_resource(provider, config, source)
-        if status == "missing":
-            return None
-        if status != "found" or not isinstance(resource, dict):
-            return user
-        return user
-    except IdentityAccessDenied:
-        return None
-    except Exception:
-        return user
-
-
 def clear_external_user_password(user_id):
-    execute("UPDATE users SET password='', salt='', require_password_change=0 WHERE id=%s", (user_id,))
+    execute("UPDATE users SET password='', salt='' WHERE id=%s", (user_id,))
 
 
-def apply_identity_access_profile_to_user(user_id, provider, username, email, display_name, external_id, ldap_groups, access_profile):
+def apply_identity_access_profile_to_user(user_id, provider, username, email, display_name, external_id, ldap_groups, access_profile, disabled=False, password_expired=False):
     role_value = normalize_identity_mapping_role(access_profile.get("role") or "receiver")
     userperm_value = str(access_profile.get("userperm") or "")
     restrict_groups = "1" if truthy(access_profile.get("restrict_groups")) and role_value == "user" else "0"
@@ -2763,7 +2524,7 @@ def apply_identity_access_profile_to_user(user_id, provider, username, email, di
         UPDATE users
         SET username=%s, email=%s, display_name=%s, auth_provider=%s, external_id=%s, ldap_groups=%s,
             role=%s, userperm=%s, restrict_groups=%s, restrict_messages=%s, restrict_bell_schedules=%s,
-            require_password_change=0
+            require_password_change=%s, ldap_account_disabled=%s
         WHERE id=%s
         """,
         (
@@ -2778,6 +2539,8 @@ def apply_identity_access_profile_to_user(user_id, provider, username, email, di
             restrict_groups,
             restrict_messages,
             restrict_bell_schedules,
+            int(password_expired),
+            int(disabled),
             user_id,
         ),
     )
@@ -2789,12 +2552,20 @@ def apply_identity_access_profile_to_user(user_id, provider, username, email, di
     return fetch_identity_user_by_id(user_id)
 
 
+def delete_provider_user_api_tokens(user_id):
+    try:
+        execute("DELETE FROM api_tokens WHERE user_id=%s", (user_id,))
+    except pymysql.MySQLError as exc:
+        if not exc.args or exc.args[0] != 1146:
+            raise
+
+
 def delete_provider_managed_user(user_id):
     target_id = str(user_id if user_id is not None else "").strip()
     if not target_id:
         return
     revoke_all_user_session_records(target_id)
-    execute("DELETE FROM api_tokens WHERE user_id=%s", (target_id,))
+    delete_provider_user_api_tokens(target_id)
     execute("DELETE FROM user_group_access WHERE user_id=%s", (target_id,))
     execute("DELETE FROM user_message_access WHERE user_id=%s", (target_id,))
     execute("DELETE FROM user_bell_schedule_access WHERE user_id=%s", (target_id,))
@@ -2857,18 +2628,14 @@ def set_user_group_access_ids(user_id, group_ids):
         if token and token not in seen:
             seen.add(token)
             wanted.append(token)
-    conn = db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM user_group_access WHERE user_id=%s", (user_id,))
-            for group_id in wanted:
-                cur.execute(
-                    "INSERT INTO user_group_access (user_id, group_id) VALUES (%s,%s)",
-                    (user_id, group_id),
-                )
-        conn.commit()
-    finally:
-        conn.close()
+    execute_many([
+        ("DELETE FROM user_group_access WHERE user_id=%s", (user_id,)),
+        *[
+            ("INSERT INTO user_group_access (user_id, group_id) VALUES (%s,%s)", (user_id, value))
+            for value in wanted
+        ],
+    ])
+
 
 
 def set_user_message_access_ids(user_id, message_ids):
@@ -2883,18 +2650,14 @@ def set_user_message_access_ids(user_id, message_ids):
         if token and token not in seen:
             seen.add(token)
             wanted.append(token)
-    conn = db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM user_message_access WHERE user_id=%s", (user_id,))
-            for message_id in wanted:
-                cur.execute(
-                    "INSERT INTO user_message_access (user_id, message_id) VALUES (%s,%s)",
-                    (user_id, message_id),
-                )
-        conn.commit()
-    finally:
-        conn.close()
+    execute_many([
+        ("DELETE FROM user_message_access WHERE user_id=%s", (user_id,)),
+        *[
+            ("INSERT INTO user_message_access (user_id, message_id) VALUES (%s,%s)", (user_id, value))
+            for value in wanted
+        ],
+    ])
+
 
 
 def set_user_bell_schedule_access_ids(user_id, schedule_ids):
@@ -2909,18 +2672,14 @@ def set_user_bell_schedule_access_ids(user_id, schedule_ids):
         if token and token not in seen:
             seen.add(token)
             wanted.append(token)
-    conn = db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM user_bell_schedule_access WHERE user_id=%s", (user_id,))
-            for schedule_id in wanted:
-                cur.execute(
-                    "INSERT INTO user_bell_schedule_access (user_id, schedule_id) VALUES (%s,%s)",
-                    (user_id, schedule_id),
-                )
-        conn.commit()
-    finally:
-        conn.close()
+    execute_many([
+        ("DELETE FROM user_bell_schedule_access WHERE user_id=%s", (user_id,)),
+        *[
+            ("INSERT INTO user_bell_schedule_access (user_id, schedule_id) VALUES (%s,%s)", (user_id, value))
+            for value in wanted
+        ],
+    ])
+
 
 
 def group_access_is_restricted(user):
@@ -3233,48 +2992,34 @@ def identity_provider_settings(data=None):
     normalized.update(SSO_SETTING_DEFAULTS)
     normalized.update(OIDC_SETTING_DEFAULTS)
     normalized.update(SAML_SETTING_DEFAULTS)
-    normalized.update({key: "" if value is None else str(value) for key, value in (source or {}).items()})
+    normalized.update({key: "" if value is None else str(value) for key, value in source.items() if key != LDAP_ROLE_MAPPING_SETTING})
     provider = str(normalized.get("identity_provider") or "local").strip().lower()
     if provider not in IDENTITY_PROVIDER_VALUES:
         provider = "local"
-    normalized["identity_provider"] = provider
-    normalized["ldap_enabled"] = "1" if provider == "ldap" else "0"
+    normalized["identity_provider"] = "local" if provider == "ldap" else provider
+    normalized["ldap_enabled"] = "1" if provider == "ldap" or truthy(normalized.get("ldap_enabled")) else "0"
     normalized["identity_redirect_auto"] = "1" if truthy(normalized.get("identity_redirect_auto", "1")) else "0"
     normalized["identity_allow_local_login"] = "1" if truthy(normalized.get("identity_allow_local_login", "0")) else "0"
     normalized["ldap_secure"] = "1" if truthy(normalized.get("ldap_secure", "0")) else "0"
     normalized["ldap_auto_create_users"] = "1" if truthy(normalized.get("ldap_auto_create_users", "1")) else "0"
     normalized["ldap_local_login_fallback"] = "1" if truthy(normalized.get("ldap_local_login_fallback", "1")) else "0"
     normalized["ldap_group_sync"] = "1" if truthy(normalized.get("ldap_group_sync", "1")) else "0"
-    normalized["oidc_auto_create_users"] = "1" if truthy(normalized.get("oidc_auto_create_users", "1")) else "0"
-    normalized["oidc_group_sync"] = "1" if truthy(normalized.get("oidc_group_sync", "1")) else "0"
-    normalized["saml_auto_create_users"] = "1" if truthy(normalized.get("saml_auto_create_users", "1")) else "0"
-    normalized["saml_group_sync"] = "1" if truthy(normalized.get("saml_group_sync", "1")) else "0"
-    normalized["oidc_scim_enabled"] = "1" if truthy(normalized.get("oidc_scim_enabled", "0")) else "0"
-    normalized["saml_scim_enabled"] = "1" if truthy(normalized.get("saml_scim_enabled", "0")) else "0"
-    normalized["oidc_scim_sync_groups"] = "1" if truthy(normalized.get("oidc_scim_sync_groups", "1")) else "0"
-    normalized["saml_scim_sync_groups"] = "1" if truthy(normalized.get("saml_scim_sync_groups", "1")) else "0"
     failure_behavior = str(normalized.get("ldap_failure_behavior") or "deny").strip().lower()
     normalized["ldap_failure_behavior"] = failure_behavior if failure_behavior in IDENTITY_FAILURE_BEHAVIORS else "deny"
     normalized["ldap_default_role"] = normalize_ldap_default_role(normalized.get("ldap_default_role"))
-    normalized["oidc_default_role"] = normalize_ldap_default_role(normalized.get("oidc_default_role"))
-    normalized["saml_default_role"] = normalize_ldap_default_role(normalized.get("saml_default_role"))
     normalized["oidc_scope"] = str(normalized.get("oidc_scope") or OIDC_SETTING_DEFAULTS["oidc_scope"]).strip() or OIDC_SETTING_DEFAULTS["oidc_scope"]
-    for timeout_name in ("oidc_scim_timeout", "saml_scim_timeout"):
-        try:
-            timeout_value = int(str(normalized.get(timeout_name) or "5").strip() or "5")
-        except ValueError:
-            timeout_value = 5
-        normalized[timeout_name] = str(min(120, max(1, timeout_value)))
-    normalized["ldap_role_mappings"] = normalize_ldap_role_mappings(normalized.get(LDAP_ROLE_MAPPING_SETTING))
-    normalized[OIDC_ROLE_MAPPING_SETTING] = normalize_ldap_role_mappings(normalized.get(OIDC_ROLE_MAPPING_SETTING))
-    normalized[SAML_ROLE_MAPPING_SETTING] = normalize_ldap_role_mappings(normalized.get(SAML_ROLE_MAPPING_SETTING))
+    for key, value in LDAP_STATUS_TEMPLATES.get(normalized.get("ldap_template"), {}).items():
+        if not normalized.get(key):
+            normalized[key] = value
+    normalized["ldap_password_change_method"] = normalized.get("ldap_password_change_method") or "standard"
+    normalized[LDAP_ROLE_MAPPING_SETTING] = normalize_ldap_role_mappings(source.get(LDAP_ROLE_MAPPING_SETTING))
     return normalized
 
 
 def configured_identity_provider(data=None):
     config = identity_provider_settings(data)
-    provider = str(config.get("identity_provider") or "local").strip().lower()
-    return provider if provider in IDENTITY_PROVIDER_VALUES else "local"
+    provider = config["identity_provider"]
+    return "ldap" if provider == "local" and config["ldap_enabled"] == "1" else provider
 
 
 def identity_provider_uses_redirect(data=None):
@@ -3327,7 +3072,6 @@ def pop_sso_error_detail():
 
 def current_user():
     ensure_identity_access_schema()
-    ensure_scim_reconcile_thread()
     user_id = session.get("user_id")
     if user_id is None or user_id == "":
         return None
@@ -3338,7 +3082,7 @@ def current_user():
         SELECT
             id, username, email, role, auth_provider, external_id, display_name,
             adminperm, userperm, msgsendperm, accountexpire, restrict_groups, restrict_messages,
-            restrict_bell_schedules, require_password_change
+            restrict_bell_schedules, require_password_change, ldap_account_disabled, theme, accent_color, `CSS`
         FROM users
         WHERE id=%s
         LIMIT 1
@@ -3416,7 +3160,8 @@ def local_user_record(username):
         SELECT
             id, username, email, password, salt, role, auth_provider, external_id,
             display_name, adminperm, userperm, msgsendperm, accountexpire,
-            loginsleft, restrict_groups, restrict_messages, restrict_bell_schedules, require_password_change
+            loginsleft, restrict_groups, restrict_messages, restrict_bell_schedules, require_password_change,
+            theme, accent_color, `CSS`
         FROM users
         WHERE username=%s OR email=%s
         LIMIT 1
@@ -3439,6 +3184,8 @@ def authenticate_local_user(username, password):
 def user_requires_password_change(user, login_provider=None):
     if not truthy((user or {}).get("require_password_change", "0")):
         return False
+    if (user or {}).get("auth_provider") == "ldap":
+        return True
     provider = str(login_provider or (user or {}).get("auth_provider") or session.get("auth_provider") or "").strip().lower()
     return provider == "local"
 
@@ -3479,107 +3226,381 @@ def groups_match_requirement(raw_groups, configured_value):
     return any(token in aliases for token in wanted)
 
 
-def ldap_ca_certificate_file(value):
-    raw = str(value or "").strip()
-    if not raw:
-        return None, None
-    candidate = Path(raw)
-    if "\n" not in raw and candidate.is_file():
-        return str(candidate), None
-    if "BEGIN CERTIFICATE" not in raw:
-        raise RuntimeError("CA certificate must be blank, a valid file path, or PEM text.")
-    handle = tempfile.NamedTemporaryFile("w", suffix=".crt", delete=False, encoding="utf-8")
-    try:
-        handle.write(raw)
-    finally:
-        handle.close()
-    return handle.name, handle.name
+class LDAPSystemTLS(Tls or object):
+    def __init__(self, host, extra_ca):
+        super().__init__(validate=ssl.CERT_REQUIRED)
+        self.host = host
+        self.context = ssl.create_default_context()
+        extra_ca = str(extra_ca or "").strip()
+        if "-----BEGIN CERTIFICATE-----" in extra_ca:
+            self.context.load_verify_locations(cadata=extra_ca)
+        elif extra_ca:
+            self.context.load_verify_locations(cafile=extra_ca)
+
+    def wrap_socket(self, connection, do_handshake=False):
+        connection.socket = self.context.wrap_socket(
+            connection.socket, server_hostname=self.host, do_handshake_on_connect=do_handshake
+        )
 
 
 def ldap_server_for_config(config):
     if Connection is None or Server is None:
         raise RuntimeError("LDAP support requires the ldap3 package.")
-    ca_path = None
-    temp_path = None
+    host = str(config.get("ldap_server_address") or "").strip().strip("[]")
+    secure = config.get("ldap_secure") == "1"
+    return Server(
+        host,
+        port=int(config.get("ldap_server_port") or (636 if secure else 389)),
+        use_ssl=secure,
+        get_info=ALL,
+        connect_timeout=int(config.get("ldap_connection_timeout") or 5),
+        tls=LDAPSystemTLS(host, config.get("ldap_ca_certificate")) if secure else None,
+    )
+
+
+def close_ldap_connection(connection):
     try:
-        ca_path, temp_path = ldap_ca_certificate_file(config.get("ldap_ca_certificate"))
-        tls = None
-        if config.get("ldap_secure") == "1":
-            tls = Tls(validate=ssl.CERT_REQUIRED, version=ssl.PROTOCOL_TLS_CLIENT, ca_certs_file=ca_path) if ca_path else Tls(validate=ssl.CERT_REQUIRED, version=ssl.PROTOCOL_TLS_CLIENT)
-        server = Server(
-            str(config.get("ldap_server_address") or "").strip(),
-            port=int(config.get("ldap_server_port") or 389),
-            use_ssl=config.get("ldap_secure") == "1",
-            get_info=ALL,
-            connect_timeout=int(config.get("ldap_connection_timeout") or 5),
-            tls=tls,
-        )
-        return server, temp_path
+        connection.unbind()
     except Exception:
-        if temp_path:
+        with suppress(Exception):
+            connection.strategy.close()
+
+
+@contextmanager
+def ldap_directory_connection(config, server=None):
+    if server is None:
+        server = ldap_server_for_config(config)
+    bind_user = str(config.get("ldap_bind_username") or "").strip()
+    connection = Connection(
+        server,
+        user=bind_user or None,
+        password=config.get("ldap_bind_password") if bind_user else None,
+        auto_referrals=False,
+        raise_exceptions=True,
+        receive_timeout=int(config.get("ldap_connection_timeout") or 5),
+    )
+    try:
+        if not connection.bind(read_server_info=False):
+            raise RuntimeError(connection.last_error or "The LDAP server rejected the bind.")
+        yield connection
+    finally:
+        close_ldap_connection(connection)
+
+
+def test_ldap_directory(config):
+    with ldap_directory_connection(config) as connection:
+        connection.search(
+            search_base=config["ldap_base_dn"],
+            search_filter=ldap_search_filter(config, None),
+            search_scope=SUBTREE,
+            attributes=[config["ldap_login_field"]],
+            paged_size=1,
+        )
+        result = connection.result or {}
+        if result.get("result") != 0:
+            description = result.get("description") or "LDAP search failed"
+            detail = result.get("message")
+            raise RuntimeError(f"{description}: {detail}" if detail else description)
+
+
+def identity_disable_prohibited():
+    return truthy(os.getenv("PROHIBIT_IDENTITY_DISABLE"))
+
+
+def ldap_status_attributes(config):
+    return {config[key] for key in ("ldap_disabled_attribute", "ldap_password_expired_attribute") if config.get(key)}
+
+
+def ldap_status_matches(value, rule):
+    values = value if isinstance(value, (list, tuple)) else [value]
+    rule = str(rule or "").strip().lower()
+    if not rule or rule == "none":
+        return False
+    for item in values:
+        if isinstance(item, bytes):
+            item = item.decode("utf-8", errors="replace")
+        if item is None or item == "":
+            continue
+        if rule == "present":
+            return True
+        if rule.startswith("mask:"):
             try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
-        raise
+                if int(item) & int(rule[5:]):
+                    return True
+            except (ValueError, TypeError):
+                continue
+        elif rule == "before-now" or rule.startswith("age:"):
+            try:
+                if isinstance(item, datetime):
+                    stamp = item
+                else:
+                    raw = str(item)
+                    stamp = datetime.strptime(raw, "%Y%m%d%H%M%SZ") if re.fullmatch(r"\d{14}Z", raw) else datetime.fromisoformat(raw)
+                stamp = stamp.replace(tzinfo=timezone.utc) if stamp.tzinfo is None else stamp
+                age = int(rule[4:]) if rule.startswith("age:") else 0
+                if stamp + timedelta(days=age) <= datetime.now(timezone.utc):
+                    return True
+            except (ValueError, OverflowError):
+                continue
+        elif str(item).strip().lower() in {part.strip() for part in rule.split(",")}:
+            return True
+    return False
+
+
+def ldap_account_status(config, attributes):
+    attributes = {key.lower(): value for key, value in attributes.items()}
+    return {
+        "disabled": ldap_status_matches(attributes.get(config.get("ldap_disabled_attribute", "").lower()), config.get("ldap_disabled_rule")),
+        "password_expired": ldap_status_matches(attributes.get(config.get("ldap_password_expired_attribute", "").lower()), config.get("ldap_password_expired_rule")),
+    }
+
+
+def ldap_directory_domain(base_dn):
+    labels = re.findall(r"(?:^|(?<!\\),)\s*dc\s*=\s*([a-z0-9-]+)\s*(?=,|$)", base_dn, re.IGNORECASE)
+    domain = ".".join(labels).lower()
+    return domain if len(domain) <= 90 else ""
+
+
+def ldap_can_change_password(config):
+    return config.get("ldap_enabled") == "1" and config.get("ldap_directory_access") == "read_write" and config.get("ldap_secure") == "1"
+
+
+def change_ldap_password(dn, current_password, new_password, config):
+    if not dn or not current_password or not new_password or not ldap_can_change_password(config):
+        raise IdentityAccessDenied("In-app password changes require an enabled read/write directory over secure LDAP.")
+    with LDAP_DIRECTORY_SYNC_LOCK, LDAP_USER_SYNC_LOCK:
+        current_config = identity_provider_settings()
+        if not ldap_can_change_password(current_config) or any(
+            current_config[key] != config[key]
+            for key in ("ldap_server_address", "ldap_server_port", "ldap_base_dn")
+        ):
+            raise IdentityAccessDenied("Directory settings changed. Sign in again before changing your password.")
+        with ldap_directory_connection(current_config) as connection:
+            connection.search(dn, "(objectClass=*)", BASE, attributes=list(ldap_status_attributes(current_config)) or ["1.1"])
+            if not connection.entries or ldap_account_status(current_config, connection.entries[0].entry_raw_attributes)["disabled"]:
+                raise IdentityAccessDenied("This directory account is unavailable.")
+            user_connection = Connection(
+                connection.server, user=dn, password=current_password, auto_referrals=False,
+                receive_timeout=int(current_config["ldap_connection_timeout"]),
+            )
+            try:
+                writer = user_connection if user_connection.bind(read_server_info=False) else connection
+                # A directory that rejects expired credentials can still verify the old password in the change operation.
+                if current_config["ldap_password_change_method"] == "active_directory":
+                    changed = writer.extend.microsoft.modify_password(dn, new_password, old_password=current_password)
+                else:
+                    changed = writer.extend.standard.modify_password(dn, old_password=current_password, new_password=new_password)
+                if not changed or (writer.result or {}).get("result") != 0:
+                    raise IdentityAccessDenied("The directory rejected the password change. Check your current password and the directory's password rules.")
+            finally:
+                close_ldap_connection(user_connection)
+        execute("UPDATE users SET require_password_change=0 WHERE auth_provider='ldap' AND external_id=%s", (dn,))
 
 
 def ldap_search_filter(config, username):
     template = str(config.get("ldap_user_search_filter") or "({field}={username})")
-    escaped_username = escape_filter_chars(username)
+    escaped_username = "*" if username is None else escape_filter_chars(username)
     field = str(config.get("ldap_login_field") or "uid").strip()
-    return (
-        template.replace("{username}", escaped_username)
-        .replace("{login}", escaped_username)
-        .replace("{field}", field)
-        .replace("{login_field}", field)
-    )
+    template = template.replace("{field}", field).replace("{login_field}", field)
+    search_filter, placeholders = re.subn(r"\{(?:username|login)\}", lambda _: escaped_username, template)
+    if username is not None and not placeholders:
+        return f"(&{search_filter}({field}={escaped_username}))"
+    return search_filter
+
+
+LDAP_DIRECTORY_SYNC_LOCK = threading.Lock()
+LDAP_SYNC_WORKER_LOCK = threading.Lock()
+LDAP_SYNC_WAKE = threading.Event()
+LDAP_SYNC_THREAD = None
+LDAP_SYNC_LAST_FINISHED = None
+LDAP_SYNC_STATUS = None
+
+
+class LDAPSyncInProgress(RuntimeError):
+    pass
+
+
+class LDAPSyncPartialFailure(RuntimeError):
+    def __init__(self, synced, failed, reason):
+        super().__init__(f"Synced {synced} of {synced + failed} matching LDAP users. {failed} failed ({reason}).")
+
+
+def ldap_sync_status():
+    return LDAP_SYNC_STATUS
+
+
+def sync_ldap_directory(source="manual"):
+    global LDAP_SYNC_LAST_FINISHED, LDAP_SYNC_STATUS
+    if not LDAP_DIRECTORY_SYNC_LOCK.acquire(blocking=False):
+        raise LDAPSyncInProgress("An LDAP sync is already running.")
+    try:
+        config = identity_provider_settings()
+        if config["ldap_enabled"] != "1":
+            return 0
+        LDAP_SYNC_STATUS = {"source": source, "state": "running"}
+        try:
+            count = _sync_ldap_directory(config)
+        except LDAPSyncPartialFailure as exc:
+            LDAP_SYNC_STATUS = {"source": source, "state": "failed", "message": str(exc)}
+            raise
+        except Exception as exc:
+            LDAP_SYNC_STATUS = {"source": source, "state": "failed", "message": f"LDAP sync failed ({type(exc).__name__})."}
+            raise
+        else:
+            LDAP_SYNC_STATUS = {"source": source, "state": "complete", "count": count}
+            return count
+        finally:
+            LDAP_SYNC_LAST_FINISHED = time.monotonic()
+            LDAP_SYNC_STATUS = {**LDAP_SYNC_STATUS, "finished_at": datetime.now(timezone.utc).isoformat()}
+    finally:
+        LDAP_DIRECTORY_SYNC_LOCK.release()
+
+
+def _sync_ldap_directory(config):
+    with ldap_directory_connection(config) as connection:
+        login_field = config["ldap_login_field"]
+        display_field = config["ldap_display_name_field"]
+        email_field = config["ldap_email_field"]
+        entries = connection.extend.standard.paged_search(
+            search_base=config["ldap_base_dn"],
+            search_filter=ldap_search_filter(config, None),
+            search_scope=SUBTREE,
+            attributes=list({login_field, display_field, email_field, "memberOf"} | ldap_status_attributes(config)),
+            paged_size=500,
+            generator=False,
+        )
+
+    ensure_identity_access_schema()
+    count = failed = 0
+    reason = ""
+    for entry in entries:
+        if entry.get("type") != "searchResEntry" or not entry.get("dn"):
+            continue
+        attributes = {key.lower(): value for key, value in (entry.get("attributes") or {}).items()}
+        username = identity_claim_value(attributes, login_field.lower())
+        groups = normalize_identity_group_values(attributes.get("memberof") or [])
+        claims = dict(attributes, memberof=groups)
+        try:
+            with LDAP_USER_SYNC_LOCK, identity_transaction():
+                _sync_ldap_user_record(config, {
+                    "dn": entry["dn"],
+                    "username": username,
+                    "display_name": identity_claim_value(attributes, display_field.lower()),
+                    "email": identity_claim_value(attributes, email_field.lower()),
+                    "groups": groups,
+                    "claims": claims,
+                    **ldap_account_status(config, entry.get("raw_attributes") or attributes),
+                })
+        except Exception as exc:
+            failed += 1
+            if not reason:
+                reason = type(exc).__name__
+                if isinstance(exc, pymysql.MySQLError) and exc.args and isinstance(exc.args[0], int):
+                    reason = f"database error {exc.args[0]}"
+            app.logger.exception("LDAP sync could not save one directory account")
+        else:
+            count += 1
+    if failed:
+        raise LDAPSyncPartialFailure(count, failed, reason)
+    return count
+
+
+def ldap_sync_interval(value):
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return None
+    return seconds if 1 <= seconds <= 86400 else None
+
+
+def ldap_sync_loop():
+    with app.app_context():
+        while True:
+            LDAP_SYNC_WAKE.clear()
+            wait_seconds = 60
+            try:
+                config = identity_provider_settings()
+                if config["ldap_enabled"] == "1":
+                    interval = ldap_sync_interval(config["ldap_sync_interval"]) or 60
+                    last_finished = LDAP_SYNC_LAST_FINISHED
+                    remaining = interval - (time.monotonic() - last_finished) if last_finished is not None else 0
+                    if remaining <= 0:
+                        wait_seconds = min(60, interval)
+                        try:
+                            sync_ldap_directory(source="automatic")
+                        except LDAPSyncInProgress:
+                            wait_seconds = 1
+                    else:
+                        wait_seconds = min(60, remaining)
+            except Exception:
+                app.logger.exception("Scheduled LDAP directory sync failed")
+            LDAP_SYNC_WAKE.wait(wait_seconds)
+
+
+def start_ldap_sync_worker():
+    global LDAP_SYNC_THREAD
+    with LDAP_SYNC_WORKER_LOCK:
+        if LDAP_SYNC_THREAD is None or not LDAP_SYNC_THREAD.is_alive():
+            LDAP_SYNC_THREAD = threading.Thread(target=ldap_sync_loop, name="ldap-sync", daemon=True)
+            LDAP_SYNC_THREAD.start()
 
 
 def authenticate_ldap_user(username, password, config):
     if not str(password or ""):
         return {"ok": False, "reason": "invalid"}
-    server = None
-    temp_ca_path = None
-    bind_connection = None
     user_connection = None
     try:
-        server, temp_ca_path = ldap_server_for_config(config)
-        bind_username = str(config.get("ldap_bind_username") or "").strip()
-        bind_password = str(config.get("ldap_bind_password") or "")
-        bind_kwargs = {
-            "server": server,
-            "authentication": SIMPLE,
-            "raise_exceptions": True,
-            "auto_bind": True,
-        }
-        if bind_username:
-            bind_kwargs["user"] = bind_username
-            bind_kwargs["password"] = bind_password
-        bind_connection = Connection(**bind_kwargs)
+        server = ldap_server_for_config(config)
         login_field = str(config.get("ldap_login_field") or "uid").strip() or "uid"
         display_field = str(config.get("ldap_display_name_field") or "cn").strip() or "cn"
         email_field = str(config.get("ldap_email_field") or "mail").strip() or "mail"
-        attributes = list({login_field, display_field, email_field, "memberOf"})
-        search_ok = bind_connection.search(
-            search_base=str(config.get("ldap_base_dn") or "").strip(),
-            search_filter=ldap_search_filter(config, username),
-            search_scope=SUBTREE,
-            attributes=attributes,
-            size_limit=2,
-        )
-        if not search_ok or len(bind_connection.entries) != 1:
-            return {"ok": False, "reason": "invalid"}
-        entry = bind_connection.entries[0]
+        attributes = list({login_field, display_field, email_field, "memberOf"} | ldap_status_attributes(config))
+        with ldap_directory_connection(config, server) as bind_connection:
+            search_ok = bind_connection.search(
+                search_base=str(config.get("ldap_base_dn") or "").strip(),
+                search_filter=ldap_search_filter(config, username),
+                search_scope=SUBTREE,
+                attributes=attributes,
+                size_limit=2,
+            )
+            if not bind_connection.entries:
+                stored_user = query_one(
+                    "SELECT external_id FROM users WHERE auth_provider='ldap' AND (username=%s OR email=%s) LIMIT 1",
+                    (username, username),
+                )
+                dn = str((stored_user or {}).get("external_id") or "")
+                base_dn = str(config["ldap_base_dn"]).strip()
+                if base_dn and dn.lower().endswith("," + base_dn.lower()):
+                    search_ok = bind_connection.search(
+                        search_base=dn,
+                        search_filter=ldap_search_filter(config, None),
+                        search_scope=BASE,
+                        attributes=attributes,
+                    )
+            if not search_ok or len(bind_connection.entries) != 1:
+                return {"ok": False, "reason": "invalid"}
+            entry = bind_connection.entries[0]
         user_dn = str(entry.entry_dn or "").strip()
+        status = ldap_account_status(config, entry.entry_raw_attributes or entry.entry_attributes_as_dict)
+        if not user_dn or status["disabled"]:
+            return {"ok": False, "reason": "denied"}
         user_connection = Connection(
             server,
             user=user_dn,
             password=password,
             authentication=SIMPLE,
-            raise_exceptions=True,
-            auto_bind=True,
+            auto_referrals=False,
+            receive_timeout=int(config.get("ldap_connection_timeout") or 5),
         )
+        if not user_connection.bind():
+            result = user_connection.result or {}
+            expired = status["password_expired"] or (
+                config["ldap_password_change_method"] == "active_directory"
+                and result.get("result") == 49 and re.search(r"\bdata (532|773)\b", result.get("message") or "", re.IGNORECASE)
+            )
+            if expired:
+                return {"ok": False, "reason": "password_expired", "dn": user_dn}
+            return {"ok": False, "reason": "invalid"}
         groups = []
         try:
             member_values = entry.memberOf.values if hasattr(entry, "memberOf") else []
@@ -3615,21 +3636,14 @@ def authenticate_ldap_user(username, password, config):
             "email": email,
             "groups": groups,
             "claims": claims,
+            **status,
         }
-    except Exception as exc:
-        return {"ok": False, "reason": "connection", "error": str(exc)}
+    except Exception:
+        app.logger.exception("LDAP authentication failed")
+        return {"ok": False, "reason": "connection", "error": "Unable to contact the directory."}
     finally:
-        for connection in (user_connection, bind_connection):
-            if connection is not None:
-                try:
-                    connection.unbind()
-                except Exception:
-                    pass
-        if temp_ca_path:
-            try:
-                os.unlink(temp_ca_path)
-            except OSError:
-                pass
+        if user_connection is not None:
+            close_ldap_connection(user_connection)
 
 
 def unusable_password_record():
@@ -3643,24 +3657,43 @@ def ldap_role_value(config, ldap_result):
     return str(ldap_access_profile(config, ldap_result).get("role") or "receiver")
 
 
+LDAP_USER_SYNC_LOCK = threading.Lock()
+
+
 def sync_ldap_user_record(config, ldap_result):
+    with LDAP_USER_SYNC_LOCK:
+        current = identity_provider_settings()
+        if current["ldap_enabled"] != "1" or any(
+            current[key] != config.get(key)
+            for key in ("ldap_server_address", "ldap_server_port", "ldap_base_dn")
+        ):
+            raise IdentityAccessDenied(identity_access_denied_message(config))
+        return _sync_ldap_user_record(current, ldap_result)
+
+
+def _sync_ldap_user_record(config, ldap_result):
     ensure_identity_access_schema()
     external_id = str(ldap_result.get("dn") or "").strip()
-    username = str(ldap_result.get("username") or "").strip() or external_id or "ldap-user"
     email = str(ldap_result.get("email") or "").strip()
+    username = str(ldap_result.get("username") or "").strip() or email or external_id
     display_name = str(ldap_result.get("display_name") or "").strip()
     access_profile = ldap_access_profile(config, ldap_result)
     ldap_groups = "\n".join(ldap_result.get("groups") or [])
-    matched_user = fetch_synced_identity_user("ldap", external_id, username, email)
+    matched_user = fetch_synced_ldap_user(external_id, username)
     role_value = normalize_identity_mapping_role(access_profile.get("role") or "receiver")
     if role_value == "none":
-        if matched_user:
-            delete_provider_managed_user(matched_user.get("id"))
-        raise IdentityAccessDenied(identity_access_denied_message(config))
-    target_username = unique_external_username("ldap", username, email, external_id, matched_user.get("id") if matched_user else None)
+        access_profile = {"role": "receiver"}
+    target_username = unique_external_username(
+        "ldap", username, email, external_id, matched_user.get("id") if matched_user else None,
+        domain=ldap_directory_domain(config.get("ldap_base_dn", "")),
+    )
+    status = {
+        "disabled": role_value == "none" or ldap_result.get("disabled", False),
+        "password_expired": ldap_result.get("password_expired", False),
+    }
     safe_email = unique_external_email(email, matched_user.get("id") if matched_user else None)
     if matched_user:
-        return apply_identity_access_profile_to_user(
+        updated = apply_identity_access_profile_to_user(
             matched_user.get("id"),
             "ldap",
             target_username,
@@ -3669,13 +3702,22 @@ def sync_ldap_user_record(config, ldap_result):
             external_id,
             ldap_groups,
             access_profile,
+            **status,
         )
+        if (
+            (status["disabled"] and not matched_user.get("ldap_account_disabled"))
+            or (status["password_expired"] and not matched_user.get("require_password_change"))
+        ):
+            revoke_all_user_session_records(matched_user["id"])
+            if status["disabled"]:
+                delete_provider_user_api_tokens(matched_user["id"])
+        return updated
     user_id = execute(
         """
         INSERT INTO users (
             username, email, password, salt, role, auth_provider, external_id, display_name, ldap_groups, identity_recipient_groups,
-            userperm, restrict_groups, restrict_messages, restrict_bell_schedules, require_password_change
-        ) VALUES (%s,%s,'','',%s,'ldap',%s,%s,%s,NULL,'',0,0,0,0)
+            userperm, restrict_groups, restrict_messages, restrict_bell_schedules, require_password_change, ldap_account_disabled
+        ) VALUES (%s,%s,'','',%s,'ldap',%s,%s,%s,NULL,'',0,0,0,%s,%s)
         """,
         (
             target_username,
@@ -3684,6 +3726,8 @@ def sync_ldap_user_record(config, ldap_result):
             external_id or None,
             display_name or None,
             ldap_groups or None,
+            int(status["password_expired"]),
+            int(status["disabled"]),
         ),
     )
     return apply_identity_access_profile_to_user(
@@ -3695,6 +3739,7 @@ def sync_ldap_user_record(config, ldap_result):
         external_id,
         ldap_groups,
         access_profile,
+        **status,
     )
 
 
@@ -3737,12 +3782,14 @@ def identity_claim_value(source, claim_name):
     claim = str(claim_name or "").strip()
     if not claim:
         return ""
-    current = source
-    for part in claim.split("."):
-        if isinstance(current, dict) and part in current:
-            current = current.get(part)
-        else:
-            return ""
+    if isinstance(source, dict) and claim in source:
+        current = source[claim]
+    else:
+        current = source
+        for part in claim.split("."):
+            if not isinstance(current, dict) or part not in current:
+                return ""
+            current = current[part]
     if isinstance(current, (list, tuple, set)):
         for item in current:
             text = str(item or "").strip()
@@ -3752,82 +3799,36 @@ def identity_claim_value(source, claim_name):
     return str(current or "").strip()
 
 
-def identity_claim_values(source, claim_name):
-    claim = str(claim_name or "").strip()
-    if not claim:
-        return []
-    current = source
-    for part in claim.split("."):
-        if isinstance(current, dict) and part in current:
-            current = current.get(part)
-        else:
-            return []
-    return normalize_identity_group_values(current)
-
-
-def sync_external_user_record(provider, config, identity_result):
+def match_sso_user(provider, config, identity_result):
     ensure_identity_access_schema()
-    provider = str(provider or "").strip().lower()
-    if provider not in REDIRECT_IDENTITY_PROVIDER_VALUES:
-        return None
-    source = identity_result if isinstance(identity_result, dict) else {}
-    if scim_provider_enabled(provider, config):
-        source = scim_identity_result(provider, config, source)
-    groups = normalize_identity_group_values(source.get("groups") or [])
-    external_id = str(source.get("external_id") or source.get("sub") or source.get("name_id") or "").strip()
-    username = str(source.get("username") or "").strip() or external_id or "external-user"
-    email = str(source.get("email") or "").strip()
-    display_name = str(source.get("display_name") or "").strip() or username or email
-    matched_user = fetch_synced_identity_user(provider, external_id, username, email)
-    if source.get("scim_sync_incomplete") and not groups and matched_user:
-        groups = normalize_identity_group_values(str(matched_user.get("ldap_groups") or "").splitlines())
-    groups_text = identity_groups_text(groups)
-    claims_source = external_identity_claim_source(source)
-    access_profile = identity_access_profile(provider, config, groups, claims_source)
-    role_value = normalize_identity_mapping_role(access_profile.get("role") or "receiver")
-    if role_value == "none":
-        if matched_user:
-            delete_provider_managed_user(matched_user.get("id"))
-        raise IdentityAccessDenied(identity_access_denied_message(config))
-    target_username = unique_external_username(provider, username, email, external_id, matched_user.get("id") if matched_user else None)
-    safe_email = unique_external_email(email, matched_user.get("id") if matched_user else None)
-    if matched_user:
-        return apply_identity_access_profile_to_user(
-            matched_user.get("id"),
-            provider,
-            target_username,
-            safe_email,
-            display_name,
-            external_id,
-            groups_text,
-            access_profile,
+    subject = identity_result["external_id"]
+    username = identity_result["username"]
+    email = identity_result.get("email")
+    user = None
+    if subject:
+        # Preserve existing provider links across upgrades and username changes.
+        user = query_one(
+            identity_user_select_clause() + " WHERE auth_provider=%s AND BINARY external_id=%s LIMIT 1",
+            (provider, subject),
         )
-    user_id = execute(
-        """
-        INSERT INTO users (
-            username, email, password, salt, role, auth_provider, external_id, display_name, identity_recipient_groups,
-            userperm, restrict_groups, restrict_messages, restrict_bell_schedules, require_password_change
-        ) VALUES (%s,%s,'','',%s,%s,%s,%s,NULL,'',0,0,0,0)
-        """,
-        (
-            target_username,
-            safe_email,
-            role_value if role_value in {"admin", "user", "receiver"} else "receiver",
-            provider,
-            external_id or None,
-            display_name or None,
-        ),
-    )
-    return apply_identity_access_profile_to_user(
-        user_id,
-        provider,
-        target_username,
-        safe_email,
-        display_name,
-        external_id,
-        groups_text,
-        access_profile,
-    )
+    if not user and username:
+        user = query_one(
+            identity_user_select_clause()
+            + " WHERE BINARY username=%s AND (auth_provider IN ('local', 'ldap') "
+            "OR (auth_provider=%s AND COALESCE(external_id, '')='')) LIMIT 1",
+            (username, provider),
+        )
+    if email and not (user and user.get("auth_provider") == provider):
+        email_user = query_one(
+            identity_user_select_clause() + " WHERE email=%s AND auth_provider IN ('local', 'ldap') LIMIT 1",
+            (email,),
+        )
+        if user and email_user and user["id"] != email_user["id"]:
+            raise IdentityAccessDenied(identity_access_denied_message(config))
+        user = user or email_user
+    if not user or user_account_is_expired(user):
+        raise IdentityAccessDenied(identity_access_denied_message(config))
+    return user
 
 
 def ldap_identity_exists_for_user(user, config):
@@ -3838,65 +3839,39 @@ def ldap_identity_exists_for_user(user, config):
     username = str((user or {}).get("username") or "").strip()
     if not username and not external_id:
         return False
-    server = None
-    temp_ca_path = None
-    connection = None
     try:
-        server, temp_ca_path = ldap_server_for_config(config)
-        bind_username = str(config.get("ldap_bind_username") or "").strip()
-        bind_password = str(config.get("ldap_bind_password") or "")
-        bind_kwargs = {
-            "server": server,
-            "authentication": SIMPLE,
-            "raise_exceptions": True,
-            "auto_bind": True,
-        }
-        if bind_username:
-            bind_kwargs["user"] = bind_username
-            bind_kwargs["password"] = bind_password
-        connection = Connection(**bind_kwargs)
-        if external_id and BASE is not None:
-            try:
-                if connection.search(
-                    search_base=external_id,
-                    search_filter="(objectClass=*)",
-                    search_scope=BASE,
-                    attributes=["memberOf"],
-                    size_limit=1,
-                ) and connection.entries:
-                    return True
-            except Exception:
-                pass
-        if not username:
-            return False
-        search_ok = connection.search(
-            search_base=str(config.get("ldap_base_dn") or "").strip(),
-            search_filter=ldap_search_filter(config, username),
-            search_scope=SUBTREE,
-            attributes=["memberOf"],
-            size_limit=5,
-        )
-        if not search_ok or not connection.entries:
-            return False
-        if external_id:
-            for entry in connection.entries:
-                if str(entry.entry_dn or "").strip() == external_id:
-                    return True
-            return False
-        return True
+        with ldap_directory_connection(config) as connection:
+            if external_id and BASE is not None:
+                try:
+                    if connection.search(
+                        search_base=external_id,
+                        search_filter="(objectClass=*)",
+                        search_scope=BASE,
+                        attributes=["memberOf"],
+                        size_limit=1,
+                    ) and connection.entries:
+                        return True
+                except Exception:
+                    pass
+            if not username:
+                return False
+            search_ok = connection.search(
+                search_base=str(config.get("ldap_base_dn") or "").strip(),
+                search_filter=ldap_search_filter(config, username),
+                search_scope=SUBTREE,
+                attributes=["memberOf"],
+                size_limit=5,
+            )
+            if not search_ok or not connection.entries:
+                return False
+            if external_id:
+                for entry in connection.entries:
+                    if str(entry.entry_dn or "").strip() == external_id:
+                        return True
+                return False
+            return True
     except Exception:
         return True
-    finally:
-        if connection is not None:
-            try:
-                connection.unbind()
-            except Exception:
-                pass
-        if temp_ca_path:
-            try:
-                os.unlink(temp_ca_path)
-            except OSError:
-                pass
 
 
 def synced_user_still_exists(user, data=None):
@@ -3906,51 +3881,9 @@ def synced_user_still_exists(user, data=None):
 def refresh_synced_identity_user(user, data=None):
     provider = str((user or {}).get("auth_provider") or "").strip().lower()
     config = identity_provider_settings(data)
-    if provider == "ldap":
+    if provider == "ldap" and config["ldap_enabled"] == "1":
         return user if ldap_identity_exists_for_user(user, config) else None
-    if provider in REDIRECT_IDENTITY_PROVIDER_VALUES:
-        return refresh_redirect_identity_user(user, config)
     return user
-
-
-def reconcile_scim_managed_users_once(data=None):
-    config = identity_provider_settings(data)
-    enabled_providers = [provider for provider in REDIRECT_IDENTITY_PROVIDER_VALUES if scim_provider_enabled(provider, config)]
-    if not enabled_providers:
-        return
-    placeholders = ",".join(["%s"] * len(enabled_providers))
-    rows = query_all(
-        f"SELECT id, username, email, auth_provider, external_id, display_name FROM users WHERE auth_provider IN ({placeholders})",
-        tuple(enabled_providers),
-    )
-    for row in rows:
-        refreshed_user = refresh_synced_identity_user(row, config)
-        if refreshed_user is None:
-            delete_provider_managed_user(row.get("id"))
-
-
-def scim_reconcile_loop():
-    while True:
-        try:
-            reconcile_scim_managed_users_once()
-        except Exception:
-            try:
-                app.logger.exception("SCIM reconciliation failed")
-            except Exception:
-                pass
-        time.sleep(SCIM_RECONCILE_INTERVAL_SECONDS)
-
-
-def ensure_scim_reconcile_thread():
-    global SCIM_RECONCILE_THREAD
-    config = identity_provider_settings(settings())
-    if not any(scim_provider_enabled(provider, config) for provider in REDIRECT_IDENTITY_PROVIDER_VALUES):
-        return
-    with SCIM_RECONCILE_LOCK:
-        if SCIM_RECONCILE_THREAD is not None and SCIM_RECONCILE_THREAD.is_alive():
-            return
-        SCIM_RECONCILE_THREAD = threading.Thread(target=scim_reconcile_loop, name="ops-scim-reconcile", daemon=True)
-        SCIM_RECONCILE_THREAD.start()
 
 
 def build_oidc_client(config):
@@ -3973,37 +3906,27 @@ def build_oidc_client(config):
     )
 
 
-def oidc_identity_result(config, token):
-    client = build_oidc_client(config)
-    userinfo = token.get("userinfo") if isinstance(token, dict) else {}
-    if not isinstance(userinfo, dict):
+def oidc_identity_result(config, token, client):
+    claims = token.get("userinfo") or {}
+    subject = identity_claim_value(claims, "sub")
+    if not token.get("id_token") or not subject:
+        raise IdentityAccessDenied(identity_access_denied_message(config))
+    username = identity_claim_value(claims, config["oidc_username_claim"])
+    email_claim = config["oidc_email_claim"]
+    email = identity_claim_value(claims, email_claim) if claims.get("email_verified") is True else ""
+    if (not username or (email_claim and not email)) and client.load_server_metadata().get("userinfo_endpoint"):
         try:
-            userinfo = userinfo.json()
+            userinfo = client.userinfo(token=token)
         except Exception:
-            userinfo = {}
-    if not userinfo:
-        try:
-            response = client.get("userinfo")
-            response.raise_for_status()
-            userinfo = response.json()
-        except Exception:
-            userinfo = {}
-    username = (
-        identity_claim_value(userinfo, config.get("oidc_username_claim"))
-        or identity_claim_value(userinfo, "preferred_username")
-        or identity_claim_value(userinfo, "email")
-        or identity_claim_value(userinfo, "sub")
-    )
-    email = identity_claim_value(userinfo, config.get("oidc_email_claim")) or identity_claim_value(userinfo, "email")
-    display_name = identity_claim_value(userinfo, config.get("oidc_display_name_claim")) or identity_claim_value(userinfo, "name")
-    return {
-        "external_id": identity_claim_value(userinfo, "sub") or username or email,
-        "username": username or email or identity_claim_value(userinfo, "sub"),
-        "email": email,
-        "display_name": display_name or username or email,
-        "groups": identity_claim_values(userinfo, config.get("oidc_groups_claim")),
-        "userinfo": userinfo,
-    }
+            if username:
+                return {"external_id": subject, "username": username, "email": email}
+            raise
+        if identity_claim_value(userinfo, "sub") != subject:
+            raise IdentityAccessDenied(identity_access_denied_message(config))
+        username = username or identity_claim_value(userinfo, config["oidc_username_claim"])
+        if userinfo.get("email_verified") is True:
+            email = email or identity_claim_value(userinfo, email_claim)
+    return {"external_id": subject, "username": username, "email": email}
 
 
 def saml_request_data():
@@ -4064,21 +3987,12 @@ def build_saml_auth(config):
 
 
 def saml_identity_result(config, auth):
-    attributes = auth.get_attributes() or {}
-    username = (
-        identity_claim_value(attributes, config.get("saml_username_attribute"))
-        or str(auth.get_nameid() or "").strip()
-    )
-    email = identity_claim_value(attributes, config.get("saml_email_attribute"))
-    display_name = identity_claim_value(attributes, config.get("saml_display_name_attribute")) or username or email
+    subject = str(auth.get_nameid() or "").strip()
+    attributes = auth.get_attributes()
     return {
-        "external_id": str(auth.get_nameid() or "").strip() or username or email,
-        "username": username or email or str(auth.get_nameid() or "").strip(),
-        "email": email,
-        "display_name": display_name,
-        "groups": identity_claim_values(attributes, config.get("saml_groups_attribute")),
-        "attributes": attributes,
-        "name_id": str(auth.get_nameid() or "").strip(),
+        "external_id": subject,
+        "username": identity_claim_value(attributes, config["saml_username_attribute"]) or subject,
+        "email": identity_claim_value(attributes, config["saml_email_attribute"]) or (subject if auth.get_nameid_format() == "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress" else ""),
     }
 
 
@@ -4104,6 +4018,39 @@ def begin_web_login_session(user, auth_provider="local"):
     session["web_session_touched_at"] = str(now_value)
     session["external_identity_checked_at"] = str(now_value)
     session["full_activity_touched_at"] = str(now_value)
+    remember_accent_cookie(user)
+
+
+def accent_color_key(value):
+    key = str(value or "orange").strip().lower()
+    return key if key in ACCENT_COLORS else "orange"
+
+
+def user_accent_color_key(user):
+    key = accent_color_key((user or {}).get("accent_color"))
+    if "accent_color" in (user or {}):
+        return key
+    row = query_one("SELECT accent_color FROM users WHERE id=%s LIMIT 1", ((user or {}).get("id"),)) or {}
+    return accent_color_key(row.get("accent_color"))
+
+
+def remember_accent_cookie(user_or_accent):
+    if isinstance(user_or_accent, dict):
+        key = user_accent_color_key(user_or_accent)
+    else:
+        key = accent_color_key(user_or_accent)
+
+    @after_this_request
+    def set_accent_cookie(response):
+        response.set_cookie(
+            ACCENT_COLOR_COOKIE,
+            key,
+            max_age=31536000,
+            secure=request.is_secure,
+            httponly=True,
+            samesite="Lax",
+        )
+        return response
 
 
 def post_login_redirect_target(user, auth_provider="local"):
@@ -4127,10 +4074,12 @@ def authenticate_user_credentials(username, password, data=None):
         if ldap_result.get("ok"):
             try:
                 user = sync_ldap_user_record(config, ldap_result)
-                if user:
+                if user and not user_account_is_expired(user):
                     return {"ok": True, "user": user, "provider": "ldap"}
             except IdentityAccessDenied as exc:
                 return {"ok": False, "provider": "ldap", "reason": "denied", "error": str(exc)}
+        if ldap_result.get("reason") == "password_expired":
+            return ldap_result
         if should_try_local_fallback(config, ldap_result):
             user = authenticate_local_user(username, password)
             if user:
@@ -4179,7 +4128,7 @@ def product_context():
     }
 
 
-def ops_sidebar_brand_html(data, product_name):
+def ops_sidebar_brand_html(data, product_name, theme="system"):
     data = data if isinstance(data, dict) else {}
     product_name = "" if product_name is None else str(product_name)
     use_logo = truthy(data.get("use_logo_in_sidebar", "1"))
@@ -4190,7 +4139,13 @@ def ops_sidebar_brand_html(data, product_name):
         demo_badge = '<span class="sidebar-demo-mode"><i class="fa-solid fa-bag-shopping"></i> Demo Mode</span>'
     if not use_logo or not light_logo:
         return f'<div class="sidebar-brand"><div class="sidebar-brand-inner"><span>{h(product_name)}</span>{demo_badge}</div></div>'
-    dark_source = f'<source media="(prefers-color-scheme: dark)" srcset="{h(dark_logo)}">' if dark_logo else ""
+    if theme == "dark" and dark_logo:
+        light_logo = dark_logo
+        dark_source = ""
+    elif theme == "light":
+        dark_source = ""
+    else:
+        dark_source = f'<source media="(prefers-color-scheme: dark)" srcset="{h(dark_logo)}">' if dark_logo else ""
     return (
         '<div class="sidebar-brand sidebar-brand-logo"><div class="sidebar-brand-inner"><picture>'
         f'{dark_source}<img src="{h(light_logo)}" alt="{h(product_name)}">'
@@ -4232,6 +4187,9 @@ def legacy_user_context(user=None):
     product_name = data.get("product_name") or "Open Paging Server"
     display_name = str(user.get("display_name") or "").strip()
     username = display_name or user.get("username") or session.get("username") or "User"
+    theme = str(user.get("theme") or "system").strip().lower()
+    if theme not in {"system", "light", "dark"}:
+        theme = "system"
     return {
         "user": user,
         "role": role,
@@ -4247,7 +4205,7 @@ def legacy_user_context(user=None):
         "product_name": product_name,
         "favicon": data.get("favicon") or "",
         "show_online_docs": data.get("show_online_docs", "1"),
-        "brand_html": ops_sidebar_brand_html(data, product_name),
+        "brand_html": ops_sidebar_brand_html(data, product_name, theme),
     }
 
 
@@ -4351,6 +4309,45 @@ def system_banner_records(ctx):
                 "dismiss_seconds": 3600,
             }
         )
+    identity_config = identity_provider_settings(ctx.get("settings"))
+    identity_setup_incomplete = identity_config.get("identity_setup_complete") != "1"
+    identity_services_unconfigured = (
+        identity_config.get("ldap_enabled") != "1"
+        and configured_identity_provider(identity_config) not in REDIRECT_IDENTITY_PROVIDER_VALUES
+    )
+    identity_reminder_disabled = truthy(
+        (ctx.get("settings") or {}).get(IDENTITY_SETUP_REMINDER_DISABLED_SETTING)
+    )
+    identity_reminder_dismissed = request.cookies.get(IDENTITY_SETUP_REMINDER_COOKIE) == "1"
+    if (
+        ctx.get("is_admin")
+        and identity_setup_incomplete
+        and identity_services_unconfigured
+        and not identity_reminder_disabled
+        and not identity_reminder_dismissed
+    ):
+        csrf = session.setdefault("identity_setup_reminder_csrf", secrets.token_urlsafe(32))
+        product_name = h(ctx.get("product_name") or "Open Paging Server")
+        banners.append(
+            {
+                "key": "identity-setup-reminder",
+                "level": "identity",
+                "icon": "fa-solid fa-user",
+                "message_html": (
+                    "The identity wizard has not yet been completed. "
+                    '<a class="system-banner-message-link" href="/admin/settings/identity?setup=wizard">'
+                    f"Finish it to define how {product_name} will be accessed.</a> "
+                    "Such as user federation and single sign-on."
+                ),
+                "action_html": (
+                    '<a class="system-banner-disable-link" href="#" '
+                    f'data-csrf="{h(csrf)}" onclick="disableIdentitySetupReminder(event, this)">'
+                    "Disable this reminder</a>"
+                ),
+                "dismiss_seconds": IDENTITY_SETUP_REMINDER_DISMISS_SECONDS,
+                "dismiss_cookie": IDENTITY_SETUP_REMINDER_COOKIE,
+            }
+        )
     if ctx.get("is_admin"):
         try:
             conn = db()
@@ -4393,17 +4390,20 @@ def render_system_banners(ctx):
         dismiss_seconds = int(banner.get("dismiss_seconds") or 0)
         key_attr = f' data-banner-key="{h(key)}"' if key else ""
         dismiss_attr = f' data-dismiss-seconds="{dismiss_seconds}"' if dismiss_seconds > 0 else ""
+        dismiss_cookie = str(banner.get("dismiss_cookie") or "").strip()
+        cookie_attr = f' data-dismiss-cookie="{h(dismiss_cookie)}"' if dismiss_cookie else ""
         action_html = str(banner.get("action_html") or "")
+        message_html = str(banner.get("message_html") or h(banner.get("message") or ""))
         close_html = (
             ""
             if banner.get("no_dismiss")
             else '<button type="button" class="system-banner-close" onclick="dismissSystemBanner(this)" aria-label="Dismiss banner"><i class="fa-solid fa-xmark"></i></button>'
         )
         items.append(
-            f"""<div class="system-banner system-banner-{h(banner.get('level') or 'warning')}"{key_attr}{dismiss_attr}>
+            f"""<div class="system-banner system-banner-{h(banner.get('level') or 'warning')}"{key_attr}{dismiss_attr}{cookie_attr}>
     <div class="system-banner-main">
         <span class="system-banner-icon"><i class="{h(banner.get('icon') or 'fa-solid fa-circle-info')}"></i></span>
-        <span class="system-banner-text">{h(banner.get('message') or '')}</span>
+        <span class="system-banner-text">{message_html}</span>
         {action_html}
     </div>
     {close_html}
@@ -4503,6 +4503,52 @@ def legacy_sidebar_html(ctx, active):
     return "\n    ".join(item for item in rendered if item)
 
 
+def resolve_color_scheme_css(css, theme):
+    if theme == "system":
+        return css
+    pattern = re.compile(r"@media\s*([^{}]*\(\s*prefers-color-scheme\s*:\s*dark\s*\)[^{}]*)\{", re.IGNORECASE)
+    position = 0
+    output = []
+    while True:
+        match = pattern.search(css, position)
+        if not match:
+            output.append(css[position:])
+            break
+        output.append(css[position:match.start()])
+        depth = 1
+        cursor = match.end()
+        quote = ""
+        escaped = False
+        while cursor < len(css) and depth:
+            character = css[cursor]
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif quote:
+                if character == quote:
+                    quote = ""
+            elif character in {"'", '"'}:
+                quote = character
+            elif character == "{":
+                depth += 1
+            elif character == "}":
+                depth -= 1
+            cursor += 1
+        if depth:
+            output.append(css[match.start():])
+            break
+        if theme == "dark":
+            remaining_query = re.sub(r"\(\s*prefers-color-scheme\s*:\s*dark\s*\)", "", match.group(1), flags=re.IGNORECASE)
+            remaining_query = re.sub(r"^\s*and\s+|\s+and\s*$", "", remaining_query, flags=re.IGNORECASE).strip()
+            if remaining_query:
+                output.append(f"@media {remaining_query}{{{css[match.end():cursor - 1]}}}")
+            else:
+                output.append(css[match.end():cursor - 1])
+        position = cursor
+    return "".join(output)
+
+
 def legacy_page(title, ctx, active, style, content, extra_script="", extra_after=""):
     favicon_html = '<link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">'
     common_sidebar_style = """
@@ -4523,7 +4569,7 @@ def legacy_page(title, ctx, active, style, content, extra_script="", extra_after
 #ops-page-banners .system-banner[data-banner-key]{display:none}
 #ops-page-banners .system-banner.system-banner-visible{display:flex}
 #ops-page-banners .system-banner + .system-banner{border-top:none}
-#ops-page-banners .system-banner-main{display:flex;align-items:flex-start;gap:10px;min-width:0}
+#ops-page-banners .system-banner-main{display:flex;align-items:flex-start;gap:10px;min-width:0;flex:1 1 auto}
 #ops-page-banners .system-banner-icon{font-size:1em;line-height:1.2;flex:0 0 auto}
 #ops-page-banners .system-banner-text{line-height:1.4;min-width:0;font-size:0.94em;overflow-wrap:anywhere}
 #ops-page-banners .system-banner-close{border:none;background:transparent;color:inherit;padding:2px 4px;cursor:pointer;border-radius:999px;flex:0 0 auto}
@@ -4534,6 +4580,10 @@ def legacy_page(title, ctx, active, style, content, extra_script="", extra_after
 #ops-page-banners .system-banner-action:hover{background:var(--ops-accent-hover)}
 #ops-page-banners .system-banner-warning{background:#FFF8E1;border-color:#F2C94C;color:#8A5A00}
 #ops-page-banners .system-banner-warning-expiration{background:#FFF3E0;border-color:#FB8C00;color:#B85C00}
+#ops-page-banners .system-banner-identity{background:#6F42C1;border-color:#5B34A8;color:#FFF}
+#ops-page-banners .system-banner-identity a{color:#FFF;text-decoration:underline;text-underline-offset:2px}
+#ops-page-banners .system-banner-identity a:hover{color:#FFF;text-decoration-thickness:2px}
+#ops-page-banners .system-banner-disable-link{flex:0 0 auto;margin-left:auto;white-space:nowrap;align-self:center}
 body.has-system-banners #sidebar{top:var(--ops-banner-offset, 0px)!important;height:calc(100vh - var(--ops-banner-offset, 0px))!important}
 body.has-system-banners #mobile-header{top:var(--ops-banner-offset, 0px)!important}
 body.has-system-banners #content{margin-top:var(--ops-banner-offset, 0px)!important;height:calc(100vh - var(--ops-banner-offset, 0px))!important;min-height:calc(100vh - var(--ops-banner-offset, 0px))!important}
@@ -4585,8 +4635,18 @@ document.addEventListener('DOMContentLoaded', function() {{
     )
     desktop_inject = '<script>window.__OPS_DESKTOP_CLIENT__ = true;</script>' if desktop_mode else ''
 
+    user_preferences = ctx.get("user") if isinstance(ctx.get("user"), dict) else {}
+    theme = str(user_preferences.get("theme") or "system").strip().lower()
+    if theme not in {"system", "light", "dark"}:
+        theme = "system"
+    accent_key = str(user_preferences.get("accent_color") or "orange").strip().lower()
+    accent, accent_hover, on_accent = ACCENT_COLORS[accent_color_key(accent_key)]
+    custom_css = str(user_preferences.get("CSS") or "") if str(ctx.get("settings", {}).get("allow_user_custom_css", "1")) == "1" else ""
+    custom_css_json = json.dumps(custom_css).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    page_style = resolve_color_scheme_css(f"{LEGACY_GENERIC_STYLE}\n{style}\n{common_sidebar_style}", theme)
+    color_scheme = "light dark" if theme == "system" else theme
     html_doc = f"""<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="{h(theme)}" style="color-scheme:{h(color_scheme)};--ops-accent:{accent};--ops-accent-hover:{accent_hover};--ops-on-accent:{on_accent}">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -4594,15 +4654,14 @@ document.addEventListener('DOMContentLoaded', function() {{
 {favicon_html}
 <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin />
 <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet" />
-<link href="/assets/sidebar-brand.css" rel="stylesheet" />
+<link href="/assets/sidebar-brand.css?theme={h(theme)}" rel="stylesheet" />
 {desktop_inject}
 <script defer src="/assets/broadcast-sync.js"></script>
 <style>
-{LEGACY_GENERIC_STYLE}
-{style}
-{common_sidebar_style}
+{page_style}
 </style>
-<link rel="stylesheet" href="/assets/theme.css"></head>
+<link rel="stylesheet" href="/assets/theme.css?theme={h(theme)}">
+<script>const opsCustomStyle=document.createElement('style');opsCustomStyle.textContent={custom_css_json};document.head.appendChild(opsCustomStyle);</script></head>
 <body class="{'has-system-banners' if banner_markup else ''}" data-page="{h(active)}">
 {f'<div id="ops-page-banners">{banner_markup}</div>' if banner_markup else ''}
 <script>
@@ -4627,6 +4686,14 @@ function rememberBannerDismissal(key, banner) {{
   if (!key) return;
   try {{
     var seconds = parseInt((banner && banner.getAttribute('data-dismiss-seconds')) || '0', 10);
+    var cookieName = (banner && banner.getAttribute('data-dismiss-cookie')) || '';
+    if (cookieName) {{
+      var cookie = encodeURIComponent(cookieName) + '=1; Path=/; SameSite=Lax';
+      if (!isNaN(seconds) && seconds > 0) cookie += '; Max-Age=' + seconds;
+      if (window.location.protocol === 'https:') cookie += '; Secure';
+      document.cookie = cookie;
+      return;
+    }}
     if (!isNaN(seconds) && seconds > 0) {{
       localStorage.setItem(bannerDismissStorageKey(key), String(Date.now() + (seconds * 1000)));
     }} else {{
@@ -4700,6 +4767,32 @@ function dismissSystemBanner(button) {{
   var container = document.getElementById('ops-system-banners');
   if (container && !container.children.length) container.remove();
   syncSystemBannerOffset();
+}}
+function disableIdentitySetupReminder(event, link) {{
+  if (event) event.preventDefault();
+  if (!link || link.getAttribute('aria-disabled') === 'true') return;
+  link.setAttribute('aria-disabled', 'true');
+  fetch('/admin/settings/identity/reminder/disable', {{
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: {{
+      'Accept': 'application/json',
+      'X-Requested-With': 'XMLHttpRequest',
+      'X-OPS-CSRF': link.getAttribute('data-csrf') || ''
+    }}
+  }}).then(function(response) {{
+    if (!response.ok) throw new Error('Could not disable the reminder.');
+    return response.json();
+  }}).then(function() {{
+    var banner = link.closest('.system-banner');
+    if (banner) banner.remove();
+    var banners = document.getElementById('ops-system-banners');
+    if (banners && !banners.children.length) banners.remove();
+    syncSystemBannerOffset();
+  }}).catch(function(error) {{
+    link.removeAttribute('aria-disabled');
+    window.alert(error.message || 'Could not disable the reminder.');
+  }});
 }}
 document.addEventListener('DOMContentLoaded', function() {{
   var container = document.getElementById('ops-system-banners');
@@ -4782,7 +4875,7 @@ a{color:var(--ops-accent);text-decoration:none}a:hover{text-decoration:underline
 input,select,textarea{box-sizing:border-box;width:100%;padding:10px;border:1px solid #bbb;border-radius:4px;font:inherit;background:#fff;color:#222}textarea{min-height:110px}.button,button{display:inline-flex;align-items:center;gap:8px;border:0;border-radius:4px;background:var(--ops-accent);color:#fff;padding:10px 14px;font:inherit;cursor:pointer;text-decoration:none}.button:hover,button:hover{background:var(--ops-accent-hover);text-decoration:none}.danger{background:#c62828}.danger:hover{background:#b71c1c}.muted{color:#666}.table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid #eee;text-align:left;padding:10px;vertical-align:top}.flash{padding:12px;border-radius:4px;margin-bottom:16px}.success{background:#e8f5e9;color:#1b5e20}.error{background:#ffebee;color:#b71c1c}.tabs{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}.tabs a{padding:10px 14px;background:#f5f5f5;border-radius:5px 5px 0 0}.tabs a.active{background:var(--ops-accent);color:#fff;text-decoration:none}.pill{display:inline-block;padding:4px 8px;border-radius:999px;background:#e3f2fd;color:var(--ops-accent-hover)}
 .md-checkbox-container{display:flex;align-items:center;position:relative;cursor:pointer;font-size:14px;font-weight:500;color:#222;user-select:none;gap:12px}.md-checkbox-container input{position:absolute;opacity:0;cursor:pointer;height:0;width:0}.md-checkmark{position:relative;display:inline-block;flex:0 0 auto;height:20px;width:20px;background:#fff;border:2px solid #5f6368;border-radius:2px;transition:all .2s}.md-checkbox-container:hover input ~ .md-checkmark{border-color:#202124}.md-checkbox-container input:checked ~ .md-checkmark{background:var(--ops-accent);border-color:var(--ops-accent)}.md-checkmark:after{content:"";position:absolute;display:none;left:6px;top:2px;width:4px;height:10px;border:solid #fff;border-width:0 2px 2px 0;transform:rotate(45deg)}.md-checkbox-container input:checked ~ .md-checkmark:after{display:block}
 @media(max-width:767px){.layout{display:block}.sidebar{position:static;width:100%;min-height:auto}.content{margin-left:0;width:100%;padding:16px}.table{display:block;overflow-x:auto}}
-@media(prefers-color-scheme:dark){body,html{background:#121212;color:#e0e0e0}.sidebar{background:#424242}.sidebar a.active,.sidebar a:hover{background:#505050}.card{background:#1e1e1e;border-color:#333;box-shadow:none}.table th,.table td{border-color:#333}input,select,textarea{background:#222;color:#e0e0e0;border-color:#555}h1,h2{color:#90caf9}.muted{color:#bbb}.tabs a{background:#222}.pill{background:#263238;color:#90caf9}.md-checkbox-container{color:#E0E0E0}.md-checkmark{border-color:#9AA0A6;background:#1E1E1E}.md-checkbox-container:hover input ~ .md-checkmark{border-color:#E8EAED}.md-checkbox-container input:checked ~ .md-checkmark{background:#8AB4F8;border-color:#8AB4F8}.md-checkmark:after{border-color:#1E1E1E}}
+@media(prefers-color-scheme:dark){body,html{background:#121212;color:#e0e0e0}.sidebar{background:#424242}.sidebar a.active,.sidebar a:hover{background:#505050}.card{background:#1e1e1e;border-color:#333;box-shadow:none}.table th,.table td{border-color:#333}input,select,textarea{background:#222;color:#e0e0e0;border-color:#555}h1,h2{color:var(--ops-accent)}.muted{color:#bbb}.tabs a{background:#222}.pill{background:rgba(200,101,76,.14);color:var(--ops-accent)}.md-checkbox-container{color:#E0E0E0}.md-checkmark{border-color:#9AA0A6;background:#1E1E1E}.md-checkbox-container:hover input ~ .md-checkmark{border-color:#E8EAED}.md-checkbox-container input:checked ~ .md-checkmark{background:var(--ops-accent);border-color:var(--ops-accent)}.md-checkmark:after{border-color:#1E1E1E}}
 """
 
 LEGACY_GENERIC_STYLE = """
@@ -4842,10 +4935,10 @@ input,select,textarea{ background:#333; border-color:#444; color:#FFF; }
 .md-checkbox-container{color:#E0E0E0;}
 .md-checkmark{border-color:#9AA0A6;background:#1E1E1E;}
 .md-checkbox-container:hover input ~ .md-checkmark{border-color:#E8EAED;}
-.md-checkbox-container input:checked ~ .md-checkmark{background:#8AB4F8;border-color:#8AB4F8;}
+.md-checkbox-container input:checked ~ .md-checkmark{background:var(--ops-accent);border-color:var(--ops-accent);}
 .md-checkmark:after{border-color:#1E1E1E;}
-.button,button{ background:#8AB4F8; color:#10233A; }
-.button:hover,button:hover{ background:#9CC0FA; }
+.button,button{ background:var(--ops-accent); color:#FFFFFF; }
+.button:hover,button:hover{ background:var(--ops-accent-hover); }
 .danger{ background:#CF6679; color:#000; }
 .muted{ color:#AAA; }
 .tabs a{ background:#222; }
@@ -5304,6 +5397,14 @@ def bundled_asset(filename):
         abort(404)
     if not safe_path.is_file():
         abort(404)
+    if filename.endswith(".css") and session.get("user_id") not in (None, ""):
+        user = current_user() or {}
+        theme = str(user.get("theme") or "system").strip().lower()
+        if theme not in {"system", "light", "dark"}:
+            theme = "system"
+        response = Response(resolve_color_scheme_css(safe_path.read_text(encoding="utf-8"), theme), mimetype="text/css")
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
     response = send_from_directory(WEB_STATIC_DIR, filename)
     response.headers["Cache-Control"] = "public, max-age=3600, stale-while-revalidate=86400"
     return response
@@ -5404,8 +5505,8 @@ def login_oidc_callback():
     try:
         client = build_oidc_client(config)
         token = client.authorize_access_token()
-        identity_result = oidc_identity_result(config, token)
-        user = sync_external_user_record("oidc", config, identity_result)
+        identity_result = oidc_identity_result(config, token, client)
+        user = match_sso_user("oidc", config, identity_result)
         if not user:
             raise RuntimeError("Unable to complete OIDC login.")
         clear_sso_failure_state()
@@ -5463,7 +5564,7 @@ def login_saml_callback():
         if auth.get_errors() or not auth.is_authenticated():
             raise RuntimeError("Unable to complete SAML login.")
         identity_result = saml_identity_result(config, auth)
-        user = sync_external_user_record("saml", config, identity_result)
+        user = match_sso_user("saml", config, identity_result)
         if not user:
             raise RuntimeError("Unable to complete SAML login.")
         clear_sso_failure_state()
@@ -5607,6 +5708,8 @@ def bind_desktop_web_session(user, auth_provider="local", session_id=None):
         return False
     record = active_user_session_record(sid, (user or {}).get("id"))
     if not record:
+        return False
+    if record.get("auth_provider") == "chrome_verified_access":
         return False
     was_desktop_client = bool(session.get("desktop_client"))
     now_value = str(time.time())
@@ -5870,6 +5973,8 @@ def desktop_session_login():
         return jsonify(error="Username and password are required."), 400
     result = authenticate_user_credentials(username, password)
     user = result.get("user") if result.get("ok") else None
+    if not user and result.get("reason") == "password_expired":
+        return jsonify(error="Password change required through the web interface."), 403
     if not user:
         return jsonify(error="Invalid username or password."), 401
     if user_requires_password_change(user, result.get("provider")):
@@ -5886,6 +5991,13 @@ def desktop_session_login():
     bind_desktop_web_session(user, auth_provider=auth_provider, session_id=session_id)
     set_desktop_guest_session(False)
     return desktop_session_json(user, session_id=session_id)
+
+
+@alias("/desktop/session/chromeos", methods=["POST"])
+def desktop_session_chromeos():
+    from srv.web.chrome_verified_access import chromeos_session
+
+    return chromeos_session()
 
 
 @alias("/desktop/session/guest", methods=["POST"])
@@ -6317,6 +6429,41 @@ def asset_path(name):
     return path
 
 
+LOGIN_BACKGROUND_IMAGE_EXTENSIONS = {".png", ".jpg", ".bmp"}
+
+
+def login_background_asset_path(value):
+    name = asset_filename(value)
+    if not name or Path(name).suffix.lower() not in LOGIN_BACKGROUND_IMAGE_EXTENSIONS:
+        return None
+    try:
+        path = asset_path(name)
+    except Exception:
+        return None
+    if not path.is_file():
+        return None
+    try:
+        with path.open("rb") as handle:
+            sample = handle.read(16)
+    except OSError:
+        return None
+    suffix = path.suffix.lower()
+    valid = (
+        suffix == ".png" and sample.startswith(b"\x89PNG\r\n\x1a\n")
+        or suffix == ".jpg" and sample.startswith(b"\xff\xd8\xff")
+        or suffix == ".bmp" and sample.startswith(b"BM")
+    )
+    return path if valid else None
+
+
+@app.route("/assets/file/login-background")
+def login_background_asset():
+    path = login_background_asset_path(settings().get("login_background_image"))
+    if path is None:
+        abort(404)
+    return send_file(path, as_attachment=False, conditional=True)
+
+
 @app.route("/assets/", methods=["GET", "POST"])
 @alias("/assets/index", methods=["GET", "POST"])
 def assets():
@@ -6342,6 +6489,63 @@ def manage_broadcasts():
 @alias("/admin/manage-users", methods=["GET", "POST"])
 def manage_users():
     return dispatch_web_page("admin/manage-users")
+
+
+@alias("/login/ldap-password", methods=["GET", "POST"])
+def ldap_expired_password_page():
+    pending = session.get("ldap_password_pending") or {}
+    if not pending or pending["expires"] <= time.time():
+        session.pop("ldap_password_pending", None)
+        return redirect("/login")
+    config = identity_provider_settings()
+    if pending["directory"] != [config["ldap_server_address"], config["ldap_base_dn"]]:
+        session.pop("ldap_password_pending", None)
+        return redirect("/login")
+
+    error = ""
+    can_change = ldap_can_change_password(config)
+    if request.method == "POST" and can_change:
+        if demo_mode_enabled() or not hmac.compare_digest(request.form.get("nonce", ""), pending["nonce"]):
+            abort(403)
+        limited = check_rate_limit("ldap-password", client_ip(), 5, 60)
+        if limited:
+            return limited
+        current = request.form.get("current_password", "")
+        new = request.form.get("new_password", "")
+        if not current or not new or new != request.form.get("confirm_password"):
+            error = "Enter your current password and matching new passwords."
+        else:
+            try:
+                change_ldap_password(pending["dn"], current, new, config)
+            except IdentityAccessDenied as exc:
+                error = str(exc)
+            except Exception:
+                error = "The directory could not update your password."
+            else:
+                session.pop("ldap_password_pending", None)
+                return redirect("/login")
+
+    form = f"""
+        <form method="post">
+            <input type="hidden" name="nonce" value="{h(pending['nonce'])}">
+            <p><label>Current password <input name="current_password" type="password" autocomplete="current-password" required></label></p>
+            <p><label>New password <input name="new_password" type="password" autocomplete="new-password" required></label></p>
+            <p><label>Confirm new password <input name="confirm_password" type="password" autocomplete="new-password" required></label></p>
+            <button type="submit">Change Password</button>
+        </form>
+    """
+    change_url = config["ldap_password_change_url"]
+    guidance = (
+        f'<p><a href="{h(change_url)}">Change your password through your directory provider</a></p>'
+        if urlparse(change_url).scheme in {"http", "https"}
+        else "<p>Contact your directory administrator to change your password.</p>"
+    )
+    return page(
+        "Change Password",
+        f'<div class="card"><h2>Your directory password has expired</h2>'
+        f'<p role="alert">{h(error)}</p>{form if can_change else guidance}'
+        '<p><a href="/login">Back to sign in</a></p></div>',
+    )
 
 
 @alias("/user/settings", methods=["GET", "POST"])
@@ -6443,7 +6647,7 @@ def endpoint_module_settings_configure():
     return dispatch_web_page("admin/endpoint-module-settings-configure")
 
 
-SETTINGS_TABS = "<div class='tabs'><a href='/admin/settings/general'>General</a><a href='/admin/settings/login'>Login</a><a href='/admin/settings/sip'>SIP</a><a href='/admin/settings/branding'>Branding</a><a href='/admin/settings/advanced'>Advanced</a><a href='/admin/settings/about'>About</a></div>"
+SETTINGS_TABS = "<div class='tabs'><a href='/admin/settings/general'>General</a><a href='/admin/settings/login'>Login</a><a href='/admin/settings/identity'>Identity</a><a href='/admin/settings/sip'>SIP</a><a href='/admin/settings/branding'>Branding</a><a href='/admin/settings/advanced'>Advanced</a><a href='/admin/settings/about'>About</a></div>"
 
 
 @alias("/admin/settings/general", methods=["GET", "POST"])
@@ -6454,6 +6658,31 @@ def settings_general():
 @alias("/admin/settings/multicast-gateway", methods=["GET", "POST"])
 def settings_multicast_gateway():
     return dispatch_web_page("admin/settings/multicast-gateway")
+
+
+@alias("/admin/settings/identity", methods=["GET", "POST"])
+def admin_settings_identity():
+    return dispatch_web_page("admin/settings/identity")
+
+
+@alias("/admin/settings/identity/reminder/disable", methods=["POST"])
+def disable_identity_setup_reminder():
+    user = require_admin()
+    if not isinstance(user, dict):
+        return user
+    if demo_mode_enabled():
+        return jsonify(status="error", message="Demo Mode is enabled."), 403
+    expected = str(session.get("identity_setup_reminder_csrf") or "")
+    supplied = str(request.headers.get("X-OPS-CSRF") or "")
+    if not expected or not supplied.isascii() or not hmac.compare_digest(expected, supplied):
+        return jsonify(status="error", message="Reload the page and try again."), 403
+    save_setting(
+        IDENTITY_SETUP_REMINDER_DISABLED_SETTING,
+        "1",
+        "Permanently hide the incomplete identity setup reminder (0/1)",
+    )
+    session.pop("identity_setup_reminder_csrf", None)
+    return jsonify(status="success")
 
 
 @alias("/admin/settings/login", methods=["GET", "POST"])
@@ -6519,6 +6748,19 @@ def read_version():
 @alias("/admin/settings/about")
 def settings_about():
     return dispatch_web_page("admin/settings/about")
+
+
+@alias("/admin/settings/acknowledgments")
+def settings_acknowledgments():
+    user = require_admin()
+    if not isinstance(user, dict):
+        return user
+    if not ACKNOWLEDGMENTS_PATH.is_file():
+        abort(404)
+    return Response(
+        ACKNOWLEDGMENTS_PATH.read_text(encoding="utf-8"),
+        mimetype="text/plain",
+    )
 
 
 @alias("/demo-mode")
@@ -6591,4 +6833,6 @@ def edit_endpoint_redirect():
 
 
 if __name__ == "__main__":
+    ensure_identity_access_schema()
+    start_ldap_sync_worker()
     app.run("0.0.0.0", int(os.getenv("PORT", "8080")))

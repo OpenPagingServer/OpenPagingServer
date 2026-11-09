@@ -457,8 +457,10 @@ class SipLivePageSession(livepaged.LivePageSession):
             self.rtp_keepalive_payload = SILENCE_FRAME
             live_audio_started = True
             self.next_pcm_forward_time = None
-            self.pace_pcm_forwarding = True
-            page_debug(f"run_live_audio_start stream={self.stream_id} keepalive=20ms")
+            # Inbound RTP already has a 20 ms media clock. Pacing it again here
+            # makes even a tiny clock difference accumulate in the UDP socket.
+            self.pace_pcm_forwarding = False
+            page_debug(f"run_live_audio_start stream={self.stream_id} keepalive=20ms input_pacing=rtp")
             super().run()
         finally:
             self.pace_pcm_forwarding = False

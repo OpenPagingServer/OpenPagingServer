@@ -33,7 +33,7 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 #sidebar a.active,#sidebar a:hover{ background-color:#505050; }
 #mobile-header{ background-color:#424242; }
 #content{ background-color:#121212; }
-.back-link { color:#BB86FC; }
+.back-link { color:var(--ops-accent); }
 .muted,.endpoint-id{ color:#BBB; }
 .frame-shell { border-color:#333; background:#1E1E1E; box-shadow:none; }
 .form-frame { background:#1E1E1E; }

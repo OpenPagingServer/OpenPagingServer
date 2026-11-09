@@ -14,6 +14,59 @@ def handle_request():
         return bells_demo_return()
     if request.method == "POST":
         action = request.form.get("action", "save")
+        if action == "duplicate":
+            if not can_create_bell_schedules(user):
+                abort(403)
+            source = schedule_or_404(sid)
+            name = request.form.get("name", "").strip()
+            if not name:
+                return redirect("/bells")
+            conn = db()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO bell_schedules (name, enabled, timezone) VALUES (%s,0,%s)",
+                        (name, source.get("timezone") or "server"),
+                    )
+                    new_schedule_id = cur.lastrowid
+                    cur.execute(
+                        """
+                        INSERT INTO bell_schedule_groups (schedule_id, group_id)
+                        SELECT %s, group_id FROM bell_schedule_groups WHERE schedule_id=%s
+                        """,
+                        (new_schedule_id, sid),
+                    )
+                    cur.execute("SELECT id, name FROM bell_lists WHERE schedule_id=%s ORDER BY id", (sid,))
+                    list_id_map = {}
+                    for source_list in cur.fetchall():
+                        cur.execute(
+                            "INSERT INTO bell_lists (schedule_id, name) VALUES (%s,%s)",
+                            (new_schedule_id, source_list["name"]),
+                        )
+                        new_list_id = cur.lastrowid
+                        list_id_map[int(source_list["id"])] = int(new_list_id)
+                        cur.execute(
+                            """
+                            INSERT INTO bell_events (list_id, fire_time, audio, days_of_week)
+                            SELECT %s, fire_time, audio, days_of_week FROM bell_events WHERE list_id=%s
+                            """,
+                            (new_list_id, source_list["id"]),
+                        )
+                    cur.execute(
+                        "SELECT bell_date, list_id FROM bell_calendar_lists WHERE schedule_id=%s",
+                        (sid,),
+                    )
+                    for calendar_row in cur.fetchall():
+                        source_list_id = int(calendar_row["list_id"])
+                        copied_list_id = list_id_map.get(source_list_id, source_list_id)
+                        cur.execute(
+                            "INSERT INTO bell_calendar_lists (schedule_id, bell_date, list_id) VALUES (%s,%s,%s)",
+                            (new_schedule_id, calendar_row["bell_date"], copied_list_id),
+                        )
+                conn.commit()
+            finally:
+                conn.close()
+            return redirect("/bells/edit?" + urlencode({"id": new_schedule_id}))
         if action == "delete":
             for table in ("bell_schedule_groups", "bell_calendar_lists", "bell_lists"):
                 execute(f"DELETE FROM `{table}` WHERE schedule_id=%s", (sid,))

@@ -9,6 +9,7 @@ import threading
 import time
 import urllib.parse
 import uuid
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -60,6 +61,8 @@ DB_NAME = os.getenv("DB_NAME")
 WS_HOST = os.getenv("LIVEPAGED_WS_HOST", "0.0.0.0")
 WS_PORT = int(os.getenv("LIVEPAGED_WS_PORT", "50010"))
 AUDIO_FRAME_BYTES = 160
+LIVE_PAGE_MAX_BUFFER_FRAMES = 8
+LIVE_PAGE_TARGET_BUFFER_FRAMES = 3
 
 
 def endpoint_stream_prepare_command(stream_id, group_id, targets, internal_codec):
@@ -903,12 +906,20 @@ class WebLivePageSession(LivePageSession):
     def __init__(self, *args, source_codec=INTERNAL_STREAMING_CODEC_PCMU, **kwargs):
         super().__init__(*args, **kwargs)
         self.source_pcm = str(source_codec or "").strip().lower() == INTERNAL_STREAMING_CODEC_PCM
+        self.web_audio_frames = deque()
+        self.web_audio_partial = bytearray()
+        self.web_audio_lock = threading.Lock()
+        self.web_audio_ready = threading.Event()
+        self.web_audio_stop = threading.Event()
+        self.web_audio_thread = None
 
     def start(self):
         return
 
     def begin(self, websocket_conn):
         threading.Thread(target=self.enable_livepage_tracking, daemon=True).start()
+        self.web_audio_thread = threading.Thread(target=self._pace_web_audio, daemon=True)
+        self.web_audio_thread.start()
         if not self.pre_tones:
             self.pre_tone_completed = True
             return
@@ -926,6 +937,13 @@ class WebLivePageSession(LivePageSession):
         threading.Thread(target=run_pre_tones, daemon=True).start()
 
     def finish_page(self):
+        self.web_audio_stop.set()
+        self.web_audio_ready.set()
+        if self.web_audio_thread is not None and self.web_audio_thread.is_alive():
+            self.web_audio_thread.join(timeout=0.25)
+        with self.web_audio_lock:
+            self.web_audio_frames.clear()
+            self.web_audio_partial.clear()
         self.request_end()
         if self.pre_tone_active:
             while self.pre_tone_active and not self.cleaned_up:
@@ -936,10 +954,46 @@ class WebLivePageSession(LivePageSession):
         self.cleanup()
 
     def send_payload(self, payload):
-        if self.source_pcm:
-            self.forward_live_pcm_payload(payload)
-        else:
-            self.forward_live_payload(payload)
+        data = bytes(payload or b"")
+        if not data or self.web_audio_stop.is_set():
+            return
+        frame_size = ENDPOINT_PCM_FRAME_BYTES if self.source_pcm else AUDIO_FRAME_BYTES
+        with self.web_audio_lock:
+            self.web_audio_partial.extend(data)
+            while len(self.web_audio_partial) >= frame_size:
+                self.web_audio_frames.append(bytes(self.web_audio_partial[:frame_size]))
+                del self.web_audio_partial[:frame_size]
+            if len(self.web_audio_frames) > LIVE_PAGE_MAX_BUFFER_FRAMES:
+                drop = len(self.web_audio_frames) - LIVE_PAGE_TARGET_BUFFER_FRAMES
+                for _ in range(drop):
+                    self.web_audio_frames.popleft()
+                page_debug(f"websocket_audio_trim stream={self.stream_id} dropped={drop}")
+        self.web_audio_ready.set()
+
+    def _pace_web_audio(self):
+        next_send = None
+        while not self.web_audio_stop.is_set():
+            self.web_audio_ready.wait(0.1)
+            if self.web_audio_stop.is_set():
+                break
+            with self.web_audio_lock:
+                frame = self.web_audio_frames.popleft() if self.web_audio_frames else None
+                if not self.web_audio_frames:
+                    self.web_audio_ready.clear()
+            if frame is None:
+                next_send = None
+                continue
+            now = time.monotonic()
+            if next_send is None or next_send < now - 0.04:
+                next_send = now
+            wait_for = next_send - now
+            if wait_for > 0 and self.web_audio_stop.wait(wait_for):
+                break
+            if self.source_pcm:
+                self.forward_live_pcm_payload(frame)
+            else:
+                self.forward_live_payload(frame)
+            next_send += 0.02
 
 def recv_until(sock, marker, limit=8192):
     data = b""

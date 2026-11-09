@@ -378,7 +378,7 @@ def render_page(user, message="", error=""):
     .certificate-actions form {{ margin:0; }}
     .md-icon {{ width:22px; height:22px; display:block; fill:currentColor; }}
     .login-settings button.md-icon-button {{ width:40px; height:40px; min-width:40px; padding:8px; border-radius:50%; display:inline-flex; align-items:center; justify-content:center; background:transparent; color:var(--ops-accent); box-shadow:none; }}
-    .login-settings button.md-icon-button:hover {{ background:rgba(25,118,210,.12); }}
+    .login-settings button.md-icon-button:hover {{ background:rgba(200,101,76,.12); }}
     .login-settings button.md-icon-button.certificate-delete {{ background:transparent; color:#D32F2F; }}
     .login-settings button.md-icon-button.certificate-delete:hover {{ background:rgba(211,47,47,.12); }}
     .login-settings button:disabled {{ opacity:.45; cursor:not-allowed; }}
@@ -394,13 +394,13 @@ def render_page(user, message="", error=""):
     .certificate-modal-actions {{ display:flex; gap:10px; justify-content:flex-end; margin-top:18px; flex-wrap:wrap; }}
     .certificate-modal button {{ min-height:40px; border-radius:20px; padding:0 20px; font-weight:500; letter-spacing:.01em; box-shadow:none; }}
     .certificate-modal-actions button {{ background:transparent; color:var(--ops-accent); }}
-    .certificate-modal-actions button:hover {{ background:rgba(25,118,210,.1); }}
+    .certificate-modal-actions button:hover {{ background:rgba(200,101,76,.1); }}
     .certificate-modal-actions button.certificate-delete {{ color:#D32F2F; }}
     .certificate-modal-actions button.certificate-delete:hover {{ background:rgba(211,47,47,.1); }}
     .certificate-modal-actions button[type="submit"],.certificate-modal-actions button#certbotFinishButton,.certificate-modal-actions button#certbotRetryButton {{ background:var(--ops-accent); color:#FFF; }}
     .certificate-choice {{ display:flex; flex-direction:column; gap:10px; margin-top:16px; }}
-    .certificate-choice button.md-choice-button {{ width:100%; min-height:52px; text-align:left; border:1px solid rgba(25,118,210,.35); border-radius:12px; background:rgba(25,118,210,.08); color:var(--ops-accent); }}
-    .certificate-choice button.md-choice-button:hover {{ background:rgba(25,118,210,.15); }}
+    .certificate-choice button.md-choice-button {{ width:100%; min-height:52px; text-align:left; border:1px solid rgba(200,101,76,.35); border-radius:12px; background:rgba(200,101,76,.08); color:var(--ops-accent); }}
+    .certificate-choice button.md-choice-button:hover {{ background:rgba(200,101,76,.15); }}
     .certbot-install-command {{ display:block; padding:14px; border-radius:10px; background:rgba(0,0,0,.06); user-select:all; overflow-wrap:anywhere; }}
     .certbot-hostname-row {{ display:flex; align-items:center; gap:8px; margin-bottom:10px; }}
     .certbot-hostname-row input {{ flex:1; }}
@@ -425,11 +425,11 @@ def render_page(user, message="", error=""):
         .certificate-table th,.certificate-table td {{ border-bottom-color:#333; }}
         .certificate-subject,.certificate-unused,.certificate-renewal {{ color:#999; }}
         .certificate-modal {{ background:#1E1E1E; color:#E0E0E0; }}
-        .certificate-modal a,.certificate-modal a:visited {{ color:#8AB4F8; }}
+        .certificate-modal a,.certificate-modal a:visited {{ color:var(--ops-accent); }}
         .certbot-install-command {{ background:rgba(255,255,255,.07); }}
         .certbot-challenge {{ background:rgba(255,255,255,.05); }}
-        .certificate-choice button.md-choice-button {{ border-color:rgba(138,180,248,.42); background:rgba(138,180,248,.1); color:#8AB4F8; }}
-        .certificate-modal-actions button {{ color:#8AB4F8; }}
+        .certificate-choice button.md-choice-button {{ border-color:rgba(200,101,76,.42); background:rgba(200,101,76,.1); color:var(--ops-accent); }}
+        .certificate-modal-actions button {{ color:var(--ops-accent); }}
         .certificate-notice.success {{ color:#81C784; }}
         .certificate-notice.error {{ color:#EF9A9A; }}
         .certificate-notice.warning {{ color:#FFB74D; }}

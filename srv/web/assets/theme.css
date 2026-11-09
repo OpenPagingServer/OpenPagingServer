@@ -1,15 +1,119 @@
-/* Global accent theming.
-   Light mode: orange accent. Dark mode: original blue accent.
+/* Global orange accent theming for both light and dark modes.
    Consumed via var(--ops-accent) / var(--ops-accent-hover) across the app. */
 :root {
     --ops-accent: #C8654C;
     --ops-accent-hover: #B0553E;
     --ops-on-accent: #FFFFFF;
+    --ops-sidebar-background: #FFFFFF;
+    --ops-sidebar-text: #202124;
+    --ops-sidebar-hover: #F8ECE8;
+    --ops-sidebar-border: #EBC9C0;
+}
+
+/* Keep the light sidebar airy while retaining the orange navigation identity.
+   These shared overrides intentionally follow the page-level legacy styles. */
+#sidebar,
+.sidebar {
+    background: var(--ops-sidebar-background);
+    color: var(--ops-accent);
+    border-right: 1px solid var(--ops-sidebar-border);
+    box-shadow: 2px 0 8px rgba(92, 48, 36, 0.12);
+}
+
+#sidebar a,
+#sidebar .logout-btn,
+#sidebar .login-btn,
+#sidebar .desktop-app-settings-btn,
+.sidebar a,
+.sidebar .brand {
+    background: transparent;
+    color: var(--ops-sidebar-text);
+    border-bottom-color: var(--ops-sidebar-border);
+}
+
+.sidebar .brand {
+    color: var(--ops-accent);
+}
+
+#sidebar a:hover,
+#sidebar .logout-btn:hover,
+#sidebar .login-btn:hover,
+#sidebar .desktop-app-settings-btn:hover,
+.sidebar a:hover {
+    background: var(--ops-sidebar-hover);
+    color: var(--ops-accent-hover);
+}
+
+#sidebar .logout-btn:hover,
+.sidebar .logout:hover {
+    background: #F6D5D1 !important;
+    color: #8C1D18;
+}
+
+#sidebar .logout-btn,
+.sidebar .logout {
+    background: #FCE8E6;
+    color: #B3261E;
+}
+
+#sidebar a.active,
+.sidebar a.active {
+    background: var(--ops-accent);
+    color: var(--ops-on-accent);
+    box-shadow: inset 4px 0 0 var(--ops-accent-hover);
+}
+
+.sidebar-brand {
+    background: var(--ops-sidebar-background);
+    color: var(--ops-accent);
+    border-bottom: 1px solid var(--ops-sidebar-border);
 }
 
 @media (prefers-color-scheme: dark) {
-    :root {
-        --ops-accent: #1976D2;
-        --ops-accent-hover: #1565C0;
+    #sidebar,
+    .sidebar {
+        background: #424242;
+        color: #E0E0E0;
+        border-right-color: transparent;
+        box-shadow: 2px 0 8px rgba(0, 0, 0, 0.2);
+    }
+
+    #sidebar a,
+    #sidebar .desktop-app-settings-btn,
+    .sidebar a,
+    .sidebar .brand {
+        background: transparent;
+        color: #E0E0E0;
+        border-bottom-color: rgba(255, 255, 255, 0.1);
+    }
+
+    #sidebar a:hover,
+    #sidebar .desktop-app-settings-btn:hover,
+    #sidebar a.active,
+    .sidebar a:hover,
+    .sidebar a.active {
+        background: #505050;
+        color: #E0E0E0;
+        box-shadow: none;
+    }
+
+    #sidebar .logout-btn,
+    #sidebar .logout-btn:hover,
+    .sidebar .logout,
+    .sidebar .logout:hover {
+        background: #C62828 !important;
+        color: #FFFFFF;
+    }
+
+    #sidebar .login-btn,
+    #sidebar .login-btn:hover {
+        background: #2E7D32;
+        color: #FFFFFF;
+    }
+
+    .sidebar-brand {
+        background: #303030;
+        color: #FFFFFF;
+        border-bottom-color: rgba(255, 255, 255, 0.1);
     }
 }

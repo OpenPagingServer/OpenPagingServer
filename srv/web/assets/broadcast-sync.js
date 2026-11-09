@@ -14,6 +14,7 @@
     liveBid: "",
     livePaused: false,
     liveQueue: [],
+    livePrimed: false,
     liveCodec: "mulaw",
     liveSampleRate: 8000,
     audioCtx: null,
@@ -95,6 +96,7 @@
     sync.liveCodec = normalized;
     sync.liveSampleRate = rate;
     sync.liveQueue = [];
+    sync.livePrimed = false;
     if (sync.audioNode) {
       try { sync.audioNode.disconnect(); } catch (_e) {}
     }
@@ -110,11 +112,18 @@
     var AudioContextCtor = window.AudioContext || window.webkitAudioContext;
     if (!AudioContextCtor) return;
     sync.audioCtx = new AudioContextCtor({sampleRate: sync.liveSampleRate});
-    var node = sync.audioCtx.createScriptProcessor(1024, 0, 1);
+    // At 8 kHz a 1024-sample callback is 128 ms, which is too coarse for
+    // 20 ms paging frames and makes short tones sound broken up.
+    var callbackSamples = sync.liveSampleRate <= 8000 ? 256 : 1024;
+    var node = sync.audioCtx.createScriptProcessor(callbackSamples, 0, 1);
     node.onaudioprocess = function (event) {
       var output = event.outputBuffer.getChannelData(0);
       output.fill(0);
       if (sync.livePaused || !sync.liveQueue.length) return;
+      if (!sync.livePrimed) {
+        if (sync.liveQueue.length < 3) return;
+        sync.livePrimed = true;
+      }
       var offset = 0;
       while (offset < output.length && sync.liveQueue.length > 0) {
         var frame = sync.liveQueue[0];
@@ -127,6 +136,7 @@
           sync.liveQueue[0] = frame.slice(take);
         }
       }
+      if (!sync.liveQueue.length) sync.livePrimed = false;
     };
     node.connect(sync.audioCtx.destination);
     sync.audioNode = node;
@@ -160,7 +170,7 @@
     if (!sync.audioCtx) return;
     if (sync.audioCtx.state === "suspended") sync.audioCtx.resume().catch(function () {});
     sync.liveQueue.push(decodeLiveFrame(payload));
-    if (sync.liveQueue.length > 120) sync.liveQueue.splice(0, sync.liveQueue.length - 120);
+    if (sync.liveQueue.length > 12) sync.liveQueue.splice(0, sync.liveQueue.length - 5);
   }
 
   function notificationBody(payload) {
@@ -199,6 +209,7 @@
       setLiveFormat(payload.audio_codec, payload.audio_sample_rate);
       sync.liveBid = bid;
       sync.livePaused = false;
+      sync.livePrimed = false;
       tryUnlockAudio();
     }
   }
@@ -229,11 +240,13 @@
       setLiveFormat(message.audio_codec, message.audio_sample_rate);
       sync.liveBid = bid;
       sync.livePaused = false;
+      sync.livePrimed = false;
       tryUnlockAudio();
       return;
     }
     if (command === "end" && sync.liveBid === bid) {
       sync.liveQueue = [];
+      sync.livePrimed = false;
       sync.livePaused = true;
     }
   }
@@ -246,6 +259,7 @@
     }
     if (decoded.type === "E" && sync.liveBid === decoded.bid) {
       sync.liveQueue = [];
+      sync.livePrimed = false;
       sync.livePaused = true;
     }
   }

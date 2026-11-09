@@ -60,7 +60,7 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .empty-state{ background:#FFF; border:1px dashed #DADCE0; border-radius:16px; padding:36px; text-align:center; color:#5F6368; }
 .restricted-note{ background:#E8F0FE; border:1px solid #C6DAFC; border-radius:14px; padding:14px 16px; margin-bottom:16px; color:#174EA6; }
 .restricted-note p{ margin:0; line-height:1.5; }
-.docs-link{ display:inline-flex; align-items:center; gap:8px; margin-top:12px; color:#1A73E8; text-decoration:none; font-weight:500; }
+.docs-link{ display:inline-flex; align-items:center; gap:8px; margin-top:12px; color:var(--ops-accent); text-decoration:none; font-weight:500; }
 .docs-link:hover{ text-decoration:underline; }
 .modal-backdrop{ display:none; position:fixed; inset:0; background:rgba(32,33,36,.55); z-index:2000; align-items:center; justify-content:center; padding:20px; box-sizing:border-box; }
 .modal-backdrop.active{ display:flex; }
@@ -99,11 +99,11 @@ body,html{ background-color:#121212; color:#E8EAED; }
 .menu-link:hover,.menu-action:hover,.menu-button:hover,.modal-close:hover{ background:#333; }
 .file-meta,.muted,.asset-icon,.menu-button,.modal-close{ color:#BBB; }
 .control{ background:#171717; border-color:#444; color:#EEE; }
-.restricted-note{ background:#1B2A42; border-color:#31425E; color:#D2E3FC; }
-.docs-link{ color:#8AB4F8; }
-.button{ background:#BB86FC; color:#000; }
-.button:hover{ background:#A874E8; }
-.button.subtle{ background:transparent; color:#BB86FC; border-color:#BB86FC; }
+.restricted-note{ background:rgba(200,101,76,.14); border-color:rgba(200,101,76,.35); color:#EBC9C0; }
+.docs-link{ color:var(--ops-accent); }
+.button{ background:var(--ops-accent); color:#FFF; }
+.button:hover{ background:var(--ops-accent-hover); }
+.button.subtle{ background:transparent; color:var(--ops-accent); border-color:var(--ops-accent); }
 .button.danger{ background:#CF6679; color:#000; }
 .success{ background:#14351A; border-color:#2E7D32; color:#C8E6C9; }
 .error{ background:#3B1515; border-color:#6D2A2A; color:#FFCDD2; }

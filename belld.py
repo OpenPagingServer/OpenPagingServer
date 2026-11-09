@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import hashlib
 import os
 import socket
 import struct
@@ -13,7 +14,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pymysql
 from dotenv import load_dotenv
-from endpoints import ULAW_TO_LINEAR_TABLE, audio_frames, connect_endpoint_ipc, mix_ulaw_frames
+from endpoints import ULAW_TO_LINEAR_TABLE, audio_frames, connect_endpoint_ipc, resolve_audio_file
+from tts import decode_tts_token, split_audio_entries
 
 from active_broadcast_store import RUNTIME_DIR, mark_active_broadcast_delivery, put_active_broadcast
 from group_features import (
@@ -36,6 +38,8 @@ POLL_INTERVAL = max(0.2, float(os.getenv("BELL_POLL_INTERVAL", "0.5")))
 BELL_OVERLAP_BRIDGE_SECONDS = max(0.0, float(os.getenv("BELL_OVERLAP_BRIDGE_SECONDS", "15")))
 BELL_STARTUP_GRACE_SECONDS = max(1.0, float(os.getenv("BELL_STARTUP_GRACE_SECONDS", "90")))
 BELL_PREBUILD_LEAD_SECONDS = max(5.0, float(os.getenv("BELL_PREBUILD_LEAD_SECONDS", "30")))
+BELL_CLUSTER_MAX_SECONDS = max(30.0, float(os.getenv("BELL_CLUSTER_MAX_SECONDS", "120")))
+BELL_CLUSTER_MAX_EVENTS = max(2, int(os.getenv("BELL_CLUSTER_MAX_EVENTS", "64")))
 BELL_FRAME_RATE = 8000
 BELL_FRAME_BYTES = 160
 BELL_FRAME_SECONDS = BELL_FRAME_BYTES / BELL_FRAME_RATE
@@ -43,6 +47,54 @@ BELL_CLUSTER_DIR = RUNTIME_DIR / "belld-clusters"
 LOG_FILE = BASE_DIR / "belld_debug.log"
 last_seen_by_schedule = {}
 audio_duration_cache = {}
+
+
+def normalize_ulaw_frame(frame):
+    """Return one complete 20 ms mu-law frame."""
+    return bytes(frame or b"")[:BELL_FRAME_BYTES].ljust(BELL_FRAME_BYTES, b"\xff")
+
+
+def mix_bell_frames(frames):
+    """Mix bell frames to PCM without hard-clipping overlapping tones.
+
+    Averaging active sources preserves headroom. Saturating addition made two
+    loud, coincident bells clip for much of the frame, which sounds like static.
+    """
+    decoded = []
+    for frame in frames:
+        if not frame:
+            continue
+        samples = tuple(ULAW_TO_LINEAR_TABLE[value] for value in normalize_ulaw_frame(frame))
+        if any(samples):
+            decoded.append(samples)
+    if not decoded:
+        return (0,) * BELL_FRAME_BYTES
+    source_count = len(decoded)
+    samples = []
+    for index in range(BELL_FRAME_BYTES):
+        total = sum(frame[index] for frame in decoded)
+        samples.append(max(-32768, min(32767, int(round(total / source_count)))))
+    return tuple(samples)
+
+
+def bell_audio_cache_key(audio_value):
+    """Include source-file metadata so replaced tones invalidate caches."""
+    parts = []
+    for entry in split_audio_entries(str(audio_value or "")):
+        token = str(entry or "").strip()
+        if not token or token.startswith("%silence(") or decode_tts_token(token):
+            parts.append((token,))
+            continue
+        file_path = resolve_audio_file(token)
+        if not file_path:
+            parts.append((token, None))
+            continue
+        try:
+            stat = Path(file_path).stat()
+            parts.append((token, str(Path(file_path).resolve()), stat.st_size, stat.st_mtime_ns))
+        except OSError:
+            parts.append((token, str(file_path), None))
+    return tuple(parts)
 
 
 def log(message):
@@ -400,14 +452,15 @@ def bell_audio_duration_seconds(audio_value):
     audio_key = str(audio_value or "").strip()
     if not audio_key:
         return 0.0
-    cached = audio_duration_cache.get(audio_key)
+    cache_key = bell_audio_cache_key(audio_key)
+    cached = audio_duration_cache.get(cache_key)
     if cached is not None:
         return cached
     frame_count = 0
     for _frame in audio_frames(audio_key):
         frame_count += 1
     duration = frame_count * BELL_FRAME_SECONDS
-    audio_duration_cache[audio_key] = duration
+    audio_duration_cache[cache_key] = duration
     return duration
 
 
@@ -422,10 +475,19 @@ def build_bell_cluster(schedule, events, start_index, day_value):
     included = []
     index = start_index
     bridge = timedelta(seconds=BELL_OVERLAP_BRIDGE_SECONDS)
+    cluster_deadline = cluster_start + timedelta(seconds=BELL_CLUSTER_MAX_SECONDS)
     while index < len(events):
         event = events[index]
         event_start = bell_event_start(day_value, event)
         if included and event_start > cluster_end + bridge:
+            break
+        # A run of short tones separated by bridge-sized gaps must not turn
+        # into an unbounded, hours-long WAV. Never split genuinely overlapping
+        # audio; doing that would create competing broadcasts at the receiver.
+        separated = bool(included and event_start > cluster_end)
+        if separated and (
+            len(included) >= BELL_CLUSTER_MAX_EVENTS or event_start >= cluster_deadline
+        ):
             break
         duration = bell_audio_duration_seconds(event.get("audio"))
         event_end = event_start + timedelta(seconds=duration)
@@ -444,6 +506,33 @@ def build_bell_cluster(schedule, events, start_index, day_value):
     }, index - start_index
 
 
+def cluster_audio_fingerprint(cluster):
+    details = []
+    for event in cluster["events"]:
+        details.append(
+            (
+                int(event.get("event_id") or 0),
+                bell_offset_frames((event["start_at"] - cluster["start_at"]).total_seconds()),
+                bell_audio_cache_key(event.get("audio") or ""),
+            )
+        )
+    return hashlib.sha256(repr(details).encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def valid_cluster_audio_file(path, expected_frames):
+    try:
+        with wave.open(str(path), "rb") as handle:
+            return (
+                handle.getnchannels() == 1
+                and handle.getsampwidth() == 2
+                and handle.getframerate() == BELL_FRAME_RATE
+                and handle.getcomptype() == "NONE"
+                and handle.getnframes() == expected_frames * BELL_FRAME_BYTES
+            )
+    except (OSError, EOFError, wave.Error):
+        return False
+
+
 def write_cluster_audio_file(cluster):
     BELL_CLUSTER_DIR.mkdir(parents=True, exist_ok=True)
     event_ids = [str(int(event.get("event_id") or 0)) for event in cluster["events"]]
@@ -452,13 +541,14 @@ def write_cluster_audio_file(cluster):
     path = BELL_CLUSTER_DIR / (
         f"bell-cluster-{cluster['schedule_id']}-"
         f"{cluster['start_at'].strftime('%Y%m%d-%H%M%S')}-"
-        f"{first_event_id}-{last_event_id}.wav"
+        f"{first_event_id}-{last_event_id}-{cluster_audio_fingerprint(cluster)}.wav"
     )
-    try:
-        if path.is_file() and path.stat().st_size > 44:
-            return str(path)
-    except OSError:
-        pass
+    expected_frames = max(
+        1,
+        bell_offset_frames((cluster["end_at"] - cluster["start_at"]).total_seconds()),
+    )
+    if valid_cluster_audio_file(path, expected_frames):
+        return str(path)
     frames_by_index = defaultdict(list)
     max_frame_index = 0
     for event in cluster["events"]:
@@ -478,15 +568,21 @@ def write_cluster_audio_file(cluster):
         max_frame_index,
         bell_offset_frames((cluster["end_at"] - cluster["start_at"]).total_seconds()),
     )
-    temp_path = path.with_name(path.name + ".building")
-    with wave.open(str(temp_path), "wb") as handle:
-        handle.setnchannels(1)
-        handle.setsampwidth(2)
-        handle.setframerate(BELL_FRAME_RATE)
-        for frame_index in range(total_frames):
-            mixed = mix_ulaw_frames(frames_by_index.get(frame_index, []))
-            handle.writeframesraw(struct.pack("<160h", *[ULAW_TO_LINEAR_TABLE[byte] for byte in mixed[:BELL_FRAME_BYTES]]))
-    os.replace(str(temp_path), str(path))
+    temp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.building")
+    try:
+        with wave.open(str(temp_path), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(BELL_FRAME_RATE)
+            for frame_index in range(total_frames):
+                samples = mix_bell_frames(frames_by_index.get(frame_index, []))
+                handle.writeframesraw(struct.pack("<160h", *samples))
+        os.replace(str(temp_path), str(path))
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
     log(f"cluster_audio_built path={path} frames={total_frames}")
     return str(path)
 
@@ -727,6 +823,8 @@ def main():
     log(
         f"belld started poll_interval={POLL_INTERVAL} "
         f"overlap_bridge_seconds={BELL_OVERLAP_BRIDGE_SECONDS} "
+        f"cluster_max_seconds={BELL_CLUSTER_MAX_SECONDS} "
+        f"cluster_max_events={BELL_CLUSTER_MAX_EVENTS} "
         f"startup_grace_seconds={BELL_STARTUP_GRACE_SECONDS}"
     )
     while True:

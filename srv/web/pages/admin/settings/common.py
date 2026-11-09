@@ -43,7 +43,7 @@ strong { font-weight:700; }
 .switch input { opacity: 0; width: 0; height: 0; }
 .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; border-radius: 14px; }
 .slider:before { position: absolute; content: ""; height: 20px; width: 20px; left: -2px; bottom: -3px; background-color: white; transition: .4s; border-radius: 50%; box-shadow: 0 2px 4px rgba(0,0,0,0.2); }
-input:checked + .slider { background-color: #90caf9; }
+input:checked + .slider { background-color:var(--ops-accent); }
 input:checked + .slider:before { transform: translateX(20px); background-color: var(--ops-accent); }
 .login-settings input[type="text"], .login-settings input[type="password"], .login-settings input[type="number"], .login-settings select, .login-settings textarea { width:100%; padding:10px; border-radius:6px; border:1px solid #CCC; font-family:inherit; font-size:14px; box-sizing:border-box; }
 .login-settings textarea { resize:vertical; min-height:80px; }
@@ -76,26 +76,26 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 #mobile-header h2{ color:#FFF; }
 #content{ background-color:#121212; }
 .info-card{ border:1px solid #333; background-color:#1E1E1E; }
-h2,h3,h4{ color:#BB86FC; }
+h2,h3,h4{ color:var(--ops-accent); }
 .info-label { color:#BBB; }
 .info-description { color:#999; }
-.info-description a { color:#BB86FC; }
+.info-description a { color:var(--ops-accent); }
 .info-row { border-bottom:1px solid #333; }
 .tabs-container { border-bottom-color: #333; }
 .tab-link { background: #333; color: #BBB; }
-.tab-link.active { background: #BB86FC; color: #000; }
+.tab-link.active { background:var(--ops-accent); color:#FFF; }
 .tabs-mobile { background: #1E1E1E; color: #E0E0E0; border-color: #444; }
-input:checked + .slider { background-color: #3d2b52; }
-input:checked + .slider:before { background-color: #BB86FC; }
+input:checked + .slider { background-color:rgba(200,101,76,.28); }
+input:checked + .slider:before { background-color:var(--ops-accent); }
 .login-settings input[type="text"], .login-settings input[type="password"], .login-settings input[type="number"], .login-settings select, .login-settings textarea { background:#1E1E1E; border:1px solid #444; color:#E0E0E0; }
 .login-settings input:disabled, .login-settings select:disabled, .login-settings textarea:disabled { background:#2A2A2A; color:#777; }
 .md-checkbox-container { color:#BBB; }
 .md-checkmark { border-color:#9AA0A6; background:#1E1E1E; }
 .md-checkbox-container:hover input ~ .md-checkmark { border-color:#E8EAED; }
-.md-checkbox-container input:checked ~ .md-checkmark { background:#8AB4F8; border-color:#8AB4F8; }
+.md-checkbox-container input:checked ~ .md-checkmark { background:var(--ops-accent); border-color:var(--ops-accent); }
 .md-checkmark:after { border-color:#1E1E1E; }
-.login-settings button { background:#BB86FC; color:#000; }
-.login-settings button:hover { background:#A370F7; }
+.login-settings button { background:var(--ops-accent); color:#FFF; }
+.login-settings button:hover { background:var(--ops-accent-hover); }
 .login-settings p { color: #AAA; }
 .port-error-text { color: #ff5252; }
 .invalid-port { border-color: #ff5252 !important; }
@@ -124,7 +124,7 @@ function postSettings(formId, buttonId, statusId, successText, reloadAfter) {
         .then(response => response.json())
         .then(data => {
             if (data.status === 'success') {
-                status.innerText = successText;
+                status.innerText = data.message || successText;
                 status.style.color = "#4CAF50";
                 if (reloadAfter) setTimeout(() => { location.reload(); }, 1000);
             } else {
@@ -150,6 +150,7 @@ def settings_tabs(active):
     items = [
         ("general", "General", "/admin/settings/general"),
         ("login", "Login", "/admin/settings/login"),
+        ("identity", "Identity", "/admin/settings/identity"),
         ("sip", "SIP", "/admin/settings/sip"),
         ("web", "Web", "/admin/settings/web"),
         ("api", "API", "/admin/settings/api"),

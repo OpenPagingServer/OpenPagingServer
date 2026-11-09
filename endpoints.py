@@ -957,6 +957,8 @@ SIP_OUTPUT_AMD_ACTIONS = {"hangup", "redial"}
 SIP_OUTPUT_NAT_MODES = {"auto", "yes", "no"}
 SIP_OUTPUT_FRAME_BYTES = ENDPOINT_PCM_FRAME_BYTES
 SIP_OUTPUT_SILENCE_FRAME = ENDPOINT_PCM_SILENCE_FRAME
+LIVE_AUDIO_MAX_BUFFER_FRAMES = 12
+LIVE_AUDIO_TARGET_BUFFER_FRAMES = 5
 SIP_AMD_FRAME_MS = 20
 SIP_AMD_LISTEN_SECONDS = 4.5
 SIP_AMD_TIMEOUT_STEP_MS = 250
@@ -1061,7 +1063,6 @@ MULTICAST_RTP_AMP_DEFAULTS = {
     "amp_message": "mute",
 }
 MESSAGE_PRIORITY_ORDER = {"Low": 0, "Normal": 1, "High": 2, "Emergency": 3}
-MULTICAST_DELIVERY_LEAD_SECONDS = max(0.0, float(os.getenv("MULTICAST_DELIVERY_LEAD_SECONDS", "0.3")))
 MULTICAST_GATEWAY_HOST = os.getenv("OPS_MULTICAST_GATEWAY_HOST", "127.0.0.1")
 MULTICAST_GATEWAY_PORT = int(os.getenv("OPS_MULTICAST_GATEWAY_PORT", "8710"))
 HTTP_REQUEST_MODULE = "httprequest"
@@ -5117,6 +5118,14 @@ class SipOutputSession:
                 if len(frame) < SIP_OUTPUT_FRAME_BYTES:
                     frame = frame.ljust(SIP_OUTPUT_FRAME_BYTES, b"\x00")
                 self.live_frames.append(frame)
+            if len(self.live_frames) > LIVE_AUDIO_MAX_BUFFER_FRAMES:
+                drop = len(self.live_frames) - LIVE_AUDIO_TARGET_BUFFER_FRAMES
+                for _ in range(drop):
+                    self.live_frames.popleft()
+                log(
+                    f"siptrunks live audio trim stream={self.stream_id} "
+                    f"dropped_frames={drop}"
+                )
 
     def finish_input_stream(self):
         self.input_finished.set()
@@ -5298,7 +5307,9 @@ class SipOutputSession:
 
     def playback_page_audio(self, call):
         sender = SipRtpSender(call)
-        sender.prime()
+        # A short preroll opens NAT/device jitter buffers without putting a
+        # quarter-second of silence in front of every live page.
+        sender.prime(frame_count=3)
         next_send = time.monotonic()
         while not self.stop_event.is_set():
             if self.input_finished.is_set():
@@ -6373,6 +6384,19 @@ class MulticastRTPSource:
             if self.closed:
                 return
             self.partial_frame.extend(chunk)
+            max_bytes = LIVE_AUDIO_MAX_BUFFER_FRAMES * MULTICAST_RTP_FRAME_SIZE
+            if len(self.partial_frame) > max_bytes:
+                target_bytes = LIVE_AUDIO_TARGET_BUFFER_FRAMES * MULTICAST_RTP_FRAME_SIZE
+                drop_bytes = len(self.partial_frame) - target_bytes
+                # Keep frame boundaries intact so a latency correction cannot
+                # corrupt PCM alignment.
+                drop_bytes -= drop_bytes % MULTICAST_RTP_FRAME_SIZE
+                if drop_bytes > 0:
+                    del self.partial_frame[:drop_bytes]
+                    log(
+                        f"multicast rtp live audio trim dropped_frames="
+                        f"{drop_bytes // MULTICAST_RTP_FRAME_SIZE}"
+                    )
 
     def next_frame(self, discard=False):
         with self.lock:
@@ -9101,8 +9125,8 @@ def normalize_target_entry(target):
 def is_8k_ulaw(file_path):
     try:
         with wave.open(file_path, "rb") as wav_file:
-            n_channels, _sample_width, framerate, _n_frames, compression, _ = wav_file.getparams()
-            return framerate == 8000 and compression == "ULAW" and n_channels == 1
+            n_channels, sample_width, framerate, _n_frames, compression, _ = wav_file.getparams()
+            return framerate == 8000 and sample_width == 1 and compression == "ULAW" and n_channels == 1
     except Exception:
         return False
 
@@ -9159,9 +9183,12 @@ def audio_frames(audio_files_str):
         if not file_path:
             continue
         if is_8k_ulaw(file_path):
-            with open(file_path, "rb") as handle:
+            # Read through the WAV container. Reading the file directly also
+            # streams its RIFF header as audio, which is heard as a burst of
+            # static at the start of otherwise valid 8 kHz mu-law tones.
+            with wave.open(file_path, "rb") as handle:
                 while True:
-                    chunk = handle.read(160)
+                    chunk = handle.readframes(160)
                     if not chunk:
                         break
                     yield chunk.ljust(160, b"\xff")
@@ -10671,8 +10698,6 @@ def deliver_broadcast(stream_id, broadcast_id):
         if has_audio:
             target_map = normalize_targets(targets)
             endpoint_state = None
-            endpoint_wait_deadline = time.perf_counter() + 10.0
-            endpoints_ready = not bool(target_map)
             if target_map:
                 endpoint_state = create_stream_state(stream_id, target_map)
                 dispatch("prepare_audio", stream_id, broadcast_id, targets, metadata)
@@ -10697,14 +10722,24 @@ def deliver_broadcast(stream_id, broadcast_id):
                 if endpoint_state is not None:
                     pop_stream_state(stream_id)
                 return "failed"
+            if endpoint_state is not None:
+                ready = endpoint_state.ready_event.wait(10.0)
+                log(
+                    f"handle_broadcast endpoints_ready stream={stream_id} ready={ready} "
+                    f"ready_modules={sorted(endpoint_state.ready_modules)} "
+                    f"failed_modules={sorted(endpoint_state.failed_modules)} "
+                    f"pending={sorted(endpoint_state.pending_modules)}"
+                )
             recording = None
             try:
                 recording = BroadcastRecordingWriter(broadcast_id)
             except Exception as exc:
                 log(f"broadcast recording start error broadcast={broadcast_id}: {exc}")
             frame_duration = 160 / 8000
-            delivery_lead = MULTICAST_DELIVERY_LEAD_SECONDS
-            next_send_time = time.perf_counter() - delivery_lead
+            # Prerecorded audio must still leave on the same 20 ms media clock
+            # as live audio. Starting the clock in the past used to burst the
+            # first 300 ms into endpoint and browser queues.
+            next_send_time = time.perf_counter()
             stop_check_interval = max(1, int(0.5 / frame_duration))
             frames_since_stop_check = 0
             stopped = False
@@ -10722,7 +10757,6 @@ def deliver_broadcast(stream_id, broadcast_id):
                         except Exception as exc:
                             log(f"receive_audio error in {module_name}: {exc}")
 
-            pending_endpoint_frames = []
             for frame in itertools.chain([first_frame], gen):
                 legacy_frame = endpoint_pcm_to_ulaw(frame) if use_pcm else bytes(frame)
                 if frames_since_stop_check <= 0:
@@ -10748,37 +10782,21 @@ def deliver_broadcast(stream_id, broadcast_id):
                         log(f"desktop broadcast frame error broadcast={broadcast_id}: {exc}")
                         desktop_sock = None
                 if target_map:
-                    if not endpoints_ready:
-                        if endpoint_state.ready_event.is_set() or time.perf_counter() >= endpoint_wait_deadline:
-                            endpoints_ready = True
-                            log(f"handle_broadcast endpoints_ready stream={stream_id} ready={endpoint_state.ready_event.is_set()}")
-                    if endpoints_ready:
-                        if pending_endpoint_frames:
-                            for queued_frame in pending_endpoint_frames:
-                                deliver_endpoint_frame(queued_frame)
-                            pending_endpoint_frames = []
-                        deliver_endpoint_frame(frame)
-                    else:
-                        pending_endpoint_frames.append(frame)
+                    deliver_endpoint_frame(frame)
                 next_send_time += frame_duration
                 sleep_time = next_send_time - time.perf_counter()
                 if sleep_time > 0:
                     time.sleep(sleep_time)
-                elif sleep_time < -0.5:
-                    next_send_time = time.perf_counter() - delivery_lead
+                else:
+                    # Do not catch up after a scheduler/decoder stall by
+                    # emitting several packets back-to-back. A slightly longer
+                    # bell is preferable to burst loss at every receiver.
+                    next_send_time = time.perf_counter()
             try:
                 if desktop_sock is not None:
                     desktop_sock.close()
             except Exception:
                 pass
-            if target_map and pending_endpoint_frames and not stopped:
-                if not endpoints_ready:
-                    remaining = endpoint_wait_deadline - time.perf_counter()
-                    if remaining > 0:
-                        endpoint_state.ready_event.wait(remaining)
-                for queued_frame in pending_endpoint_frames:
-                    deliver_endpoint_frame(queued_frame)
-                pending_endpoint_frames = []
             recording_path = ""
             if recording is not None:
                 try:

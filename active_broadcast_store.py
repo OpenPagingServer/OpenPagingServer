@@ -5,7 +5,7 @@ import os
 import re
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
@@ -16,6 +16,17 @@ DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 LOCK_TIMEOUT_SECONDS = float(os.getenv("ACTIVE_BROADCAST_LOCK_TIMEOUT", "5"))
 REMOVAL_DELIVERY_STATES = {"expired", "cancelled"}
 MESSAGE_EXPIRATION_MESSAGE_ID_RE = re.compile(r"^\d+$")
+IMMEDIATE_BROADCAST_RETENTION_SECONDS = max(
+    1,
+    int(os.getenv("IMMEDIATE_BROADCAST_RETENTION_SECONDS", "3600")),
+)
+
+
+def _message_expiration_is_immediate(value):
+    return any(
+        token.strip().lower() == "0m"
+        for token in str(value or "").strip().split("|")
+    )
 
 
 def _message_expiration_trigger_targets(value):
@@ -83,6 +94,16 @@ def _connect():
             """
         )
         conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS active_broadcast_receipts (
+                broadcast_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                seen_at TEXT NOT NULL,
+                PRIMARY KEY (broadcast_id, user_id)
+            )
+            """
+        )
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_active_broadcasts_pending "
             "ON active_broadcasts (delivery, issued)"
         )
@@ -93,6 +114,10 @@ def _connect():
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_active_broadcasts_template_id "
             "ON active_broadcasts (template_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_active_broadcast_receipts_broadcast_id "
+            "ON active_broadcast_receipts (broadcast_id)"
         )
         yield conn
         conn.commit()
@@ -151,7 +176,7 @@ def _matches_expires_rule(record, template_id):
     return bool(targets["any_message"] or token in targets["message_ids"])
 
 
-def _row_to_record(row):
+def _row_to_record(row, seen_user_ids=None):
     if row is None:
         return None
     payload = row["payload"] if "payload" in row.keys() else ""
@@ -169,7 +194,25 @@ def _row_to_record(row):
     data["delivery"] = row["delivery"]
     data["issued"] = row["issued"]
     data["expires"] = row["expires"]
-    return _normalize_record(data)
+    normalized = _normalize_record(data)
+    normalized["seen_user_ids"] = list(seen_user_ids or [])
+    return normalized
+
+
+def _receipt_user_ids(conn, broadcast_ids):
+    ids = [str(item).strip() for item in (broadcast_ids or []) if str(item).strip()]
+    receipts = {broadcast_id: [] for broadcast_id in ids}
+    if not ids:
+        return receipts
+    placeholders = ", ".join(["?"] * len(ids))
+    rows = conn.execute(
+        "SELECT broadcast_id, user_id FROM active_broadcast_receipts "
+        f"WHERE broadcast_id IN ({placeholders}) ORDER BY seen_at ASC, user_id ASC",
+        ids,
+    ).fetchall()
+    for row in rows:
+        receipts.setdefault(row["broadcast_id"], []).append(row["user_id"])
+    return receipts
 
 
 def _delete_ids(conn, broadcast_ids):
@@ -200,16 +243,32 @@ def _delete_ids(conn, broadcast_ids):
     placeholders = ", ".join(["?"] * len(ids))
     conn.execute(f"DELETE FROM active_broadcasts WHERE id IN ({placeholders})", ids)
     conn.execute(f"DELETE FROM active_broadcast_controls WHERE id IN ({placeholders})", ids)
+    conn.execute(f"DELETE FROM active_broadcast_receipts WHERE broadcast_id IN ({placeholders})", ids)
 
 
 def _prune_expired_records(conn):
-    now_text = datetime.now().strftime(DATE_FORMAT)
+    now = datetime.now()
+    now_text = now.strftime(DATE_FORMAT)
     rows = conn.execute(
         "SELECT id FROM active_broadcasts "
         "WHERE expires IS NOT NULL AND expires <> '' AND expires <= ?",
         (now_text,),
     ).fetchall()
     expired_ids = [row["id"] for row in rows]
+    immediate_cutoff = now - timedelta(seconds=IMMEDIATE_BROADCAST_RETENTION_SECONDS)
+    immediate_rows = conn.execute(
+        "SELECT id, expires_rule, issued FROM active_broadcasts "
+        "WHERE lower(trim(expires_rule)) = '0m'"
+    ).fetchall()
+    for row in immediate_rows:
+        issued = _parse_datetime(row["issued"])
+        if (
+            row["id"] not in expired_ids
+            and _message_expiration_is_immediate(row["expires_rule"])
+            and issued is not None
+            and issued <= immediate_cutoff
+        ):
+            expired_ids.append(row["id"])
     if expired_ids:
         _delete_ids(conn, expired_ids)
     return expired_ids
@@ -255,7 +314,8 @@ def fetch_active_broadcast(broadcast_id):
             "FROM active_broadcasts WHERE id = ? LIMIT 1",
             (wanted,),
         ).fetchone()
-    return _row_to_record(row)
+        seen_user_ids = _receipt_user_ids(conn, [wanted]).get(wanted, [])
+    return _row_to_record(row, seen_user_ids)
 
 
 def list_active_broadcasts(limit=200):
@@ -266,7 +326,91 @@ def list_active_broadcasts(limit=200):
             "FROM active_broadcasts ORDER BY issued DESC LIMIT ?",
             (max(1, int(limit)),),
         ).fetchall()
-    return [_row_to_record(row) for row in rows if row is not None]
+        receipts = _receipt_user_ids(conn, [row["id"] for row in rows])
+    return [
+        _row_to_record(row, receipts.get(row["id"], []))
+        for row in rows
+        if row is not None
+    ]
+
+
+def claim_immediate_broadcast_for_user(broadcast_id, user_id):
+    """Reserve one dashboard delivery for an immediate broadcast and user.
+
+    Non-immediate broadcasts are deliberately unaffected and always return True.
+    A failed dashboard send should release a successful reservation with
+    ``release_immediate_broadcast_for_user``.
+    """
+    wanted = str(broadcast_id or "").strip()
+    user = str(user_id if user_id is not None else "").strip()
+    if not wanted or not user:
+        return False
+    with _connect() as conn:
+        _prune_expired_records(conn)
+        row = conn.execute(
+            "SELECT expires_rule FROM active_broadcasts WHERE id = ? LIMIT 1",
+            (wanted,),
+        ).fetchone()
+        if row is None:
+            return False
+        if not _message_expiration_is_immediate(row["expires_rule"]):
+            return True
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO active_broadcast_receipts "
+            "(broadcast_id, user_id, seen_at) VALUES (?, ?, ?)",
+            (wanted, user, datetime.now().strftime(DATE_FORMAT)),
+        )
+    return cursor.rowcount > 0
+
+
+def mark_immediate_broadcasts_seen(broadcast_ids, user_id):
+    """Mark all existing immediate broadcasts in ``broadcast_ids`` seen by a user."""
+    ids = []
+    for broadcast_id in broadcast_ids or []:
+        token = str(broadcast_id or "").strip()
+        if token and token not in ids:
+            ids.append(token)
+    user = str(user_id if user_id is not None else "").strip()
+    if not ids or not user:
+        return []
+    placeholders = ", ".join(["?"] * len(ids))
+    seen_at = datetime.now().strftime(DATE_FORMAT)
+    marked = []
+    with _connect() as conn:
+        _prune_expired_records(conn)
+        rows = conn.execute(
+            "SELECT id, expires_rule FROM active_broadcasts "
+            f"WHERE id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        immediate_ids = {
+            row["id"]
+            for row in rows
+            if _message_expiration_is_immediate(row["expires_rule"])
+        }
+        for broadcast_id in ids:
+            if broadcast_id not in immediate_ids:
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO active_broadcast_receipts "
+                "(broadcast_id, user_id, seen_at) VALUES (?, ?, ?)",
+                (broadcast_id, user, seen_at),
+            )
+            marked.append(broadcast_id)
+    return marked
+
+
+def release_immediate_broadcast_for_user(broadcast_id, user_id):
+    wanted = str(broadcast_id or "").strip()
+    user = str(user_id if user_id is not None else "").strip()
+    if not wanted or not user:
+        return False
+    with _connect() as conn:
+        cursor = conn.execute(
+            "DELETE FROM active_broadcast_receipts WHERE broadcast_id = ? AND user_id = ?",
+            (wanted, user),
+        )
+    return cursor.rowcount > 0
 
 
 def list_pending_active_broadcast_ids(limit=20, exclude_sender="sendmsgd"):
@@ -318,6 +462,7 @@ def mark_active_broadcast_delivery(broadcast_id, status):
         if state in REMOVAL_DELIVERY_STATES:
             cursor = conn.execute("DELETE FROM active_broadcasts WHERE id = ?", (wanted,))
             conn.execute("DELETE FROM active_broadcast_controls WHERE id = ?", (wanted,))
+            conn.execute("DELETE FROM active_broadcast_receipts WHERE broadcast_id = ?", (wanted,))
         else:
             cursor = conn.execute(
                 "UPDATE active_broadcasts SET delivery = ? WHERE id = ?",

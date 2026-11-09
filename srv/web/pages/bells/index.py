@@ -52,6 +52,10 @@ def handle_request():
     for schedule in schedules:
         enabled = int(schedule.get("enabled") or 0) == 1
         timezone_name = schedule.get("timezone") or "server"
+        duplicate_onclick = "openDemoModePopup('bells')" if demo else f"duplicateSchedule({int(schedule['id'])}, {json.dumps(str(schedule['name'] or ''))})"
+        duplicate_action = ""
+        if can_create_bell_schedules(user):
+            duplicate_action = f'''<button class="btn icon secondary" type="button" onclick="{h(duplicate_onclick)}" title="Duplicate Schedule"><i class="fa-solid fa-copy"></i></button>'''
         rows.append(
             f"""<li class="list-item">
                     <div class="list-main">
@@ -63,6 +67,7 @@ def handle_request():
                         <a class="btn secondary" href="/bells/lists?{h(urlencode({'schedule_id': schedule['id']}))}"><i class="fa-solid fa-bell"></i> Bells</a>
                         <a class="btn secondary" href="/bells/groups?{h(urlencode({'schedule_id': schedule['id']}))}"><i class="fa-solid fa-user-group"></i> Groups</a>
                         <a class="btn icon secondary" href="{"javascript:openDemoModePopup('bells')" if demo else f"/bells/edit?{h(urlencode({'id': schedule['id']}))}"}" title="Edit Schedule"><i class="fa-solid fa-pen-to-square"></i></a>
+                        {duplicate_action}
                     </div>
                 </li>"""
         )
@@ -73,5 +78,19 @@ def handle_request():
     <a class="summary-item" href="/bells/bell-lists" style="text-decoration:none;color:inherit;"><strong>{h(list_count)}</strong><span class="muted">System Bell Lists</span></a>
     <div class="summary-item"><strong>{h(exception_count)}</strong><span class="muted">Calendar Override Days</span></div>
 </div>
-<div class="info-card flush">{schedule_list}</div>"""
+<div class="info-card flush">{schedule_list}</div>
+<form id="duplicate-schedule-form" method="POST" action="/bells/edit" style="display:none;">
+    <input type="hidden" name="action" value="duplicate">
+    <input type="hidden" name="id" id="duplicate-schedule-id" value="">
+    <input type="hidden" name="name" id="duplicate-schedule-name" value="">
+</form>
+<script>
+function duplicateSchedule(id, name) {{
+    const copyName = window.prompt('Name for the duplicated bell schedule:', 'Copy of ' + name);
+    if (copyName === null || !copyName.trim()) return;
+    document.getElementById('duplicate-schedule-id').value = id;
+    document.getElementById('duplicate-schedule-name').value = copyName.trim();
+    document.getElementById('duplicate-schedule-form').submit();
+}}
+</script>"""
     return bells_page("Bells", "Schedules, lists, and calendar exceptions", actions, body, user)

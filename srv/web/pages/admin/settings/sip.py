@@ -375,7 +375,7 @@ def sip_settings_body(ctx, data, detected_external_ipv4, user, unlock_page_token
         background-color:#F3F4F6;
     }}
     .switch.static.checked .slider {{
-        background-color:#90caf9;
+        background-color:var(--ops-accent);
     }}
     .switch.static.checked .slider:before {{
         transform: translateX(20px);
@@ -550,10 +550,10 @@ def sip_settings_body(ctx, data, detected_external_ipv4, user, unlock_page_token
             background-color:#666;
         }}
         .switch.static.checked .slider {{
-            background-color:#3d2b52;
+            background-color:rgba(200,101,76,.28);
         }}
         .switch.static.checked .slider:before {{
-            background-color:#BB86FC;
+            background-color:var(--ops-accent);
         }}
         .sip-security-divider {{
             border-top-color:#333;
@@ -577,11 +577,11 @@ def sip_settings_body(ctx, data, detected_external_ipv4, user, unlock_page_token
             color:#BBB;
         }}
         .sip-sensitive-actions button {{
-            background-color:#90caf9;
-            color:#121212;
+            background-color:var(--ops-accent);
+            color:#FFF;
         }}
         .sip-sensitive-cancel {{
-            color:#90caf9;
+            color:var(--ops-accent);
         }}
         .sip-sensitive-error {{
             color:#ffcdd2;

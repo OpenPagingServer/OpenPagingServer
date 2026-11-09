@@ -51,7 +51,7 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 .md-checkbox-container { color:#BBB; }
 .md-checkmark { border-color:#9AA0A6; background-color:#1E1E1E; }
 .md-checkbox-container:hover input ~ .md-checkmark { border-color:#E8EAED; }
-.md-checkbox-container input:checked ~ .md-checkmark { background-color:#8AB4F8; border-color:#8AB4F8; }
+.md-checkbox-container input:checked ~ .md-checkmark { background-color:var(--ops-accent); border-color:var(--ops-accent); }
 .md-checkmark:after { border-color:#1E1E1E; }
 .md-checkbox-container input:disabled ~ .md-checkmark { border-color:#5F6368; background-color:#3C4043; }
 .md-checkbox-container input:disabled ~ .text { color:#5F6368; }

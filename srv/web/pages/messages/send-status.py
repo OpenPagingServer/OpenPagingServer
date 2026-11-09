@@ -24,9 +24,9 @@ SEND_STATUS_STYLE = r"""
 @media(prefers-color-scheme:dark){
 .status-title{color:#E0E0E0;}
 .status-detail{color:#9E9E9E;}
-.md-spinner circle{stroke:#8AB4F8;}
-.btn-return{background:#8AB4F8;color:#000;}
-.btn-return:hover{background:#AECBFA;}
+.md-spinner circle{stroke:var(--ops-accent);}
+.btn-return{background:var(--ops-accent);color:#FFF;}
+.btn-return:hover{background:var(--ops-accent-hover);}
 .btn-return svg{fill:#000;}
 }
 """

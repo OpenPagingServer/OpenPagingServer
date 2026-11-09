@@ -325,6 +325,16 @@ def handle_request():
                     ok = bool(local_user and _can_use_local_login_record(local_user) and challenge and request.form.get("response") == expected)
                     authed_user = local_user if ok else None
                 _record_login_attempt(ip, username, ok, ua)
+                if auth_mode == "ldap" and result.get("reason") == "password_expired":
+                    config = identity_provider_settings(data)
+                    session.clear()
+                    session["ldap_password_pending"] = {
+                        "dn": result["dn"],
+                        "directory": [config["ldap_server_address"], config["ldap_base_dn"]],
+                        "expires": time.time() + 300,
+                        "nonce": secrets.token_urlsafe(24),
+                    }
+                    return jsonify(success=True, redirect="/login/ldap-password")
                 if ok:
                     clear_sso_failure_state()
                     auth_provider = result.get("provider") if auth_mode == "ldap" else "local"
@@ -346,6 +356,7 @@ def handle_request():
             return _invalid_login_response()
 
     product_name = data.get("product_name") or "Open Paging Server"
+    login_accent, login_accent_hover, login_on_accent = ACCENT_COLORS[accent_color_key(request.cookies.get(ACCENT_COLOR_COOKIE))]
     favicon = data.get("favicon") or ""
     identity_provider = configured_identity_provider(data)
     redirect_provider = identity_provider in REDIRECT_IDENTITY_PROVIDER_VALUES
@@ -364,6 +375,7 @@ def handle_request():
     enable_login_logo = _setting_bool(data, "enable_login_logo")
     login_logo_light = data.get("login_logo_light") or ""
     login_logo_dark = data.get("login_logo_dark") or ""
+    login_background_image = login_background_asset_path(data.get("login_background_image"))
     client_ip = request.remote_addr or ""
     captcha_provider = _captcha_required(data, client_ip) if show_local_login_form else ""
     captcha_site_key = _captcha_site_key(data)
@@ -476,7 +488,7 @@ def handle_request():
         <p id="login-error" class="error">{h(login_error)}</p>"""
 
     body = f"""<!DOCTYPE html>
-<html lang="en">
+<html lang="en" style="--ops-accent:{login_accent};--ops-accent-hover:{login_accent_hover};--ops-on-accent:{login_on_accent}">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -488,6 +500,7 @@ def handle_request():
     <style>
       *, *::before, *::after {{ box-sizing: border-box; }}
       body, html {{ margin: 0; padding: 0; font-family: "Tahoma", sans-serif; height: 100%; width: 100%; position: fixed; display: flex; align-items: center; justify-content: center; background: #e3f2fd; overflow-x: hidden; }}
+      body {{ background-image: {"url('/assets/file/login-background')" if login_background_image else "none"}; background-size: cover; background-position: center; background-repeat: no-repeat; }}
       @keyframes fadeInPage {{ from {{ opacity: 0; }} to {{ opacity: 1; }} }}
       .background-slideshow {{ position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 0; }}
       @media (max-width: 768px) {{ .background-slideshow {{ display: none; }} }}
@@ -504,7 +517,7 @@ def handle_request():
       .login-box {{ background: #fff; padding: 30px; border-radius: 6px; box-shadow: 0 4px 6px rgba(0,0,0,0.1),0 1px 3px rgba(0,0,0,0.08); max-width: 390px; width: min(92vw, 390px); text-align: center; animation: fadeInPage 1.5s ease-in-out; }}
       @media (max-width: 768px) {{ 
         body, html {{ position: static; height: auto; min-height: 100%; display: block; }}
-        body {{ background: #fff; min-height: 100vh; overflow-y: auto; }}
+        body {{ background-color: #fff; min-height: 100vh; overflow-y: auto; }}
         .center-container {{ width: 100%; height: auto; min-height: auto; padding: 0 16px 24px 16px; align-items: center; justify-content: flex-start; }}
         .login-box {{ max-width: 360px; width: 100%; height: auto; border-radius: 6px; padding: 22px; }} 
         .login-banner {{ max-width: 360px; width: 100%; border-radius: 4px; }}
@@ -521,7 +534,7 @@ def handle_request():
       .login-box .basic-captcha-refresh {{ width: 42px; height: 42px; padding: 0; flex: 0 0 42px; border-radius: 4px; font-size: 16px; text-transform: none; }}
       .captcha-answer-field {{ width: 100%; margin-bottom: 0; }}
       .cf-turnstile, .g-recaptcha {{ max-width: 100%; }}
-      .login-box button {{ width: 100%; padding: 12px; background-color: var(--ops-accent); border: none; color: #fff; font-size: 16px; border-radius: 4px; cursor: pointer; font-family: "Roboto", sans-serif; text-transform: uppercase; position: relative; height: 45px; display: inline-flex; align-items: center; justify-content: center; }}
+      .login-box button {{ width: 100%; padding: 12px; background-color: var(--ops-accent); border: none; color: var(--ops-on-accent); font-size: 16px; border-radius: 4px; cursor: pointer; font-family: "Roboto", sans-serif; text-transform: uppercase; position: relative; height: 45px; display: inline-flex; align-items: center; justify-content: center; }}
       .login-box .text-action {{ width: auto; height: auto; padding: 6px 0; margin-top: 10px; background: transparent; color: var(--ops-accent); border-radius: 0; text-transform: none; font-size: 14px; justify-content: center; }}
       .login-box .text-action:hover {{ background: transparent; text-decoration: underline; }}
       .login-box button.loading {{ pointer-events: none; background-color: var(--ops-accent-hover); }}
@@ -547,15 +560,15 @@ def handle_request():
       .maintenance-action-btn.secondary {{ width: auto; min-width: 120px; background: #5f6368; }}
       .maintenance-action-btn.danger {{ background: #c62828; }}
       @media (prefers-color-scheme: dark) {{
-        body, html {{ background: #121212; color: #fff; }}
+        body, html {{ background-color: #121212; color: #fff; }}
         .login-banner {{ background: #3e2723; border: 1px solid #5d4037; color: #ffb74d; }}
         .login-box {{ background: #1e1e1e; box-shadow: 0 4px 6px rgba(0,0,0,0.6); }}
         .login-box h2 {{ color: #fff; }}
         .input-field input {{ color: #fff; border-bottom: 2px solid #555; }}
         .input-field label {{ color: #ccc; }}
         .basic-captcha-row img {{ background: #2a2a2a; border-color: #555; }}
-        .login-box button {{ background-color: #90caf9; color: #121212; }}
-        .login-box .text-action {{ color: #90caf9; }}
+        .login-box button {{ background-color:var(--ops-accent); color:var(--ops-on-accent); }}
+        .login-box .text-action {{ color:var(--ops-accent); }}
         .error {{ color: #ffcdd2; }}
         .sso-error-title {{ color: #ffcdd2; }}
         .sso-error-message {{ color: #bbb; }}
@@ -567,12 +580,12 @@ def handle_request():
         .maintenance-popup-status {{ color: #bbb; }}
         .maintenance-popup-status.success {{ color: #81c784; }}
         .maintenance-popup-status.error {{ color: #ef9a9a; }}
-        .maintenance-action-btn {{ background: #90caf9; color: #121212; }}
+        .maintenance-action-btn {{ background:var(--ops-accent); color:#fff; }}
         .maintenance-action-btn.secondary {{ background: #5f6368; color: #fff; }}
         .maintenance-action-btn.danger {{ background: #ef5350; color: #fff; }}
         {dark_logo_css}
       }}
-      @media (prefers-color-scheme: dark) and (max-width: 768px) {{ body {{ background: #121212; }} }}
+      @media (prefers-color-scheme: dark) and (max-width: 768px) {{ body {{ background-color: #121212; }} }}
       @media (max-width: 768px) {{ .demo-mode-login {{ position: static; transform: none; margin: 16px 0 10px 0; }} }}
       .login-app-settings-btn {{ position: fixed; top: 16px; right: 16px; z-index: 3; display: inline-flex; align-items: center; gap: 8px; width: auto; height: auto; padding: 8px 14px; background: rgba(255,255,255,0.9); color: #444; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; font-family: "Roboto", sans-serif; text-transform: none; cursor: pointer; box-shadow: 0 1px 3px rgba(0,0,0,0.08); transition: background 0.15s ease; }}
       .login-app-settings-btn:hover {{ background: #f0f0f0; }}

@@ -15,7 +15,7 @@ def normalize_days(days):
     selected = [day for day in allowed if day in set(days or [])]
     return ",".join(selected or allowed)
 
-def render_bells_ui(scope_schedule_id, post_path, hidden_fields, demo=False):
+def render_bells_ui(scope_schedule_id, post_path, hidden_fields, demo=False, active_list_id=0):
     lists = query_all("SELECT id, schedule_id, name FROM bell_lists WHERE schedule_id=%s ORDER BY name ASC", (scope_schedule_id,))
     events = {}
     if lists:
@@ -25,7 +25,11 @@ def render_bells_ui(scope_schedule_id, post_path, hidden_fields, demo=False):
             events.setdefault(int(event["list_id"]), []).append(event)
     
     files = audio_files()
-    audio_options = "".join(f'<option value="{h(file)}">{h(file)}</option>' for file in files)
+    preferred_audio = "OPS-Bell1.wav" if "OPS-Bell1.wav" in files else ""
+    audio_options = "".join(
+        f'<option value="{h(file)}"{" selected" if file == preferred_audio else ""}>{h(file)}</option>'
+        for file in files
+    )
     day_mapping = {"0": "Sun", "1": "Mon", "2": "Tue", "3": "Wed", "4": "Thu", "5": "Fri", "6": "Sat"}
     
     def render_day_checks(prefix=""):
@@ -50,6 +54,7 @@ def render_bells_ui(scope_schedule_id, post_path, hidden_fields, demo=False):
             bell_count = len(events.get(list_id, []))
             border = 'border-bottom: 1px solid var(--border, rgba(128,128,128,0.2));' if idx < len(lists) - 1 else ''
             edit_list_onclick = "openDemoModePopup('bells')" if demo else f"openEditList({list_id}, {json.dumps(str(bell_list['name'] or ''))})"
+            duplicate_list_onclick = "openDemoModePopup('bells')" if demo else f"duplicateList({list_id}, {json.dumps(str(bell_list['name'] or ''))})"
             
             main_view += f"""
             <div style="display: flex; justify-content: space-between; align-items: center; padding: 15px 20px; {border}">
@@ -63,6 +68,9 @@ def render_bells_ui(scope_schedule_id, post_path, hidden_fields, demo=False):
                     </button>
                     <button class="btn secondary" type="button" onclick="{h(edit_list_onclick)}" title="Edit List">
                         <i class="fa-solid fa-pen"></i>
+                    </button>
+                    <button class="btn secondary" type="button" onclick="{h(duplicate_list_onclick)}" title="Duplicate List">
+                        <i class="fa-solid fa-copy"></i>
                     </button>
                     <form method="POST" action="{h(post_path)}" onsubmit="{"openDemoModePopup('bells'); return false;" if demo else "return confirm('Delete this list and all its bells?')"}" style="margin: 0;">
                         <input type="hidden" name="action" value="delete_list">{hidden}
@@ -100,6 +108,7 @@ def render_bells_ui(scope_schedule_id, post_path, hidden_fields, demo=False):
                 days_str = h(event.get("days_of_week") or "")
                 border = 'border-bottom: 1px solid var(--border, rgba(128,128,128,0.2));' if idx < len(list_events) - 1 else ''
                 edit_bell_onclick = "openDemoModePopup('bells')" if demo else f"openEditBell({eid}, {json.dumps(str(event['fire_time'] or ''))}, {json.dumps(str(event.get('audio') or ''))}, {json.dumps(str(event.get('days_of_week') or ''))})"
+                duplicate_bell_onclick = "openDemoModePopup('bells')" if demo else f"openDuplicateBell({list_id}, {json.dumps(str(event['fire_time'] or ''))}, {json.dumps(str(event.get('audio') or ''))}, {json.dumps(str(event.get('days_of_week') or ''))})"
                 
                 detail_views += f"""
                 <div style="display: flex; justify-content: space-between; align-items: center; padding: 15px 20px; {border}">
@@ -110,6 +119,9 @@ def render_bells_ui(scope_schedule_id, post_path, hidden_fields, demo=False):
                     <div style="display: flex; gap: 8px;">
                         <button class="btn secondary" type="button" onclick="{h(edit_bell_onclick)}" title="Edit Bell">
                             <i class="fa-solid fa-pen"></i>
+                        </button>
+                        <button class="btn secondary" type="button" onclick="{h(duplicate_bell_onclick)}" title="Duplicate Bell">
+                            <i class="fa-solid fa-copy"></i>
                         </button>
                         <form method="POST" action="{h(post_path)}" onsubmit="{"openDemoModePopup('bells'); return false;" if demo else "return confirm('Delete this bell?')"}" style="margin: 0;">
                             <input type="hidden" name="action" value="delete_event">{hidden}
@@ -144,6 +156,12 @@ def render_bells_ui(scope_schedule_id, post_path, hidden_fields, demo=False):
         </div>
     </div>
 
+    <form id="duplicate-list-form" method="POST" action="{h(post_path)}" style="display:none;">
+        <input type="hidden" name="action" value="duplicate_list">{hidden}
+        <input type="hidden" name="list_id" id="duplicate-list-id" value="">
+        <input type="hidden" name="list_name" id="duplicate-list-name" value="">
+    </form>
+
     <div id="modal-edit-list" class="bell-modal" style="{modal_bg}">
         <div class="card" style="{modal_card}">
             <h3 style="margin-top: 0; margin-bottom: 20px; font-weight: normal;">Edit List</h3>
@@ -164,17 +182,17 @@ def render_bells_ui(scope_schedule_id, post_path, hidden_fields, demo=False):
 
     <div id="modal-add-bell" class="bell-modal" style="{modal_bg}">
         <div class="card" style="{modal_card}">
-            <h3 style="margin-top: 0; margin-bottom: 20px; font-weight: normal;">Add Bell</h3>
+            <h3 id="add-bell-title" style="margin-top: 0; margin-bottom: 20px; font-weight: normal;">Add Bell</h3>
             <form method="POST" action="{h(post_path)}">
                 <input type="hidden" name="action" value="add_event">{hidden}
                 <input type="hidden" name="list_id" id="add-bell-list-id" value="">
                 <div style="margin-bottom: 15px;">
                     <label>Time</label>
-                    <input type="time" name="fire_time" step="1" required style="{input_style}">
+                    <input type="time" name="fire_time" id="add-bell-time" step="1" required style="{input_style}">
                 </div>
                 <div style="margin-bottom: 15px;">
                     <label>Audio</label>
-                    <select name="audio_files" required style="{input_style}">{audio_options}</select>
+                    <select name="audio_files" id="add-bell-audio" required style="{input_style}">{audio_options}</select>
                 </div>
                 <div style="margin-bottom: 25px;">
                     <label style="display: block; margin-bottom: 8px;">Days</label>
@@ -217,6 +235,7 @@ def render_bells_ui(scope_schedule_id, post_path, hidden_fields, demo=False):
     
     script = """
     <script>
+        const defaultBellAudio = %s;
         function openModal(id) {
             document.getElementById(id).style.display = 'flex';
         }
@@ -237,9 +256,32 @@ def render_bells_ui(scope_schedule_id, post_path, hidden_fields, demo=False):
             document.getElementById('edit-list-name').value = name;
             openModal('modal-edit-list');
         }
-        function openAddBell(listId) {
+        function duplicateList(id, name) {
+            const copyName = window.prompt('Name for the duplicated bell list:', 'Copy of ' + name);
+            if (copyName === null || !copyName.trim()) return;
+            document.getElementById('duplicate-list-id').value = id;
+            document.getElementById('duplicate-list-name').value = copyName.trim();
+            document.getElementById('duplicate-list-form').submit();
+        }
+        function setAddBellDays(days) {
+            const selectedDays = days ? days.split(',') : [];
+            for (let i = 0; i <= 6; i++) {
+                const checkbox = document.getElementById('add_day_' + i);
+                if (checkbox) checkbox.checked = selectedDays.includes(i.toString());
+            }
+        }
+        function openAddBell(listId, time, audio, days, duplicate) {
             document.getElementById('add-bell-list-id').value = listId;
+            document.getElementById('add-bell-title').textContent = duplicate ? 'Duplicate Bell' : 'Add Bell';
+            document.getElementById('add-bell-time').value = time || '';
+            const audioSelect = document.getElementById('add-bell-audio');
+            audioSelect.value = audio || defaultBellAudio;
+            if (!audioSelect.value && audioSelect.options.length) audioSelect.selectedIndex = 0;
+            setAddBellDays(days || '0,1,2,3,4,5,6');
             openModal('modal-add-bell');
+        }
+        function openDuplicateBell(listId, time, audio, days) {
+            openAddBell(listId, time, audio, days, true);
         }
         function openEditBell(id, time, audio, days) {
             document.getElementById('edit-bell-id').value = id;
@@ -261,8 +303,12 @@ def render_bells_ui(scope_schedule_id, post_path, hidden_fields, demo=False):
                 }
             });
         });
+        const initialListId = %s;
+        if (initialListId && document.getElementById('detail-view-' + initialListId)) {
+            showDetail(initialListId);
+        }
     </script>
-    """
+    """ % (json.dumps(preferred_audio), int(active_list_id or 0))
     
     return main_view + detail_views + modals + script
 
@@ -280,6 +326,37 @@ def handle_list_post(scope_schedule_id):
         list_id = request.form.get("list_id")
         if name and list_id:
             execute("UPDATE bell_lists SET name=%s WHERE id=%s AND schedule_id=%s", (name, list_id, scope_schedule_id))
+    elif action == "duplicate_list":
+        name = request.form.get("list_name", "").strip()
+        source_list_id = int(request.form.get("list_id", "0") or 0)
+        if name and source_list_id:
+            conn = db()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id FROM bell_lists WHERE id=%s AND schedule_id=%s FOR UPDATE",
+                        (source_list_id, scope_schedule_id),
+                    )
+                    if cur.fetchone():
+                        cur.execute(
+                            "INSERT INTO bell_lists (schedule_id, name) VALUES (%s,%s)",
+                            (scope_schedule_id, name),
+                        )
+                        new_list_id = cur.lastrowid
+                        cur.execute(
+                            """
+                            INSERT INTO bell_events (list_id, fire_time, audio, days_of_week)
+                            SELECT %s, fire_time, audio, days_of_week
+                            FROM bell_events
+                            WHERE list_id=%s
+                            """,
+                            (new_list_id, source_list_id),
+                        )
+                        conn.commit()
+                        return int(new_list_id)
+                conn.rollback()
+            finally:
+                conn.close()
     elif action == "add_event":
         list_id = int(request.form.get("list_id", "0") or 0)
         time_value = request.form.get("fire_time", "").strip()
@@ -291,17 +368,32 @@ def handle_list_post(scope_schedule_id):
             row = query_one("SELECT COUNT(*) AS total FROM bell_lists WHERE id=%s AND schedule_id=%s", (list_id, scope_schedule_id))
             if int((row or {}).get("total") or 0) > 0:
                 execute("INSERT INTO bell_events (list_id, fire_time, audio, days_of_week) VALUES (%s,%s,%s,%s)", (list_id, time_value, audio_value, days))
+                return list_id
     elif action == "edit_event":
         event_id = request.form.get("event_id")
         time_value = request.form.get("fire_time", "").strip()
         audio_value = request.form.get("audio_files", "").strip()
         days = normalize_days(request.form.getlist("days_of_week"))
         if re.fullmatch(r"\d{2}:\d{2}(:\d{2})?", time_value) and audio_value and event_id:
+            event = query_one(
+                "SELECT e.list_id FROM bell_events e JOIN bell_lists l ON l.id=e.list_id WHERE e.id=%s AND l.schedule_id=%s",
+                (event_id, scope_schedule_id),
+            )
+            if not event:
+                return None
             if len(time_value) == 5:
                 time_value += ":00"
             execute("UPDATE bell_events e JOIN bell_lists l ON l.id=e.list_id SET e.fire_time=%s, e.audio=%s, e.days_of_week=%s WHERE e.id=%s AND l.schedule_id=%s", (time_value, audio_value, days, event_id, scope_schedule_id))
+            return int(event["list_id"])
     elif action == "delete_event":
-        execute("DELETE e FROM bell_events e JOIN bell_lists l ON l.id=e.list_id WHERE e.id=%s AND l.schedule_id=%s", (request.form.get("event_id"), scope_schedule_id))
+        event_id = request.form.get("event_id")
+        event = query_one(
+            "SELECT e.list_id FROM bell_events e JOIN bell_lists l ON l.id=e.list_id WHERE e.id=%s AND l.schedule_id=%s",
+            (event_id, scope_schedule_id),
+        )
+        if event:
+            execute("DELETE e FROM bell_events e JOIN bell_lists l ON l.id=e.list_id WHERE e.id=%s AND l.schedule_id=%s", (event_id, scope_schedule_id))
+            return int(event["list_id"])
 
 def handle_request():
     user = require_non_receiver()
@@ -314,18 +406,13 @@ def handle_request():
         if demo and request.method == "POST":
             return bells_demo_return()
         if request.method == "POST":
-            handle_list_post(0)
-            return redirect("/bells/bell-lists")
-        system_event_count = query_one(
-            """
-            SELECT COUNT(*) AS total
-            FROM bell_events e
-            JOIN bell_lists l ON l.id = e.list_id
-            WHERE l.schedule_id = 0
-            """
-        ) or {}
-        body = f"""
-        """
+            active_list_id = handle_list_post(0)
+            target = "/bells/bell-lists"
+            if active_list_id:
+                target += "?" + urlencode({"list_id": active_list_id})
+            return redirect(target)
+        active_list_id = int(request.args.get("list_id", "0") or 0)
+        body = render_bells_ui(0, "/bells/bell-lists", {}, demo, active_list_id)
         return bells_page("System Bell Lists", "", '<a class="btn secondary" href="/bells"><i class="fa-solid fa-arrow-left"></i> Back</a>', body, user)
         
     sid = int(request.values.get("schedule_id", "0") or 0)
@@ -333,8 +420,11 @@ def handle_request():
     if demo and request.method == "POST":
         return bells_demo_return()
     if request.method == "POST":
-        handle_list_post(sid)
-        return redirect("/bells/lists?" + urlencode({"schedule_id": sid}))
+        active_list_id = handle_list_post(sid)
+        redirect_values = {"schedule_id": sid}
+        if active_list_id:
+            redirect_values["list_id"] = active_list_id
+        return redirect("/bells/lists?" + urlencode(redirect_values))
         
     counts = query_one(
         """
@@ -347,6 +437,6 @@ def handle_request():
     
     body = f"""
     {schedule_settings_card(schedule, "bells")}
-    {render_bells_ui(sid, "/bells/lists", {"schedule_id": sid}, demo)}
+    {render_bells_ui(sid, "/bells/lists", {"schedule_id": sid}, demo, int(request.args.get("list_id", "0") or 0))}
     """
     return bells_page("Bell Lists", schedule["name"], '<a class="btn secondary" href="/bells"><i class="fa-solid fa-arrow-left"></i> Back</a>', body, user)

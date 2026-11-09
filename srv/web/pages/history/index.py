@@ -36,7 +36,7 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 .info-card{ border:1px solid #333; background-color:#1E1E1E; }
 .info-label { color:#DDD; }
 .info-row { border-bottom:1px solid #333; }
-.history-icon { color:#BB86FC; }
+.history-icon { color:var(--ops-accent); }
 }
 .header-actions { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
 .msg-type { font-size: 0.85em; color: #777; font-weight: 400; white-space: nowrap; }

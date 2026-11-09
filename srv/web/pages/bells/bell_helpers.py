@@ -107,10 +107,10 @@ input,select{background:#121212;border-color:#444;color:#E0E0E0;}
 .md-checkbox-container{color:#BBB;}
 .md-checkmark{border-color:#9AA0A6;background:#1E1E1E;}
 .md-checkbox-container:hover input ~ .md-checkmark{border-color:#E8EAED;}
-.md-checkbox-container input:checked ~ .md-checkmark{background:#8AB4F8;border-color:#8AB4F8;}
+.md-checkbox-container input:checked ~ .md-checkmark{background:var(--ops-accent);border-color:var(--ops-accent);}
 .md-checkmark:after{border-color:#1E1E1E;}
-.btn{background:#BB86FC;color:#000;}
-.btn.secondary{background:transparent;color:#BB86FC;}
+.btn{background:var(--ops-accent);color:#FFF;}
+.btn.secondary{background:transparent;color:var(--ops-accent);}
 .btn.danger{background:#CF6679;color:#000;}
 .error{background:#3B1515;border-color:#6D2A2A;color:#FFCDD2;}
 .day-list{background:#242424;border-color:#333;}
@@ -118,8 +118,8 @@ input,select{background:#121212;border-color:#444;color:#E0E0E0;}
 .checkbox-tile{border-color:#333;background:#1E1E1E;}
 .weekday-chip{background:#242424;border-color:#444;}
 .schedule-tabs{border-top-color:#333;}
-.schedule-tabs a{color:#BB86FC;}
-.schedule-tabs a.active,.schedule-tabs a:hover{background:#2A2433;color:#D9B8FF;}
+.schedule-tabs a{color:var(--ops-accent);}
+.schedule-tabs a.active,.schedule-tabs a:hover{background:rgba(200,101,76,.14);color:var(--ops-accent);}
 }
 """
 

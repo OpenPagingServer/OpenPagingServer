@@ -270,7 +270,7 @@ def handle_request():
             <img src="/assets/OPENPAGINGSERVER-768x576-LIGHTMODE.png" class="server-image" alt="Open Paging Server">
         </picture>
         <p>Open Paging Server{(" " + h(version)) if version else ""}</p>
-        <p>Open Paging Server is licensed under the GNU General Public License v2.0. Third-party components, modules, and software used by Open Paging Server are subject to their own licenses.</p>
+        <p>Open Paging Server is licensed under the GNU General Public License v2.0. Third-party components, modules, and software used by Open Paging Server are subject to their own licenses. <a href="/admin/settings/acknowledgments" target="_blank" rel="noopener noreferrer">Acknowledgments</a></p>
         <p>Open Paging Server is provided "as is" without any warranties, express or implied, including but not limited to fitness for a particular purpose or non-infringement.</p>
         <div class="info-card">
             <h2>Hardware & OS</h2>

@@ -39,3 +39,7 @@ curl -fsSL https://install.openpagingserver.org | bash
 ```
 Please note that this install script is still in beta and may have issues.
 [Install script's repo](https://github.com/OpenPagingServer/Installer)
+
+### Identity settings
+
+Set `PROHIBIT_IDENTITY_DISABLE=true` in the server’s `.env` and restart the web service to prevent disabling LDAP sync once enabled, turning off single sign-on, or resetting Identity settings.

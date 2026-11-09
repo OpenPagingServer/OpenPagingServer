@@ -50,7 +50,31 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .field-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:14px; }
 .field { display:flex; flex-direction:column; gap:6px; margin-bottom:14px; }
 .field label { color:#555; font-size:0.9em; }
-.field input { border:1px solid #CCC; border-radius:6px; padding:10px; font:inherit; box-sizing:border-box; background:#FFF; }
+.field input,.field select { border:1px solid #CCC; border-radius:6px; padding:10px; font:inherit; box-sizing:border-box; background:#FFF; color:#202124; }
+.style-form { max-width:560px; }
+.style-form textarea { min-height:180px; resize:vertical; border:1px solid #CCC; border-radius:6px; padding:10px; font:inherit; box-sizing:border-box; background:#FFF; color:#202124; }
+.custom-css-settings { margin-bottom:14px; border:1px solid #E0E0E0; border-radius:8px; overflow:hidden; }
+.custom-css-settings summary { padding:10px; cursor:pointer; display:flex; align-items:center; justify-content:space-between; gap:12px; color:#555; font-size:.9em; list-style:none; }
+.custom-css-settings summary::-webkit-details-marker { display:none; }
+.custom-css-settings summary::after { content:'\25BE'; margin-left:auto; transition:transform .2s ease; }
+.custom-css-settings[open] summary::after { transform:rotate(180deg); }
+.custom-css-status { font-weight:700; margin-left:auto; }
+.custom-css-body { padding:0 10px 10px; }
+.custom-css-body textarea { width:100%; }
+.custom-css-settings.disabled { background:#F5F5F5; color:#777; }
+.custom-css-settings.disabled summary { color:#777; }
+.custom-css-settings.disabled textarea { background:#E8E8E8; color:#777; cursor:not-allowed; }
+.style-dropdown { position:relative; }
+.style-dropdown-button { width:100%; min-height:42px; border:1px solid #CCC; border-radius:6px; padding:10px; font:inherit; background:#FFF; color:#202124; display:flex; align-items:center; justify-content:space-between; gap:10px; cursor:pointer; text-align:left; }
+.style-dropdown-button:hover { background:#FFF; color:#202124; }
+.style-dropdown-value,.style-dropdown-option { display:flex; align-items:center; gap:10px; }
+.style-color-dot { width:12px; height:12px; border-radius:50%; background:var(--style-color); flex:0 0 12px; }
+.style-dropdown-menu { display:none; position:absolute; top:calc(100% + 6px); left:0; right:0; z-index:20; border:1px solid #DADCE0; border-radius:10px; background:#FFF; box-shadow:0 8px 18px rgba(0,0,0,0.15); padding:6px; }
+.style-dropdown.open .style-dropdown-menu { display:grid; }
+.style-dropdown-option { width:100%; border:0; border-radius:6px; padding:10px; background:transparent; color:#202124; font:inherit; cursor:pointer; text-align:left; }
+.style-dropdown-option:hover,.style-dropdown-option.selected { background:var(--ops-sidebar-hover); color:var(--ops-accent-hover); }
+#styleSaveButton { background:var(--style-preview-accent,var(--ops-accent)); color:var(--style-preview-on-accent,var(--ops-on-accent)); }
+#styleSaveButton:hover { background:var(--style-preview-accent-hover,var(--ops-accent-hover)); }
 .form-actions { display:flex; align-items:center; gap:12px; margin-top:8px; flex-wrap:wrap; }
 .btn-primary { background:var(--ops-accent); color:#FFF; border:none; border-radius:6px; padding:10px 14px; cursor:pointer; font:inherit; text-decoration:none; display:inline-flex; align-items:center; gap:8px; }
 .btn-secondary { color:var(--ops-accent); text-decoration:none; padding:10px 12px; display:inline-flex; align-items:center; justify-content:center; background:#FFF; border:1px solid var(--ops-accent); border-radius:6px; cursor:pointer; font:inherit; }
@@ -101,26 +125,36 @@ body,html{ background-color:#121212; color:#E0E0E0; }
 #mobile-header{ background-color:#424242; }
 #content{ background-color:#121212; }
 .card{ border:1px solid #333; background-color:#1E1E1E; }
-.card h2 { color:#BB86FC; }
+.card h2 { color:var(--ops-accent); }
 .page-header p,.field label,.muted,.token-meta,.token-modal p,.general-row p{ color:#BBB; }
-.field input,.token-display input { background:#121212; border-color:#444; color:#E0E0E0; }
-.btn-primary { background:#BB86FC; color:#000; }
-.btn-secondary { color:#BB86FC; border-color:#BB86FC; background:#1E1E1E; }
+.field input,.field select,.token-display input,.style-form textarea { background:#121212; border-color:#444; color:#E0E0E0; }
+.style-dropdown-button { background:#121212; border-color:#444; color:#E0E0E0; }
+.style-dropdown-button:hover { background:#121212; color:#E0E0E0; }
+.style-dropdown-menu { background:#1E1E1E; border-color:#444; }
+.style-dropdown-option { color:#E0E0E0; }
+.style-dropdown-option:hover,.style-dropdown-option.selected { background:#2A2A2A; color:var(--ops-accent); }
+.custom-css-settings { border-color:#444; }
+.custom-css-settings summary { color:#BBB; }
+.custom-css-settings.disabled { background:#252525; color:#888; }
+.custom-css-settings.disabled summary { color:#999; }
+.custom-css-settings.disabled textarea { background:#2A2A2A; color:#888; }
+.btn-primary { background:var(--ops-accent); color:#FFF; }
+.btn-secondary { color:var(--ops-accent); border-color:var(--ops-accent); background:#1E1E1E; }
 .flash.success { background:#12301A; border-color:#2E7D32; color:#C8E6C9; }
 .flash.error,.error { background:#3B1515; border-color:#6D2A2A; color:#FFCDD2; }
 .subtabs { border-bottom-color:#333; }
 .subtab-link { background:#2A2A2A; color:#BBB; }
-.subtab-link.active { background:#BB86FC; color:#000; border-color:#BB86FC; }
+.subtab-link.active { background:var(--ops-accent); color:#FFF; border-color:var(--ops-accent); }
 .token-item { border-color:#333; background:#171A1F; }
 .token-name { color:#EDEDED; }
 .token-modal { background:#1E1E1E; }
-.token-modal h3 { color:#BB86FC; }
+.token-modal h3 { color:var(--ops-accent); }
 .session-table { background:#1E1E1E; border-color:#333; }
 .session-head { background:#202124; color:#BBB; }
 .session-row { border-top-color:#333; background:#1E1E1E; }
 .session-cell,.session-title { color:#EDEDED; }
 .session-cell.muted,.session-subtitle,.session-limit-form,.session-empty { color:#BBB; }
-.session-badge { background:#2A2433; color:#D9B8FF; }
+.session-badge { background:rgba(200,101,76,.14); color:var(--ops-accent); }
 .session-badge.current { background:#12301A; color:#C8E6C9; }
 .session-limit-form select { background:#121212; border-color:#444; color:#E0E0E0; }
 }
@@ -186,6 +220,8 @@ def handle_request():
     ctx = legacy_user_context(user)
     auth_provider = str((user or {}).get("auth_provider") or "local").strip().lower()
     synced_user = auth_provider in {"ldap", "oidc", "saml"}
+    ldap_config = identity_provider_settings(ctx["settings"])
+    ldap_writable = auth_provider == "ldap" and ldap_can_change_password(ldap_config)
     synced_password_change_url = identity_password_change_url(user, ctx["settings"])
     forced_password_change = user_requires_password_change(user)
     api_enabled = (
@@ -198,7 +234,8 @@ def handle_request():
     active_tab = requested_tab if requested_tab in {"general", "api-keys", "sessions"} else "general"
     if active_tab == "api-keys" and not api_enabled:
         active_tab = "general"
-    flash = ""
+    stored_flash = session.pop("user_settings_flash", "")
+    flash = f'<div class="flash success">{h(stored_flash)}</div>' if stored_flash else ""
     error_html = ""
     new_api_token = session.pop("user_settings_new_api_token", {})
 
@@ -213,8 +250,42 @@ def handle_request():
             history_limit = session_history_limit_value(request.form.get("limit") or history_limit)
         if demo_mode_enabled() and action in {"change_password", "create_api_token"}:
             return demo_mode_iframe_html("user-settings")
-        if action == "change_password":
-            if synced_user:
+        if action == "save_style":
+            theme = str(request.form.get("theme") or "system").strip().lower()
+            accent_color = str(request.form.get("accent_color") or "orange").strip().lower()
+            custom_css_allowed = str(ctx["settings"].get("allow_user_custom_css", "1")) == "1"
+            custom_css = str(request.form.get("CSS") or "")
+            valid_accents = {"orange", "blue", "blue-green", "green", "yellow", "red", "red-violet", "violet", "blue-violet"}
+            if theme not in {"system", "light", "dark"} or accent_color not in valid_accents:
+                error_html = '<div class="error">Select a valid theme and accent color.</div>'
+            else:
+                if custom_css_allowed:
+                    execute("UPDATE users SET theme=%s, accent_color=%s, `CSS`=%s WHERE id=%s", (theme, accent_color, custom_css, user.get("id")))
+                else:
+                    execute("UPDATE users SET theme=%s, accent_color=%s WHERE id=%s", (theme, accent_color, user.get("id")))
+                remember_accent_cookie(accent_color)
+                session["user_settings_flash"] = "Style updated."
+                return redirect("/user/settings?tab=general")
+        elif action == "change_password":
+            if ldap_writable:
+                limited = check_rate_limit("ldap-password", client_ip(), 5, 60)
+                if limited:
+                    return limited
+                current = request.form.get("current_password", "")
+                new = request.form.get("new_password", "")
+                try:
+                    if not current or not new or new != request.form.get("confirm_password"):
+                        raise IdentityAccessDenied("Enter your current password and matching new passwords.")
+                    change_ldap_password(user.get("external_id"), current, new, ldap_config)
+                except IdentityAccessDenied as exc:
+                    error_html = f'<div class="error">{h(exc)}</div>'
+                    open_password_modal = True
+                except Exception:
+                    error_html = '<div class="error">The directory could not update your password.</div>'
+                    open_password_modal = True
+                else:
+                    return redirect("/user/settings")
+            elif synced_user:
                 error_html = '<div class="error">To change your password, go through your Single Sign-On provider. Contact your system administrator for more information.</div>'
                 active_tab = "general"
                 open_password_modal = False
@@ -280,7 +351,7 @@ def handle_request():
     tabs_html = '<div class="subtabs">' + "".join(tabs) + "</div>"
     demo_form_attr = ' onsubmit="openDemoModePopup(\'user-settings\'); return false;"' if demo_mode_enabled() else ""
 
-    if synced_user:
+    if synced_user and not ldap_writable:
         password_body = (
             f'<a class="btn-primary" href="{h(synced_password_change_url)}" target="_blank" rel="noopener noreferrer"><i class="fa-solid fa-arrow-up-right-from-square"></i> Change Password</a>'
             if synced_password_change_url
@@ -330,6 +401,72 @@ def handle_request():
                 </div>
             </form>
         </div>
+    </div>"""
+
+    theme_value = str(user.get("theme") or "system").strip().lower()
+    if theme_value not in {"system", "light", "dark"}:
+        theme_value = "system"
+    accent_value = str(user.get("accent_color") or "orange").strip().lower()
+    custom_css = str(user.get("CSS") or "")
+    custom_css_allowed = str(ctx["settings"].get("allow_user_custom_css", "1")) == "1"
+    accent_choices = (
+        ("orange", "Open Paging Orange (Default)", "#C8654C"),
+        ("blue", "Blue", "#1976D2"),
+        ("blue-green", "Blue-Green", "#00897B"),
+        ("green", "Green", "#388E3C"),
+        ("yellow", "Yellow", "#F9A825"),
+        ("red", "Red", "#D32F2F"),
+        ("red-violet", "Red-Violet", "#C2185B"),
+        ("violet", "Violet", "#7B1FA2"),
+        ("blue-violet", "Blue-Violet", "#5E35B1"),
+    )
+    if accent_value not in {choice[0] for choice in accent_choices}:
+        accent_value = "orange"
+    selected_accent = next(choice for choice in accent_choices if choice[0] == accent_value)
+    theme_options = "".join(
+        f'<option value="{value}"{" selected" if value == theme_value else ""}>{label}</option>'
+        for value, label in (("system", "System"), ("light", "Light"), ("dark", "Dark"))
+    )
+    accent_options = "".join(
+        f'<button class="style-dropdown-option{" selected" if value == accent_value else ""}" type="button" data-value="{h(value)}" data-label="{h(label)}" data-color="{color}" data-hover="{ACCENT_COLORS[value][1]}" data-on-accent="{ACCENT_COLORS[value][2]}" onclick="selectAccent(this)"><span class="style-color-dot" style="--style-color:{color}"></span><span>{h(label)}</span></button>'
+        for value, label, color in accent_choices
+    )
+    custom_css_section = ""
+    if custom_css_allowed or custom_css:
+        custom_css_disabled = not custom_css_allowed
+        custom_css_section = f"""
+            <details class="custom-css-settings{' disabled' if custom_css_disabled else ''}"{' open' if custom_css else ''}>
+                <summary><span>Custom CSS</span>{'<strong class="custom-css-status">Disabled by system administrator</strong>' if custom_css_disabled else ''}</summary>
+                <div class="custom-css-body">
+                    <textarea id="custom_css" name="CSS"{' disabled' if custom_css_disabled else ''}>{h(custom_css)}</textarea>
+                </div>
+            </details>"""
+    general_panel += f"""
+    <div class="card">
+        <h2>Style</h2>
+        <form class="style-form" method="POST" action="/user/settings">
+            <input type="hidden" name="action" value="save_style">
+            <input type="hidden" name="tab" value="general">
+            <div class="field">
+                <label for="theme">Theme</label>
+                <select id="theme" name="theme">{theme_options}</select>
+            </div>
+            <div class="field">
+                <label for="accent_color_button">Accent Color</label>
+                <input id="accent_color" name="accent_color" type="hidden" value="{h(accent_value)}">
+                <div class="style-dropdown" id="accentColorDropdown">
+                    <button class="style-dropdown-button" id="accent_color_button" type="button" aria-haspopup="listbox" aria-expanded="false" onclick="toggleAccentDropdown()">
+                        <span class="style-dropdown-value"><span class="style-color-dot" style="--style-color:{selected_accent[2]}"></span><span>{h(selected_accent[1])}</span></span>
+                        <i class="fa-solid fa-chevron-down"></i>
+                    </button>
+                    <div class="style-dropdown-menu" role="listbox">{accent_options}</div>
+                </div>
+            </div>
+            {custom_css_section}
+            <div class="form-actions">
+                <button class="btn-primary" id="styleSaveButton" type="submit"><i class="fa-solid fa-save"></i> Save</button>
+            </div>
+        </form>
     </div>"""
 
     api_panel = ""
@@ -601,6 +738,31 @@ function closeApiKeyRevealModal() {
   const modal = document.getElementById('apiKeyRevealModal');
   if (modal) modal.classList.remove('active');
 }
+function toggleAccentDropdown() {
+  const dropdown = document.getElementById('accentColorDropdown');
+  const button = document.getElementById('accent_color_button');
+  if (!dropdown || !button) return;
+  const open = dropdown.classList.toggle('open');
+  button.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+function selectAccent(option) {
+  const dropdown = document.getElementById('accentColorDropdown');
+  const button = document.getElementById('accent_color_button');
+  const input = document.getElementById('accent_color');
+  if (!dropdown || !button || !input || !option) return;
+  input.value = option.dataset.value;
+  button.querySelector('.style-dropdown-value').innerHTML = '<span class="style-color-dot" style="--style-color:' + option.dataset.color + '"></span><span></span>';
+  button.querySelector('.style-dropdown-value span:last-child').textContent = option.dataset.label;
+  dropdown.querySelectorAll('.style-dropdown-option').forEach(function(item) { item.classList.toggle('selected', item === option); });
+  const saveButton = document.getElementById('styleSaveButton');
+  if (saveButton) {
+    saveButton.style.setProperty('--style-preview-accent', option.dataset.color);
+    saveButton.style.setProperty('--style-preview-accent-hover', option.dataset.hover);
+    saveButton.style.setProperty('--style-preview-on-accent', option.dataset.onAccent);
+  }
+  dropdown.classList.remove('open');
+  button.setAttribute('aria-expanded', 'false');
+}
 function toggleNewApiKeyVisibility() {
   const input = document.getElementById('new-api-key-value');
   if (!input) return;
@@ -621,6 +783,12 @@ async function copyNewApiKey() {
 document.addEventListener('click', function(event) {
   if (event.target && event.target.classList && event.target.classList.contains('token-modal-backdrop')) {
     event.target.classList.remove('active');
+  }
+  const dropdown = document.getElementById('accentColorDropdown');
+  if (dropdown && !dropdown.contains(event.target)) {
+    dropdown.classList.remove('open');
+    const button = document.getElementById('accent_color_button');
+    if (button) button.setAttribute('aria-expanded', 'false');
   }
 });
 </script>"""

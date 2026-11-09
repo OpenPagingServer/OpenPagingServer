@@ -324,7 +324,8 @@ def user_from_desktop_payload(payload):
     if not user_id.isdigit():
         return None
     session_id = _token_session_id(payload)
-    if not active_session_for_token(session_id, user_id):
+    session_record = active_session_for_token(session_id, user_id)
+    if not session_record:
         return None
     conn = db()
     try:
@@ -348,6 +349,7 @@ def user_from_desktop_payload(payload):
     ):
         return None
     user["desktop_session_id"] = session_id
+    user["desktop_session_provider"] = session_record.get("auth_provider")
     return user
 
 
@@ -413,6 +415,19 @@ def broadcast_explicit_targets(broadcast):
         if token:
             targets.append(token)
     return targets
+
+
+def broadcast_seen_by_user(user_id, broadcast):
+    if not any(
+        token.strip().lower() == "0m"
+        for token in str((broadcast or {}).get("expires_rule") or "").split("|")
+    ):
+        return False
+    wanted = str(user_id if user_id is not None else "").strip()
+    return bool(wanted) and wanted in {
+        str(item if item is not None else "").strip()
+        for item in (broadcast or {}).get("seen_user_ids") or []
+    }
 
 
 def user_in_broadcast(user_id, broadcast):
@@ -982,6 +997,8 @@ def dispatch_broadcast_start(broadcast_id, codec="mulaw", sample_rate=8000, broa
             continue
         if not connection_in_broadcast(connection, broadcast):
             continue
+        if broadcast_seen_by_user(connection.user.get("id"), broadcast):
+            continue
         try:
             if str(broadcast_id or "").strip() not in connection.sent_ids:
                 payload = desktop_payload_for_broadcast(connection.user, broadcast, connection.server_origin)
@@ -1016,6 +1033,8 @@ def dispatch_broadcast_frame(broadcast_id, frame, broadcast=None):
             continue
         if not connection_in_broadcast(connection, broadcast):
             continue
+        if str(broadcast_id or "").strip() not in connection.sent_ids:
+            continue
         try:
             with connection.send_lock:
                 send_binary_packet(connection.sock, AUDIO_FRAME_PREFIX, broadcast_id, frame)
@@ -1039,6 +1058,8 @@ def dispatch_broadcast_end(broadcast_id, broadcast=None):
         if connection.closed.is_set():
             continue
         if not connection_in_broadcast(connection, broadcast):
+            continue
+        if str(broadcast_id or "").strip() not in connection.sent_ids:
             continue
         try:
             with connection.send_lock:
@@ -1189,6 +1210,8 @@ def broadcast_watcher_loop():
                     late = bool(issued_at and issued_at < connection.connected_at)
                     if not user_in_broadcast(connection.user.get("id"), broadcast):
                         continue
+                    if broadcast_seen_by_user(connection.user.get("id"), broadcast):
+                        continue
                     try:
                         payload = desktop_payload_for_broadcast(connection.user, broadcast, connection.server_origin)
                         if payload.get("has_audio"):
@@ -1301,6 +1324,10 @@ def handle_desktop_websocket_client(conn, addr, request=None):
                 except Exception:
                     message = {}
                 if message.get("type") == "ping":
+                    if user.get("desktop_session_provider") == "chrome_verified_access" and not active_session_for_token(
+                        user["desktop_session_id"], user["id"]
+                    ):
+                        break
                     send_ws_json(conn, {"type": "pong", "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
     except Exception:
         pass
