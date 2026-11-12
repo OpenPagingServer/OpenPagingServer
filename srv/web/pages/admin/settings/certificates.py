@@ -248,21 +248,15 @@ def finish_certbot_job(job, data):
     certificate_id = str(job.get("certificate_id") or "")
     if not certificate_id:
         raise ValueError("The deployed certificate is not registered yet.")
-    enable_web = bool(request.form.get("enable_web_https"))
-    enable_api = bool(request.form.get("enable_api_https")) and data.get("api_http_enable", "0") == "1"
-    enable_sip = bool(request.form.get("enable_sip_tls")) and data.get("enable_insecure_sip", "0") == "1"
-    selected = enable_web or enable_api or enable_sip
-    restart_needed = selected or bool(job.get("renew_certificate_id"))
+    restart_needed = bool(job.get("renew_certificate_id")) or any(
+        (
+            data.get("webserver_https_enable", "0") == "1",
+            data.get("api_https_enable", "0") == "1",
+            str(data.get("enable_secure_sip", "0") or "0") not in {"", "0"},
+        )
+    )
     if restart_needed and not can_restart_openpagingserver():
         raise RuntimeError("The certificate was deployed, but OpenPagingServer cannot be restarted automatically on this server.")
-    if enable_web:
-        save_setting("webserver_https_enable", "1", "HTTPs Enable (0/1)")
-        save_setting("webserver_http_to_https", "1", "Automatically redirect HTTP requests to HTTPS (0/1)")
-    if enable_api:
-        save_setting("api_https_enable", "1", "Enable REST API over HTTPS (0/1)")
-        save_setting("api_http_to_https", "1", "Automatically redirect API HTTP requests to HTTPS (0/1)")
-    if enable_sip:
-        save_setting("enable_secure_sip", "1", "Enable SIP over TLS (0/1)")
     if restart_needed:
         schedule_openpagingserver_restart()
     return restart_needed
@@ -344,15 +338,6 @@ def render_page(user, message="", error=""):
         f'data-available="{1 if certbot_is_available else 0}" data-account-ready="{1 if certbot_account.get("ready") else 0}">'
         'Generate new using Certbot</button>'
     )
-    web_finish_checked = "" if current_settings.get("webserver_https_enable", "0") == "1" else " checked"
-    api_finish_checked = "" if current_settings.get("api_https_enable", "0") == "1" else " checked"
-    sip_finish_checked = "" if str(current_settings.get("enable_secure_sip", "0") or "0") not in {"", "0"} else " checked"
-    api_finish_option = """
-                    <label class="md-checkbox-container"><input type="checkbox" id="certbotEnableApi"{api_checked}><span class="md-checkmark"></span><span class="md-checkbox-text">Enable HTTPS for API</span></label>
-    """.format(api_checked=api_finish_checked) if current_settings.get("api_http_enable", "0") == "1" else ""
-    sip_finish_option = """
-                    <label class="md-checkbox-container"><input type="checkbox" id="certbotEnableSip"{sip_checked}><span class="md-checkmark"></span><span class="md-checkbox-text">Enable TLS for SIP</span></label>
-    """.format(sip_checked=sip_finish_checked) if current_settings.get("enable_insecure_sip", "0") == "1" else ""
     material_spinner = """
         <svg class="md-circular-progress" viewBox="0 0 48 48" aria-hidden="true" focusable="false">
             <circle cx="24" cy="24" r="19"></circle>
@@ -413,7 +398,6 @@ def render_page(user, message="", error=""):
     .certbot-progress-note {{ line-height:1.5; margin:0; }}
     .certbot-error {{ color:#C62828; white-space:pre-wrap; max-height:180px; overflow:auto; }}
     .certbot-success-icon {{ width:64px; height:64px; display:block; fill:#2E7D32; margin:0 auto 14px; }}
-    .certbot-finish-options {{ display:flex; flex-direction:column; gap:14px; margin:18px 0; }}
     @media(max-width:600px) {{ .certbot-challenge-row {{ grid-template-columns:56px minmax(0,1fr) 40px; gap:8px; }} }}
     @media(prefers-color-scheme:dark) {{
         .certificate-table th {{ color:#BBB; }}
@@ -554,11 +538,6 @@ def render_page(user, message="", error=""):
             <div id="certbotSuccessPanel" style="display:none">
                 <svg class="certbot-success-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"></path></svg>
                 <h2 style="text-align:center">Certificate deployed successfully</h2>
-                <div class="certbot-finish-options">
-                    <label class="md-checkbox-container"><input type="checkbox" id="certbotEnableWeb"{web_finish_checked}><span class="md-checkmark"></span><span class="md-checkbox-text">Enable HTTPS for Web</span></label>
-                    {api_finish_option}
-                    {sip_finish_option}
-                </div>
                 <div id="certbotFinishError" class="certbot-error"></div>
                 <div class="certificate-modal-actions"><button type="button" id="certbotFinishButton">Finish</button></div>
             </div>
@@ -1057,14 +1036,9 @@ document.addEventListener('DOMContentLoaded', function() {
         finishError.innerText = '';
         this.disabled = true;
         try {
-            const apiToggle = document.getElementById('certbotEnableApi');
-            const sipToggle = document.getElementById('certbotEnableSip');
             const data = await certbotRequest({
                 action: 'certbot_finish',
-                job_id: certbotJobId,
-                enable_web_https: document.getElementById('certbotEnableWeb').checked ? '1' : '',
-                enable_api_https: apiToggle && apiToggle.checked ? '1' : '',
-                enable_sip_tls: sipToggle && sipToggle.checked ? '1' : ''
+                job_id: certbotJobId
             });
             sessionStorage.removeItem('ops-certbot-job');
             sessionStorage.removeItem('ops-certbot-flow');

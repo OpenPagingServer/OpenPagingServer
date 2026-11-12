@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import signal
 import shlex
 import shutil
 import subprocess
@@ -337,7 +338,6 @@ def build_certbot_command(binary, hook_command, certbot_name, hostnames, force_r
             [
                 "--pre-hook", certbot_http_hook_command("start"),
                 "--post-hook", certbot_http_hook_command("stop"),
-                "--deploy-hook", certbot_http_hook_command("deploy"),
             ]
         )
     else:
@@ -538,6 +538,117 @@ def public_job(job):
     }
 
 
+def atomic_write_json(path, payload):
+    path = Path(path)
+    temporary = path.with_name(path.name + ".tmp-" + uuid.uuid4().hex)
+    try:
+        temporary.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def persist_certbot_job(job):
+    """Persist enough state for another web process (or a restart) to resume polling."""
+    job_dir = Path(job["job_dir"])
+    payload = public_job(job)
+    payload.update({
+        "pid": int(job.get("pid") or getattr(job.get("process"), "pid", 0) or 0),
+        "binary": str(job.get("binary") or ""),
+    })
+    atomic_write_json(job_dir / "job.json", payload)
+
+
+def load_persisted_certbot_job(job_id):
+    wanted = str(job_id or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{32}", wanted):
+        return None
+    job_dir = CERTBOT_JOB_ROOT / wanted
+    try:
+        payload = json.loads((job_dir / "job.json").read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("id") != wanted:
+        return None
+    try:
+        hostnames = normalize_hostnames(payload.get("hostnames") or [])
+        pid = max(0, int(payload.get("pid") or 0))
+    except (TypeError, ValueError):
+        return None
+    return {
+        "id": wanted,
+        "status": str(payload.get("status") or "starting"),
+        "hostnames": hostnames,
+        "certbot_name": str(payload.get("certbot_name") or ""),
+        "job_dir": str(job_dir),
+        "log_path": str(job_dir / "certbot.log"),
+        "log_handle": None,
+        "process": None,
+        "pid": pid,
+        "binary": str(payload.get("binary") or ""),
+        "certificate_path": str(payload.get("certificate_path") or ""),
+        "private_key_path": str(payload.get("private_key_path") or ""),
+        "certificate_id": payload.get("certificate_id"),
+        "renew_certificate_id": payload.get("renew_certificate_id"),
+        "verification_method": str(payload.get("verification_method") or "dns"),
+        "temporary_http_server": None,
+        "error": str(payload.get("error") or ""),
+        "status_message": str(payload.get("status_message") or "This may take several minutes..."),
+        "created_at": payload.get("created_at"),
+        "rehydrated": True,
+    }
+
+
+def certbot_process_running(job):
+    process = job.get("process")
+    if process is not None:
+        return process.poll() is None
+    pid = int(job.get("pid") or 0)
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    if os.name != "nt":
+        try:
+            command_line = (Path("/proc") / str(pid) / "cmdline").read_bytes().replace(b"\0", b" ").decode(
+                "utf-8", errors="replace"
+            )
+        except OSError:
+            return False
+        certbot_name = str(job.get("certbot_name") or "")
+        if certbot_name and certbot_name not in command_line:
+            return False
+    return True
+
+
+def refresh_rehydrated_certbot_job(job):
+    if not job.get("rehydrated") or job.get("status") in {"success", "error", "cancelled"}:
+        return
+    if (Path(job["job_dir"]) / "cancel").exists():
+        job["status"] = "cancelled"
+        persist_certbot_job(job)
+        return
+    if certbot_process_running(job):
+        return
+    try:
+        certificate_path, private_key_path = certbot_certificate_paths(
+            job["certbot_name"], binary=job.get("binary") or None
+        )
+        job["status"] = "success"
+        job["certificate_path"] = certificate_path
+        job["private_key_path"] = private_key_path
+        job["error"] = ""
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        job["status"] = "error"
+        job["error"] = log_tail(job["log_path"]) or str(exc) or "Certbot stopped before issuing the certificate."
+    persist_certbot_job(job)
+
+
 def read_challenge_state(job):
     state_path = Path(job["job_dir"]) / "challenge.json"
     try:
@@ -615,11 +726,13 @@ def watch_certbot_job(job_id):
                 current["certificate_path"] = certificate_path
                 current["private_key_path"] = private_key_path
                 current["error"] = ""
+                persist_certbot_job(current)
                 return
             current["error"] = certificate_path_error or "Certbot completed but its certificate files could not be found."
         elif current.get("status") != "error":
             current["error"] = log_tail(current["log_path"]) or "Certbot failed to issue the certificate."
         current["status"] = "error"
+        persist_certbot_job(current)
 
 
 def start_certbot_job(hostname_values, existing_certbot_name=None, renew_certificate_id=None, verification_method="dns"):
@@ -690,6 +803,7 @@ def start_certbot_job(hostname_values, existing_certbot_name=None, renew_certifi
         "log_path": str(log_path),
         "log_handle": log_handle,
         "process": process,
+        "pid": process.pid,
         "binary": binary,
         "certificate_path": "",
         "private_key_path": "",
@@ -703,6 +817,7 @@ def start_certbot_job(hostname_values, existing_certbot_name=None, renew_certifi
     }
     with CERTBOT_JOBS_LOCK:
         CERTBOT_JOBS[job_id] = job
+        persist_certbot_job(job)
     threading.Thread(target=watch_certbot_job, args=(job_id,), daemon=True).start()
     return public_job(job)
 
@@ -712,10 +827,17 @@ def get_certbot_job(job_id):
     with CERTBOT_JOBS_LOCK:
         job = CERTBOT_JOBS.get(wanted)
     if not job:
-        return None
+        job = load_persisted_certbot_job(wanted)
+        if not job:
+            return None
+        with CERTBOT_JOBS_LOCK:
+            job = CERTBOT_JOBS.setdefault(wanted, job)
     read_challenge_state(job)
     with CERTBOT_JOBS_LOCK:
-        return public_job(CERTBOT_JOBS.get(wanted))
+        current = CERTBOT_JOBS.get(wanted)
+        if current:
+            refresh_rehydrated_certbot_job(current)
+        return public_job(current)
 
 
 def cancel_certbot_job(job_id):
@@ -723,11 +845,15 @@ def cancel_certbot_job(job_id):
     with CERTBOT_JOBS_LOCK:
         job = CERTBOT_JOBS.get(wanted)
         if not job:
-            return False
+            job = load_persisted_certbot_job(wanted)
+            if not job:
+                return False
+            CERTBOT_JOBS[wanted] = job
         if job.get("status") in {"success", "cancelled"}:
             return True
         job["status"] = "cancelled"
         process = job.get("process")
+        pid = int(job.get("pid") or 0)
         job_dir = Path(job["job_dir"])
     try:
         (job_dir / "cancel").touch()
@@ -746,6 +872,12 @@ def cancel_certbot_job(job_id):
                 process.wait(timeout=2)
             except (OSError, subprocess.TimeoutExpired):
                 pass
+    elif pid > 0 and certbot_process_running(job):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    persist_certbot_job(job)
     return True
 
 
@@ -754,6 +886,7 @@ def set_certbot_job_certificate_id(job_id, certificate_id):
         job = CERTBOT_JOBS.get(str(job_id or "").strip())
         if job:
             job["certificate_id"] = int(certificate_id)
+            persist_certbot_job(job)
             return public_job(job)
     return None
 

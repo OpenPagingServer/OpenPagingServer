@@ -110,16 +110,12 @@ def read_web_settings():
         "webserver_http_port": "80",
         "webserver_https_enable": "0",
         "webserver_https_port": "443",
-        "webserver_https_privkey": "",
-        "webserver_https_cert": "",
         "webserver_http_to_https": "0",
         "webserver_hsts": "0",
         "api_http_enable": "0",
         "api_http_port": "8088",
         "api_https_enable": "0",
         "api_https_port": "8089",
-        "api_https_cert": "",
-        "api_https_privkey": "",
         "api_http_to_https": "0",
         "api_hsts": "0",
         "_certificates": [],
@@ -136,14 +132,17 @@ def read_web_settings():
             cur.execute(
                 "SELECT parameter, value FROM systemsettings WHERE parameter IN "
                 "('webserver_enable','webserver_http_port','webserver_https_enable','webserver_https_port',"
-                "'webserver_https_privkey','webserver_https_cert','webserver_http_to_https','webserver_hsts',"
-                "'api_http_enable','api_http_port','api_https_enable','api_https_port','api_https_cert',"
-                "'api_https_privkey','api_http_to_https','api_hsts')"
+                "'webserver_http_to_https','webserver_hsts','api_http_enable','api_http_port',"
+                "'api_https_enable','api_https_port','api_http_to_https','api_hsts')"
             )
             for row in cur.fetchall():
                 defaults[str(row["parameter"])] = str(row["value"])
             try:
-                cur.execute("SELECT certificate_path, private_key_path, certbot_domains FROM certificates")
+                cur.execute(
+                    "SELECT id, certificate_path, private_key_path, certbot_domains, "
+                    "UNIX_TIMESTAMP(updated_at) AS certificate_version "
+                    "FROM certificates ORDER BY id DESC"
+                )
                 defaults["_certificates"] = list(cur.fetchall())
             except pymysql.MySQLError:
                 defaults["_certificates"] = []
@@ -517,25 +516,55 @@ def send_acme_challenge(client, path, head_only=False):
 
 def certificate_hostnames(record):
     try:
-        configured = json.loads(record.get("certbot_domains") or "[]")
-    except (TypeError, ValueError, json.JSONDecodeError):
-        configured = []
-    names = [str(value).strip().lower().rstrip(".") for value in configured if str(value).strip()]
-    try:
         decoded = ssl._ssl._test_decode_cert(str(record.get("certificate_path") or ""))
     except (OSError, ValueError, ssl.SSLError):
-        decoded = {}
-    names.extend(
+        return ()
+    names = [
         str(value).strip().lower().rstrip(".")
         for kind, value in decoded.get("subjectAltName", ())
         if str(kind).lower() == "dns" and value
-    )
+    ]
     if not names:
         for rdn in decoded.get("subject", ()):
             for key, value in rdn:
                 if key == "commonName" and value:
                     names.append(str(value).strip().lower().rstrip("."))
     return tuple(dict.fromkeys(name for name in names if name))
+
+
+def certificate_is_current(record, now=None):
+    try:
+        decoded = ssl._ssl._test_decode_cert(str(record.get("certificate_path") or ""))
+        valid_from = ssl.cert_time_to_seconds(decoded["notBefore"])
+        expires_at = ssl.cert_time_to_seconds(decoded["notAfter"])
+    except (KeyError, OSError, TypeError, ValueError, ssl.SSLError):
+        return False
+    current_time = time.time() if now is None else float(now)
+    return valid_from <= current_time < expires_at
+
+
+def certificate_valid_from(record):
+    try:
+        decoded = ssl._ssl._test_decode_cert(str(record.get("certificate_path") or ""))
+        return float(ssl.cert_time_to_seconds(decoded["notBefore"]))
+    except (KeyError, OSError, TypeError, ValueError, ssl.SSLError):
+        return 0.0
+
+
+def read_certificate_store():
+    if not all([DB_HOST, DB_USER, DB_NAME]):
+        return []
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, certificate_path, private_key_path, certbot_domains, "
+                "UNIX_TIMESTAMP(updated_at) AS certificate_version "
+                "FROM certificates ORDER BY id DESC"
+            )
+            return list(cur.fetchall())
+    finally:
+        conn.close()
 
 
 def hostname_matches(pattern, hostname):
@@ -546,27 +575,77 @@ def hostname_matches(pattern, hostname):
     return bool(pattern and pattern == hostname)
 
 
-def create_ssl_context(certificates):
-    contexts = []
-    for record in certificates or []:
-        certfile = str(record.get("certificate_path") or "").strip()
-        keyfile = str(record.get("private_key_path") or "").strip()
-        candidate = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        if hasattr(ssl, "TLSVersion") and hasattr(ssl.TLSVersion, "TLSv1_2"):
-            candidate.minimum_version = ssl.TLSVersion.TLSv1_2
-        try:
-            candidate.load_cert_chain(certfile=certfile, keyfile=keyfile)
-        except (OSError, ssl.SSLError):
-            continue
-        names = certificate_hostnames(record)
-        if names:
-            contexts.append((names, candidate))
+def create_ssl_context(certificates, certificate_loader=None):
+    def store_signature(records):
+        signature = []
+        for record in records or []:
+            certfile = str(record.get("certificate_path") or "").strip()
+            keyfile = str(record.get("private_key_path") or "").strip()
+            try:
+                cert_mtime = Path(certfile).stat().st_mtime_ns
+                key_mtime = Path(keyfile).stat().st_mtime_ns
+            except OSError:
+                cert_mtime = key_mtime = 0
+            signature.append(
+                (
+                    str(record.get("id") or ""),
+                    certfile,
+                    keyfile,
+                    str(record.get("certificate_version") or ""),
+                    cert_mtime,
+                    key_mtime,
+                )
+            )
+        return tuple(signature)
+
+    def load_contexts(records):
+        loaded = []
+        newest_first = sorted(records or [], key=certificate_valid_from, reverse=True)
+        for record in newest_first:
+            if not certificate_is_current(record):
+                continue
+            certfile = str(record.get("certificate_path") or "").strip()
+            keyfile = str(record.get("private_key_path") or "").strip()
+            candidate = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            if hasattr(ssl, "TLSVersion") and hasattr(ssl.TLSVersion, "TLSv1_2"):
+                candidate.minimum_version = ssl.TLSVersion.TLSv1_2
+            try:
+                candidate.load_cert_chain(certfile=certfile, keyfile=keyfile)
+            except (OSError, ssl.SSLError):
+                continue
+            names = certificate_hostnames(record)
+            if names:
+                loaded.append((names, candidate))
+        return loaded
+
+    contexts = load_contexts(certificates)
     if not contexts:
         return None, lambda _hostname: False
     context = contexts[0][1]
+    context_state = {"contexts": contexts, "signature": store_signature(certificates)}
+    context_lock = threading.Lock()
+
+    def current_contexts():
+        if certificate_loader is None:
+            return context_state["contexts"]
+        with context_lock:
+            try:
+                records = certificate_loader()
+            except Exception as exc:
+                # Never continue serving a deleted or revoked in-memory
+                # certificate when the authoritative store cannot be read.
+                context_state["contexts"] = []
+                context_state["signature"] = None
+                print(f"TLS certificate store refresh failed; refusing stale certificates: {exc}", flush=True)
+                return context_state["contexts"]
+            signature = store_signature(records)
+            if signature != context_state["signature"]:
+                context_state["contexts"] = load_contexts(records)
+                context_state["signature"] = signature
+            return context_state["contexts"]
 
     def context_for_hostname(hostname):
-        for names, candidate in contexts:
+        for names, candidate in current_contexts():
             if any(hostname_matches(name, hostname) for name in names):
                 return candidate
         return None
@@ -874,7 +953,9 @@ def server_ports(label, configured_port):
 
 def build_servers(settings):
     servers = []
-    ssl_context, tls_hostname_checker = create_ssl_context(settings.get("_certificates") or [])
+    ssl_context, tls_hostname_checker = create_ssl_context(
+        settings.get("_certificates") or [], certificate_loader=read_certificate_store
+    )
     if enabled(settings.get("webserver_enable")):
         from srv.web.app import app as web_app, ensure_identity_access_schema, start_ldap_sync_worker
 
