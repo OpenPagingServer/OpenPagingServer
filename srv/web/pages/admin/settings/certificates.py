@@ -753,7 +753,11 @@ document.addEventListener('DOMContentLoaded', function() {
             console.error('[Certbot] Invalid JSON response', response.status, responseText);
             throw new Error('OpenPagingServer returned invalid Certbot status data. Check the server log for the matching error.');
         }
-        if (!response.ok || data.status === 'error') throw new Error(data.message || 'Certbot request failed.');
+        if (!response.ok || data.status === 'error') {
+            const requestError = new Error(data.message || 'Certbot request failed.');
+            requestError.code = data.code || '';
+            throw requestError;
+        }
         return data;
     }
 
@@ -915,6 +919,20 @@ document.addEventListener('DOMContentLoaded', function() {
         openModal(certbotProgressModal);
     }
 
+    function clearUnavailableCertbotJob() {
+        stopCertbotPolling();
+        certbotJobId = '';
+        certbotPollFailures = 0;
+        sessionStorage.removeItem('ops-certbot-job');
+        sessionStorage.removeItem('ops-certbot-flow');
+        openCertbotHostnames(
+            pendingCertbotFlow.hostnames,
+            pendingCertbotFlow.certificateId,
+            pendingCertbotFlow.verificationMethod
+        );
+        document.getElementById('certbotHostnameError').innerText = 'The previous Certbot job expired. Review the settings and click Generate to start a new request.';
+    }
+
     async function pollCertbotJob() {
         if (!certbotJobId) return;
         try {
@@ -932,6 +950,7 @@ document.addEventListener('DOMContentLoaded', function() {
             if (job.status === 'cancelled') {
                 stopCertbotPolling();
                 sessionStorage.removeItem('ops-certbot-job');
+                sessionStorage.removeItem('ops-certbot-flow');
                 closeModals();
                 return;
             }
@@ -940,6 +959,10 @@ document.addEventListener('DOMContentLoaded', function() {
             openModal(certbotProgressModal);
             certbotPollTimer = window.setTimeout(pollCertbotJob, 2000);
         } catch (error) {
+            if (error && error.code === 'certbot_job_not_found') {
+                clearUnavailableCertbotJob();
+                return;
+            }
             if (error && error.retryAfterMs) {
                 certbotPollTimer = window.setTimeout(pollCertbotJob, error.retryAfterMs);
                 return;
@@ -956,6 +979,11 @@ document.addEventListener('DOMContentLoaded', function() {
 
     async function startCertbot(hostnames) {
         showCertbotStarting();
+        pendingCertbotFlow = {
+            hostnames: hostnames.slice(),
+            certificateId: renewCertificateId || '',
+            verificationMethod: (document.querySelector('input[name="certbotVerificationMethod"]:checked') || {}).value || 'http'
+        };
         const data = await certbotRequest({
             action: 'certbot_start',
             hostnames: hostnames,
@@ -965,6 +993,7 @@ document.addEventListener('DOMContentLoaded', function() {
         certbotJobId = data.job.id;
         certbotPollFailures = 0;
         sessionStorage.setItem('ops-certbot-job', certbotJobId);
+        sessionStorage.setItem('ops-certbot-flow', JSON.stringify(pendingCertbotFlow));
         stopCertbotPolling();
         certbotPollTimer = window.setTimeout(pollCertbotJob, 1000);
     }
@@ -995,6 +1024,7 @@ document.addEventListener('DOMContentLoaded', function() {
         }
         certbotJobId = '';
         sessionStorage.removeItem('ops-certbot-job');
+        sessionStorage.removeItem('ops-certbot-flow');
         closeModals();
     }
 
@@ -1012,6 +1042,10 @@ document.addEventListener('DOMContentLoaded', function() {
             stopCertbotPolling();
             certbotPollTimer = window.setTimeout(pollCertbotJob, 1000);
         } catch (error) {
+            if (error && error.code === 'certbot_job_not_found') {
+                clearUnavailableCertbotJob();
+                return;
+            }
             showCertbotError(error && error.message ? error.message : 'Unable to retry Certbot.');
         } finally {
             this.disabled = false;
@@ -1033,6 +1067,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 enable_sip_tls: sipToggle && sipToggle.checked ? '1' : ''
             });
             sessionStorage.removeItem('ops-certbot-job');
+            sessionStorage.removeItem('ops-certbot-flow');
             if (data.restart_scheduled) {
                 openModal(certbotRestartModal);
                 window.setTimeout(function() { window.location.reload(); }, 30000);
@@ -1046,6 +1081,15 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     });
 
+    const savedCertbotFlow = sessionStorage.getItem('ops-certbot-flow');
+    if (savedCertbotFlow) {
+        try {
+            const parsedFlow = JSON.parse(savedCertbotFlow);
+            if (parsedFlow && Array.isArray(parsedFlow.hostnames)) pendingCertbotFlow = parsedFlow;
+        } catch (_error) {
+            sessionStorage.removeItem('ops-certbot-flow');
+        }
+    }
     const savedCertbotJob = sessionStorage.getItem('ops-certbot-job');
     if (savedCertbotJob && certbotChoice) {
         certbotJobId = savedCertbotJob;
@@ -1130,7 +1174,11 @@ def handle_request():
                     job_id = str(request.form.get("job_id") or "").strip()
                     job = get_certbot_job(job_id)
                     if not job:
-                        raise ValueError("The Certbot job is no longer available.")
+                        return jsonify(
+                            status="error",
+                            code="certbot_job_not_found",
+                            message="The Certbot job is no longer available.",
+                        ), 404
                     if action == "certbot_cancel":
                         cancel_certbot_job(job_id)
                         return jsonify(status="success")
