@@ -248,6 +248,8 @@ def _captcha_script_tag(provider):
 
 def handle_request():
     login_error = ""
+    reauth_user = None
+    enforced_reauth_user = None
     try:
         ctx = product_context()
         data = ctx["settings"]
@@ -265,8 +267,22 @@ def handle_request():
 
     if session.get("user_id") is not None and session.get("user_id") != "" and not maintenance_popup_open:
         user_check = current_user()
+        if (
+            isinstance(user_check, dict)
+            and user_check
+            and getattr(g, "ops_soft_logout", False)
+            and enforced_auto_login_context()
+        ):
+            enforced_reauth_user = user_check
         if isinstance(user_check, dict) and user_check and not getattr(g, "ops_soft_logout", False):
             return redirect("/dashboard")
+        if (
+            isinstance(user_check, dict)
+            and user_check
+            and getattr(g, "ops_soft_logout", False)
+            and truthy(request.args.get("reauth"))
+        ):
+            reauth_user = user_check
 
     if request.method == "POST":
         ip = request.remote_addr or ""
@@ -278,7 +294,10 @@ def handle_request():
                 return _invalid_login_response()
 
             if "get_challenge" in request.form:
-                username = request.form.get("username", "").strip()
+                username = str(
+                    (enforced_reauth_user or {}).get("username")
+                    or request.form.get("username", "")
+                ).strip()
                 session["temp_user"] = username
                 forced_mode = str(request.form.get("login_mode") or "").strip().lower()
                 provider = "local" if forced_mode == "local" else configured_identity_provider(data)
@@ -366,8 +385,10 @@ def handle_request():
     local_login_button_enabled = redirect_provider and (
         identity_local_login_allowed(data) or sso_error == "cancelled" or sso_failure_count() >= 2
     )
-    show_local_login_form = identity_provider in {"local", "ldap"} or local_mode
-    sso_auto_redirect = redirect_provider and identity_redirect_auto_enabled(data) and not local_mode and not sso_error
+    enforced_upgrade = bool(enforced_reauth_user and enforced_auto_login_context())
+    show_local_login_form = enforced_upgrade or identity_provider in {"local", "ldap"} or local_mode
+    reauth_identity = str((reauth_user or {}).get("username") or (reauth_user or {}).get("email") or "").strip()
+    sso_auto_redirect = redirect_provider and identity_redirect_auto_enabled(data) and not local_mode and not sso_error and not enforced_upgrade
     banner_enabled = _setting_bool(data, "login_banner_enabled")
     banner_title = data.get("login_banner_title") or ""
     banner_message = data.get("login_banner_message") or ""
@@ -377,7 +398,7 @@ def handle_request():
     login_logo_dark = data.get("login_logo_dark") or ""
     login_background_image = login_background_asset_path(data.get("login_background_image"))
     client_ip = request.remote_addr or ""
-    captcha_provider = _captcha_required(data, client_ip) if show_local_login_form else ""
+    captcha_provider = _captcha_required(data, client_ip) if show_local_login_form and not enforced_upgrade else ""
     captcha_site_key = _captcha_site_key(data)
     captcha_html = _captcha_markup(captcha_provider, captcha_site_key)
     captcha_script = _captcha_script_tag(captcha_provider)
@@ -459,13 +480,15 @@ def handle_request():
             f'<div class="sso-error-detail">{h(sso_error_detail)}</div>' if sso_error == "failed" and sso_error_detail else ""
         )
     local_back_button = ""
-    if redirect_provider and show_local_login_form:
+    if redirect_provider and show_local_login_form and not enforced_upgrade:
         local_back_button = '<button type="button" class="text-action" onclick="showSsoOptions()">Back</button>'
+    enforced_identity = str((enforced_reauth_user or {}).get("username") or reauth_identity or "")
+    username_attrs = ' readonly aria-readonly="true" class="enforced-identity"' if enforced_upgrade else ""
     if show_local_login_form:
         login_box_inner = f"""
         <h2>Login</h2>
         <div class="input-field">
-          <input type="text" id="username" placeholder=" " required />
+          <input type="text" id="username" placeholder=" " value="{h(enforced_identity if enforced_upgrade else reauth_identity)}"{username_attrs} required />
           <label for="username">Username or Email</label>
         </div>
         <div class="input-field">
@@ -501,7 +524,12 @@ def handle_request():
       *, *::before, *::after {{ box-sizing: border-box; }}
       body, html {{ margin: 0; padding: 0; font-family: "Tahoma", sans-serif; height: 100%; width: 100%; position: fixed; display: flex; align-items: center; justify-content: center; background: #e3f2fd; overflow-x: hidden; }}
       body {{ background-image: {"url('/assets/file/login-background')" if login_background_image else "none"}; background-size: cover; background-position: center; background-repeat: no-repeat; }}
-      @keyframes fadeInPage {{ from {{ opacity: 0; }} to {{ opacity: 1; }} }}
+      *[hidden] {{ display:none !important; }}
+      .desktop-login-back-btn {{ position:fixed; top:16px; left:16px; z-index:4; min-width:88px; height:40px; padding:0 16px; border:0; border-radius:20px; background:#e8def8; color:#1d192b; font:500 14px "Roboto","Segoe UI",sans-serif; cursor:pointer; align-items:center; justify-content:center; gap:10px; box-shadow:0 1px 3px rgba(0,0,0,.18); transition:background-color .15s ease,box-shadow .15s ease; }}
+      .desktop-login-back-btn:not([hidden]) {{ display:inline-flex; }}
+      .desktop-login-back-btn:hover {{ background:#d0bcff; box-shadow:0 2px 6px rgba(0,0,0,.22); }}
+      .desktop-login-back-btn:focus-visible {{ outline:3px solid var(--ops-accent); outline-offset:3px; }}
+      @media (prefers-color-scheme: dark) {{ .desktop-login-back-btn {{ background:#4a4458; color:#f4efff; }} .desktop-login-back-btn:hover {{ background:#625b71; }} }}
       .background-slideshow {{ position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 0; }}
       @media (max-width: 768px) {{ .background-slideshow {{ display: none; }} }}
       .center-container {{ display: flex; flex-direction: column; justify-content: center; align-items: center; width: 100%; height: 100%; position: relative; z-index: 1; }}
@@ -511,10 +539,10 @@ def handle_request():
       .logo-dark {{ display: none; }}
       @media (max-width: 768px) {{ .logo {{ position: relative; top: auto; left: auto; transform: none; width: min(82vw, 360px); height: auto; margin: 18px auto 12px auto; padding: 0; flex: 0 0 auto; }} .logo img {{ width: 100%; height: auto; max-height: 110px; }} }}
       @media (min-width: 769px) {{ .logo.logo-corner {{ top: 16px; left: 16px; transform: none; width: min(320px, 34vw); height: auto; justify-content: flex-start; }} .logo.logo-corner img {{ width: 100%; height: auto; max-height: 70px; object-fit: contain; object-position: left center; }} }}
-      .login-banner {{ background: #fff3e0; border: 1px solid #ffe0b2; border-radius: 6px; padding: 15px; margin-bottom: 15px; width: 100%; max-width: 390px; box-sizing: border-box; text-align: left; color: #e65100; box-shadow: 0 2px 4px rgba(0,0,0,0.05); animation: fadeInPage 1s ease-in-out; }}
+      .login-banner {{ background: #fff3e0; border: 1px solid #ffe0b2; border-radius: 6px; padding: 15px; margin-bottom: 15px; width: 100%; max-width: 390px; box-sizing: border-box; text-align: left; color: #e65100; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }}
       .login-banner h3 {{ margin: 0 0 5px 0; font-size: 15px; font-weight: 700; text-transform: uppercase; }}
       .login-banner p {{ margin: 0; font-size: 14px; line-height: 1.4; }}
-      .login-box {{ background: #fff; padding: 30px; border-radius: 6px; box-shadow: 0 4px 6px rgba(0,0,0,0.1),0 1px 3px rgba(0,0,0,0.08); max-width: 390px; width: min(92vw, 390px); text-align: center; animation: fadeInPage 1.5s ease-in-out; }}
+      .login-box {{ background: #fff; padding: 30px; border-radius: 6px; box-shadow: 0 4px 6px rgba(0,0,0,0.1),0 1px 3px rgba(0,0,0,0.08); max-width: 390px; width: min(92vw, 390px); text-align: center; }}
       @media (max-width: 768px) {{ 
         body, html {{ position: static; height: auto; min-height: 100%; display: block; }}
         body {{ background-color: #fff; min-height: 100vh; overflow-y: auto; }}
@@ -525,6 +553,7 @@ def handle_request():
       .login-box h2 {{ color: var(--ops-accent); font-weight: 500; margin-bottom: 20px; margin-top: 0; }}
       .input-field {{ position: relative; margin-bottom: 20px; }}
       .input-field input {{ width: 100%; padding: 8px 0; border: none; border-bottom: 2px solid #ccc; font-size: 16px; background: transparent; outline: none; color: #333; font-family: "Roboto", sans-serif; }}
+      .input-field input.enforced-identity {{ background:#d6d6d6; color:#666; cursor:not-allowed; padding-left:8px; padding-right:8px; border-radius:4px 4px 0 0; }}
       .input-field input:focus {{ border-bottom: 2px solid var(--ops-accent); }}
       .input-field label {{ position: absolute; top: 8px; left: 0; color: #888; font-size: 14px; pointer-events: none; transition: 0.2s ease all; }}
       .input-field input:focus ~ label, .input-field input:not(:placeholder-shown) ~ label {{ top: -16px; left: 0; font-size: 12px; color: var(--ops-accent); }}
@@ -597,6 +626,7 @@ def handle_request():
     </style>
   <link rel="stylesheet" href="/assets/theme.css"></head>
   <body>
+    <button type="button" id="desktop-login-back-btn" class="desktop-login-back-btn" hidden aria-hidden="true" onclick="window.history.back()"><i class="fa-solid fa-arrow-left"></i><span>Back</span></button>
     <div class="background-slideshow"></div>
     {logo_html}
     <div class="center-container">
@@ -609,6 +639,13 @@ def handle_request():
     {maintenance_popup_html}
     {desktop_settings_login_html}
     <script>
+      window.setOpsBackButtonVisible = function(visible) {{
+        const button = document.getElementById('desktop-login-back-btn');
+        if (!button) return;
+        button.hidden = !visible;
+        button.setAttribute('aria-hidden', visible ? 'false' : 'true');
+      }};
+
       function rectsOverlap(a, b) {{
         return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
       }}
@@ -785,9 +822,11 @@ def handle_request():
 
         try {{
           const isDesktopClient = !!window.__OPS_DESKTOP_CLIENT__;
-          const loginUrl = isDesktopClient ? '/login?desktop_client=1' : '/login';
+          const enforcedAutoLogin = {str(enforced_upgrade).lower()};
+          const loginUrl = isDesktopClient ? '/login?desktop_client=1' + (enforcedAutoLogin ? '&enforced_auto_login=1' : '') : '/login';
           const loginHeaders = {{ 'Content-Type': 'application/x-www-form-urlencoded' }};
           if (isDesktopClient) loginHeaders['X-OPS-Desktop-Client'] = '1';
+          if (enforcedAutoLogin) loginHeaders['X-OPS-Enforced-Auto-Login'] = '1';
 
           async function parseJsonResponse(response) {{
             const contentType = (response.headers.get('content-type') || '').toLowerCase();
@@ -853,6 +892,13 @@ def handle_request():
       }}
 
       document.addEventListener('DOMContentLoaded', function() {{
+        const usernameInput = document.getElementById('username');
+        const passwordInput = document.getElementById('pw');
+        if (usernameInput && usernameInput.value && passwordInput) {{
+          passwordInput.focus();
+        }} else if (usernameInput) {{
+          usernameInput.focus();
+        }}
         const saveBtn = document.getElementById('maintenance-save-btn');
         const enterBtn = document.getElementById('maintenance-enter-btn');
         const restartBtn = document.getElementById('maintenance-restart-btn');

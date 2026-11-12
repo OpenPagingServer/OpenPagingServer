@@ -104,6 +104,68 @@ def sip_debug(message):
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] DEBUG sip {message}", flush=True)
 
 
+def certificate_hostnames(record):
+    try:
+        configured = json.loads(record.get("certbot_domains") or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        configured = []
+    names = [str(value).strip().lower().rstrip(".") for value in configured if str(value).strip()]
+    try:
+        decoded = ssl._ssl._test_decode_cert(str(record.get("certificate_path") or ""))
+    except (OSError, ValueError, ssl.SSLError):
+        decoded = {}
+    names.extend(
+        str(value).strip().lower().rstrip(".")
+        for kind, value in decoded.get("subjectAltName", ())
+        if str(kind).lower() == "dns" and value
+    )
+    if not names:
+        for rdn in decoded.get("subject", ()):
+            for key, value in rdn:
+                if key == "commonName" and value:
+                    names.append(str(value).strip().lower().rstrip("."))
+    return tuple(dict.fromkeys(name for name in names if name))
+
+
+def hostname_matches(pattern, hostname):
+    pattern = str(pattern or "").lower().rstrip(".")
+    hostname = str(hostname or "").lower().rstrip(".")
+    if pattern.startswith("*."):
+        return hostname.endswith(pattern[1:]) and hostname.count(".") == pattern.count(".")
+    return bool(pattern and pattern == hostname)
+
+
+def create_ssl_context(certificates):
+    contexts = []
+    for record in certificates or []:
+        candidate = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        if hasattr(ssl, "TLSVersion") and hasattr(ssl.TLSVersion, "TLSv1_2"):
+            candidate.minimum_version = ssl.TLSVersion.TLSv1_2
+        try:
+            candidate.load_cert_chain(
+                certfile=str(record.get("certificate_path") or "").strip(),
+                keyfile=str(record.get("private_key_path") or "").strip(),
+            )
+        except (OSError, ssl.SSLError):
+            continue
+        names = certificate_hostnames(record)
+        if names:
+            contexts.append((names, candidate))
+    if not contexts:
+        return None
+    context = contexts[0][1]
+
+    def select_context(sock, server_name, _initial_context):
+        for names, candidate in contexts:
+            if any(hostname_matches(name, server_name) for name in names):
+                sock.context = candidate
+                return None
+        return ssl.ALERT_DESCRIPTION_UNRECOGNIZED_NAME
+
+    context.set_servername_callback(select_context)
+    return context
+
+
 def parse_sip_codec_order_setting(value):
     requested = [normalize_sip_codec_name(token) for token in str(value or "").split(",")]
     requested = [token for token in requested if token]
@@ -748,24 +810,36 @@ class SipServer:
     def get_tls_settings(self):
         enabled_raw = self.read_setting("enable_secure_sip")
         port_raw = self.read_setting("secure_sip_port")
-        certificate_path = str(self.read_setting("secure_sip_cert") or "").strip()
-        private_key_path = str(self.read_setting("secure_sip_privkey") or "").strip()
         try:
-            secure_mode = int(enabled_raw)
-            enabled = secure_mode in {1, 2}
+            enabled = int(enabled_raw) == 1
         except (TypeError, ValueError):
-            secure_mode = 0
             enabled = False
-        if secure_mode == 1 and (not certificate_path or not private_key_path):
-            certificate_path = str(self.read_setting("webserver_https_cert") or "").strip()
-            private_key_path = str(self.read_setting("webserver_https_privkey") or "").strip()
         try:
             port = int(port_raw)
         except (TypeError, ValueError):
             port = 5061
         if port < 1 or port > 65535:
             port = 5061
-        return enabled, port, certificate_path, private_key_path
+        return enabled, port, self.tls_certificates() if enabled else []
+
+    def tls_certificates(self):
+        conn = self.connect_db()
+        try:
+            with conn.cursor() as cur:
+                try:
+                    cur.execute("SELECT certificate_path, private_key_path, certbot_domains FROM certificates")
+                except pymysql.MySQLError:
+                    return []
+                return [
+                    {
+                        "certificate_path": row[0],
+                        "private_key_path": row[1],
+                        "certbot_domains": row[2],
+                    }
+                    for row in cur.fetchall()
+                ]
+        finally:
+            conn.close()
 
     def sip_security_setting_enabled(self, key, default=True):
         if not sip_abuse_override_enabled():
@@ -2524,7 +2598,6 @@ class SipServer:
         return ""
 
     def cucm_intercept_codecs(self):
-        # **CUCM does not play it's intercept after wideband calls**
         return [codec for codec in self.sip_codec_preferences() if codec in {"PCMU", "PCMA"}] or ["PCMU"]
 
     def build_invite_sdp(
@@ -3145,8 +3218,7 @@ class SipServer:
         call.to_h = to_h
         call.invite_branch = uuid.uuid4().hex[:10]
         call.invite_route_headers = self.initial_route_headers(route)
-        codec_names = self.cucm_intercept_codecs() if getattr(call, "cucm_narrowband", False) else None
-        sdp = self.build_invite_sdp(call.advertised_media_ip, call.advertised_media_port, codec_names=codec_names)
+        sdp = self.build_invite_sdp(call.advertised_media_ip, call.advertised_media_port)
         lines = [
             f"INVITE {target_uri} SIP/2.0",
             f"Via: SIP/2.0/{route_transport.upper()} {local_ip}:{call.local_sip_port};branch=z9hG4bK{call.invite_branch}{self.sip_via_params(route_transport)}",
@@ -4287,7 +4359,7 @@ class SipServer:
             session = call["session"]
             nat_mode = call.get("nat_mode")
 
-        cucm_narrowband = bool(call.get("cucm_narrowband")) or self.cisco_cucm_headers(headers)
+        cucm_narrowband = bool(call.get("cucm_narrowband"))
         codec_preferences = self.cucm_intercept_codecs() if cucm_narrowband else None
 
         hold = self.sdp_offer_is_hold(body) if body else False
@@ -4400,8 +4472,9 @@ class SipServer:
         user = self.request_user_from_uri(uri)
         
         db_status, trigger, passcode, trigger_groups = self.get_endpoint_trigger(user)
-        cucm_narrowband = self.cisco_cucm_headers(headers)
-        codec_preferences = self.cucm_intercept_codecs() if cucm_narrowband else None
+        cucm_peer = self.cisco_cucm_headers(headers)
+        cucm_narrowband = False
+        codec_preferences = None
 
         generator = None
         early_media_status = None
@@ -4533,6 +4606,9 @@ class SipServer:
                 return self.build_response(headers, "200 OK", body=sdp, local_ip=local_sip_ip, local_port=local_sip_port, transport=transport, call_tag=local_tag)
 
             session_class, generator, on_start, early_media_status = self.build_trigger_result(trigger, user, headers)
+
+        cucm_narrowband = bool(cucm_peer and early_media_status)
+        codec_preferences = self.cucm_intercept_codecs() if cucm_narrowband else None
 
         if session_class is None:
             session_class = RTPSession
@@ -5064,11 +5140,10 @@ class SipServer:
                 return True
         return False
 
-    def bind_tls_listener(self, port, certificate_path, private_key_path, configuration=None):
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        if hasattr(ssl, "TLSVersion") and hasattr(ssl.TLSVersion, "TLSv1_2"):
-            context.minimum_version = ssl.TLSVersion.TLSv1_2
-        context.load_cert_chain(certfile=certificate_path, keyfile=private_key_path)
+    def bind_tls_listener(self, port, certificates, configuration=None):
+        context = create_ssl_context(certificates)
+        if context is None:
+            raise RuntimeError("SIP TLS requires at least one valid installed certificate")
         tls_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             tls_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -5077,7 +5152,7 @@ class SipServer:
         except Exception:
             tls_sock.close()
             raise
-        configuration = configuration or (int(port), str(certificate_path), str(private_key_path))
+        configuration = configuration or (int(port),)
         with self.lock:
             self.tls_sock = tls_sock
             self.active_tls_port = int(port)
@@ -5096,22 +5171,23 @@ class SipServer:
                     if self.active_port != port or self.udp_sock is None or self.tcp_sock is None:
                         self.close_insecure_sockets()
                         self.bind_listeners(port)
-                tls_enabled, tls_port, certificate_path, private_key_path = self.get_tls_settings()
-                try:
-                    certificate_mtime = os.path.getmtime(certificate_path)
-                except OSError:
-                    certificate_mtime = None
-                try:
-                    private_key_mtime = os.path.getmtime(private_key_path)
-                except OSError:
-                    private_key_mtime = None
-                wanted_tls_configuration = (tls_port, certificate_path, private_key_path, certificate_mtime, private_key_mtime)
+                tls_enabled, tls_port, certificates = self.get_tls_settings()
+                wanted_tls_configuration = (tls_port,) + tuple(
+                    (
+                        str(record.get("certificate_path") or ""),
+                        str(record.get("private_key_path") or ""),
+                        str(record.get("certbot_domains") or ""),
+                        os.path.getmtime(str(record.get("certificate_path") or "")) if os.path.isfile(str(record.get("certificate_path") or "")) else None,
+                        os.path.getmtime(str(record.get("private_key_path") or "")) if os.path.isfile(str(record.get("private_key_path") or "")) else None,
+                    )
+                    for record in certificates
+                )
                 if not tls_enabled:
                     if self.tls_sock is not None:
                         self.close_tls_socket()
                 elif self.tls_sock is None or self.tls_configuration != wanted_tls_configuration:
                     self.close_tls_socket()
-                    self.bind_tls_listener(tls_port, certificate_path, private_key_path, configuration=wanted_tls_configuration)
+                    self.bind_tls_listener(tls_port, certificates, configuration=wanted_tls_configuration)
                 self.enabled = bool(enabled or tls_enabled)
                 self.sip_intrusion_cleanup()
                 self.maintain_outbound_trunks()

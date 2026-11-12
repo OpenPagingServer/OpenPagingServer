@@ -1,5 +1,6 @@
 from srv.web.app import *
 from srv.web.chrome_verified_access import SERVICE_ACCOUNT_FILE, store_service_account
+from srv.web.kerberos_desktop_auth import KEYTAB_FILE, store_keytab, validate_keytab, write_krb5_config
 from srv.web.pages.admin.settings.common import settings_page
 
 
@@ -23,7 +24,7 @@ IDENTITY_WELCOME = '''
     </div>
     <h1>Configure Single sign-on in a few clicks</h1>
     <div class="identity-welcome-actions">
-        <a class="identity-welcome-primary" href="?setup=wizard">Get Started</a>
+        <a class="identity-welcome-primary" __WIZARD_LINK_ATTRIBUTES__>Get Started</a>
         <a class="identity-welcome-secondary" href="?setup=manual">Configure manually</a>
     </div>
 </div>
@@ -426,18 +427,20 @@ def _save_identity_settings(cleaned, reset=False, delete_ldap=False, initial_syn
     return redirect("/admin/settings/identity")
 
 
-def chromeos_auto_login_section(data):
+def desktop_auto_login_section(data):
     product = h(data.get("product_name") or "Open Paging Server")
     csrf = session.setdefault("chromeos_settings_csrf", secrets.token_urlsafe(32))
     enabled = data.get("chromeos_auto_login") == "1"
+    kerberos_enabled = data.get("kerberos_auto_login") == "1"
     key_uploaded = SERVICE_ACCOUNT_FILE.is_file()
+    keytab_uploaded = KEYTAB_FILE.is_file()
     return f"""
     <section style="margin-top:24px;" aria-labelledby="chromeosSettingsTitle">
         <h4 id="chromeosSettingsTitle">Desktop client auto-login</h4>
         <p>Automatically sign users into their {product} account when they login to their domain account on a managed computer. Sessions created with this method will only be able to receive broadcasts until they login to {product} manually.</p>
         <input type="hidden" name="chromeos_settings_csrf" value="{h(csrf)}">
         <div class="info-row">
-            <label class="info-label" id="chromeosEnableLabel" for="chromeosAutoLogin"><strong>ChromeOS</strong> (Chrome Verified Access)</label>
+            <label class="info-label" id="chromeosEnableLabel" for="chromeosAutoLogin"><strong>Chrome Verified Access (ChromeOS)</strong></label>
             <label class="switch"><input type="checkbox" role="switch" id="chromeosAutoLogin"
                 name="chromeos_auto_login" value="1" aria-labelledby="chromeosEnableLabel"
                 aria-controls="chromeosSettingsFields" {"checked" if enabled else ""}><span class="slider"></span></label>
@@ -452,13 +455,42 @@ def chromeos_auto_login_section(data):
                 <div aria-labelledby="chromeosServiceAccountLabel">
                     <input type="file" id="chromeosServiceAccountFile" accept=".json,application/json" hidden>
                     <button type="button" id="chromeosUploadKey" {"hidden" if key_uploaded else ""}>Upload</button>
-                    <button type="button" id="chromeosDeleteKey" {"" if key_uploaded else "hidden"}>Delete</button>
+                    <button type="button" id="chromeosDeleteKey" class="identity-delete-button" {"" if key_uploaded else "hidden"}>Delete</button>
                     <span id="chromeosKeyStatus" class="save-status" role="status"></span>
                 </div>
             </div>
             <div class="info-row" style="flex-direction: column; align-items: flex-start; gap: 8px;">
                 <label class="info-label" for="chromeosSessionDays">Session lifetime in days</label>
                 <input type="number" id="chromeosSessionDays" name="chromeos_session_days" min="1" max="365" value="{h(data.get('chromeos_session_days', '7'))}">
+            </div>
+        </div>
+        <div class="info-row" style="margin-top:20px;">
+            <label class="info-label" id="kerberosEnableLabel" for="kerberosAutoLogin"><strong>Kerberos (Active Directory)</strong></label>
+            <label class="switch"><input type="checkbox" role="switch" id="kerberosAutoLogin"
+                name="kerberos_auto_login" value="1" aria-labelledby="kerberosEnableLabel"
+                aria-controls="kerberosSettingsFields" {"checked" if kerberos_enabled else ""}><span class="slider"></span></label>
+        </div>
+        <div class="ldap-settings-panel" id="kerberosSettingsFields" {"" if kerberos_enabled else "hidden"}>
+            <div class="info-row" style="flex-direction: column; align-items: flex-start; gap: 8px;">
+                <label class="info-label" for="kerberosRealm">Kerberos Realm</label>
+                <input type="text" id="kerberosRealm" name="kerberos_realm" autocomplete="off" value="{h(data.get('kerberos_realm', ''))}" placeholder="EXAMPLE.COM">
+            </div>
+            <div class="info-row" style="flex-direction: column; align-items: flex-start; gap: 8px;">
+                <label class="info-label" for="kerberosKdc">Key Distribution Center (KDC)</label>
+                <input type="text" id="kerberosKdc" name="kerberos_kdc" autocomplete="off" value="{h(data.get('kerberos_kdc', ''))}" placeholder="dc01.example.com">
+            </div>
+            <div class="info-row" style="flex-direction: column; align-items: flex-start; gap: 8px;">
+                <label class="info-label" for="kerberosSpn">Service Principal Name (SPN)</label>
+                <input type="text" id="kerberosSpn" name="kerberos_spn" autocomplete="off" value="{h(data.get('kerberos_spn', ''))}" placeholder="HTTP/paging.example.com">
+            </div>
+            <div class="info-row" style="flex-direction: column; align-items: flex-start; gap: 8px;">
+                <span class="info-label" id="kerberosKeytabLabel">Service Keytab</span>
+                <div aria-labelledby="kerberosKeytabLabel">
+                    <input type="file" id="kerberosKeytabFile" accept=".keytab,.kt,application/octet-stream" hidden>
+                    <button type="button" id="kerberosUploadKeytab" {"hidden" if keytab_uploaded else ""}>Upload</button>
+                    <button type="button" id="kerberosDeleteKeytab" class="identity-delete-button" {"" if keytab_uploaded else "hidden"}>Delete</button>
+                    <span id="kerberosKeytabStatus" class="save-status" role="status"></span>
+                </div>
             </div>
         </div>
     </section>
@@ -507,6 +539,29 @@ def handle_request():
                 app.logger.warning("Could not update the Chrome Verified Access service account file")
                 return jsonify(status="error", message="OPS could not update the service account file."), 500
             return jsonify(status="success", uploaded=SERVICE_ACCOUNT_FILE.is_file())
+        kerberos_key_action = request.form.get("kerberos_key_action")
+        if kerberos_key_action in {"upload", "delete"}:
+            if not chromeos_settings_csrf_valid():
+                return jsonify(status="error", message="Reload Identity Settings and try again."), 403
+            try:
+                if kerberos_key_action == "upload":
+                    upload = request.files.get("kerberos_service_keytab")
+                    spn = str(request.form.get("kerberos_spn") or "").strip()
+                    realm = str(request.form.get("kerberos_realm") or "").strip().upper()
+                    if not upload or not spn or not realm:
+                        return jsonify(status="error", message="Enter the realm and SPN, then choose a service keytab."), 400
+                    store_keytab(upload, f"{spn}@{realm}")
+                else:
+                    KEYTAB_FILE.unlink(missing_ok=True)
+            except ImportError:
+                app.logger.exception("Kerberos dependencies are missing")
+                return jsonify(status="error", message="Install the updated OPS server dependencies to upload a keytab."), 503
+            except ValueError:
+                return jsonify(status="error", message="Upload a valid keytab containing the configured SPN (maximum 1 MB)."), 400
+            except OSError:
+                app.logger.warning("Could not update the Kerberos service keytab")
+                return jsonify(status="error", message="OPS could not update the service keytab."), 500
+            return jsonify(status="success", uploaded=KEYTAB_FILE.is_file())
         if request.form.get("test_ldap_connection") == "1":
             config, errors = _normalize_ldap_connection_settings(request.form, identity_data)
             if errors:
@@ -546,7 +601,7 @@ def handle_request():
                 abort(403)
         if reset:
             return _save_identity_settings(
-                {**LDAP_SETTING_DEFAULTS, **SSO_SETTING_DEFAULTS, **OIDC_SETTING_DEFAULTS, **SAML_SETTING_DEFAULTS},
+                {**LDAP_SETTING_DEFAULTS, **SSO_SETTING_DEFAULTS, **OIDC_SETTING_DEFAULTS, **SAML_SETTING_DEFAULTS, **DESKTOP_AUTO_LOGIN_DEFAULTS},
                 reset=True,
             )
         cleaned, errors = _normalize_identity_settings(request.form, data)
@@ -567,6 +622,32 @@ def handle_request():
                     errors.append("Upload a Google service account JSON file.")
                 changes.update(chromeos_workspace_domain=domain, chromeos_session_days=days)
             cleaned.update(changes)
+            kerberos_enabled = request.form.get("kerberos_auto_login") == "1"
+            kerberos_changes = {"kerberos_auto_login": "1" if kerberos_enabled else "0"}
+            if kerberos_enabled:
+                realm = str(request.form.get("kerberos_realm") or "").strip().upper()
+                kdc = str(request.form.get("kerberos_kdc") or "").strip()
+                spn = str(request.form.get("kerberos_spn") or "").strip()
+                if not re.fullmatch(r"[A-Z0-9][A-Z0-9.-]{0,254}", realm):
+                    errors.append("Enter a valid Kerberos realm.")
+                if not re.fullmatch(r"[A-Za-z0-9._:\-\[\]]{1,255}", kdc):
+                    errors.append("Enter a valid KDC host name or address.")
+                if len(spn) > 512 or any(character.isspace() for character in spn) or "/" not in spn or "@" in spn:
+                    errors.append("Enter a valid SPN such as HTTP/paging.example.com.")
+                if not KEYTAB_FILE.is_file():
+                    errors.append("Upload a Kerberos service keytab.")
+                elif realm and spn:
+                    try:
+                        validate_keytab(f"{spn}@{realm}")
+                    except Exception:
+                        errors.append("The service keytab does not contain the configured SPN.")
+                kerberos_changes.update(kerberos_realm=realm, kerberos_kdc=kdc, kerberos_spn=spn)
+                if not errors:
+                    try:
+                        write_krb5_config(realm, kdc)
+                    except OSError:
+                        errors.append("OPS could not write the Kerberos configuration.")
+            cleaned.update(kerberos_changes)
         if errors:
             if request.headers.get("X-Requested-With") == "XMLHttpRequest":
                 return jsonify(status="error", message=" ".join(errors))
@@ -587,7 +668,17 @@ def handle_request():
         or identity_data.get("identity_provider") in REDIRECT_IDENTITY_PROVIDER_VALUES
     )
     if not configured and mode not in {"wizard", "manual"}:
-        return settings_page("Identity Settings", ctx, "identity", IDENTITY_WELCOME, "")
+        demo_wizard_action = ""
+        if demo_mode_enabled():
+            demo_wizard_action = (
+                ' onclick="if(window.openDemoModePopup){openDemoModePopup(\'settings\');return false;}"'
+                ' href="/dashboard?demomodal=settings"'
+            )
+        welcome = IDENTITY_WELCOME.replace(
+            "__WIZARD_LINK_ATTRIBUTES__",
+            (demo_wizard_action or ' href="?setup=wizard"').strip(),
+        )
+        return settings_page("Identity Settings", ctx, "identity", welcome, "")
     wizard = mode == "wizard" and not configured
     wizard_buttons = """
         <button type="button" id="identityWizardBack" hidden>Back</button>
@@ -641,6 +732,8 @@ def handle_request():
         .identity-wizard-choices legend {{ margin-bottom:8px; font-weight:500; }}
         #identityWizardError {{ color:var(--ops-error, #c62828); margin-top:12px; }}
         #identitySettingsForm .identity-actions {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:20px; }}
+        #identitySettingsForm button.identity-delete-button {{ background:#c62828; color:#fff; }}
+        #identitySettingsForm button.identity-delete-button:hover {{ background:#b71c1c; }}
         #identitySettingsForm #resetIdentityBtn {{ background:#b3261e; color:#fff; }}
         #identitySettingsForm #resetIdentityBtn:hover {{ background:#8c1d18; }}
         #identitySettingsForm .identity-use-wizard {{
@@ -1284,7 +1377,7 @@ def handle_request():
                     </div>
                 </div>
                 </section>
-                {chromeos_auto_login_section(data) if not wizard else ""}
+                {desktop_auto_login_section(data) if not wizard else ""}
                 <div class="identity-actions">
                     {wizard_buttons}
                     <button type="button" id="saveIdentityBtn"{" hidden" if wizard else ""}>{"Save identity setup" if wizard else "Save Settings"}</button>
@@ -1336,6 +1429,53 @@ document.addEventListener('DOMContentLoaded', function() {
         upload.addEventListener('click', () => file.click());
         file.addEventListener('change', () => { if (file.files.length) updateKey('upload'); });
         remove.addEventListener('click', () => updateKey('delete'));
+    }
+    const kerberosAutoLogin = document.getElementById('kerberosAutoLogin');
+    kerberosAutoLogin?.addEventListener('change', () => {
+        document.getElementById('kerberosSettingsFields').hidden = !kerberosAutoLogin.checked;
+    });
+    if (kerberosAutoLogin) {
+        const file = document.getElementById('kerberosKeytabFile');
+        const upload = document.getElementById('kerberosUploadKeytab');
+        const remove = document.getElementById('kerberosDeleteKeytab');
+        const status = document.getElementById('kerberosKeytabStatus');
+        async function updateKeytab(action) {
+            const data = new FormData();
+            data.append('kerberos_key_action', action);
+            data.append('chromeos_settings_csrf', kerberosAutoLogin.form.elements.chromeos_settings_csrf.value);
+            data.append('kerberos_spn', document.getElementById('kerberosSpn').value.trim());
+            data.append('kerberos_realm', document.getElementById('kerberosRealm').value.trim());
+            if (action === 'upload') data.append('kerberos_service_keytab', file.files[0]);
+            upload.disabled = remove.disabled = true;
+            status.textContent = action === 'upload' ? 'Uploading…' : 'Deleting…';
+            try {
+                const response = await fetch('/admin/settings/identity', {
+                    method: 'POST', body: data, headers: {'X-Requested-With': 'XMLHttpRequest'}
+                });
+                const result = await response.json();
+                if (!response.ok || result.status !== 'success') {
+                    status.textContent = result.message || 'Could not update the service keytab.';
+                    return;
+                }
+                upload.hidden = result.uploaded;
+                remove.hidden = !result.uploaded;
+                status.textContent = result.uploaded ? 'Keytab uploaded.' : 'Keytab deleted.';
+            } catch (_) {
+                status.textContent = 'Could not update the service keytab.';
+            } finally {
+                file.value = '';
+                upload.disabled = remove.disabled = false;
+            }
+        }
+        upload.addEventListener('click', () => {
+            if (!document.getElementById('kerberosSpn').value.trim() || !document.getElementById('kerberosRealm').value.trim()) {
+                status.textContent = 'Enter the realm and SPN before uploading its keytab.';
+                return;
+            }
+            file.click();
+        });
+        file.addEventListener('change', () => { if (file.files.length) updateKeytab('upload'); });
+        remove.addEventListener('click', () => updateKeytab('delete'));
     }
     const ldapEnabled = document.getElementById('ldapEnabled');
     const ldapSyncActions = document.getElementById('ldapSyncActions');
@@ -2121,6 +2261,10 @@ document.addEventListener('DOMContentLoaded', function() {
     postSettings('identitySettingsForm','saveIdentityBtn','save-status','Settings saved successfully.', true);
     const resetButton = document.getElementById('resetIdentityBtn');
     resetButton?.addEventListener('click', async () => {
+        if (window.openDemoModePopup && document.querySelector('[data-demo-mode="1"]')) {
+            openDemoModePopup('settings');
+            return;
+        }
         if (!window.confirm('Clear all synced users and reset SSO settings? This cannot be undone.')) return;
         const status = document.getElementById('save-status');
         const detail = document.getElementById('resetIdentityDetail');

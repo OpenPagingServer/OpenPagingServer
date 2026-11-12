@@ -1324,7 +1324,7 @@ def handle_desktop_websocket_client(conn, addr, request=None):
                 except Exception:
                     message = {}
                 if message.get("type") == "ping":
-                    if user.get("desktop_session_provider") == "chrome_verified_access" and not active_session_for_token(
+                    if user.get("desktop_session_provider") in {"chrome_verified_access", "kerberos"} and not active_session_for_token(
                         user["desktop_session_id"], user["id"]
                     ):
                         break

@@ -122,6 +122,7 @@ API_TOKEN_LABEL_LENGTH = 120
 ACCENT_COLOR_COOKIE = "ops_last_accent"
 ACCENT_COLORS = {
     "orange": ("#C8654C", "#B0553E", "#FFFFFF"),
+    "generated-purple": ("#BB86FC", "#9965F4", "#121212"),
     "blue": ("#1976D2", "#1565C0", "#FFFFFF"),
     "blue-green": ("#00897B", "#00796B", "#FFFFFF"),
     "green": ("#388E3C", "#2E7D32", "#FFFFFF"),
@@ -140,12 +141,14 @@ IDENTITY_ACCESS_SCHEMA_READY = False
 IDENTITY_ACCESS_SCHEMA_LOCK = threading.Lock()
 WEB_RATE_LIMIT_BUCKETS = {}
 WEB_RATE_LIMIT_LOCK = threading.Lock()
-WEB_RATE_LIMIT_EXEMPT_PREFIXES = ("/bundled-assets/", "/assets/file/", "/favicon.ico", "/robots.txt")
+WEB_RATE_LIMIT_EXEMPT_PREFIXES = ("/bundled-assets/", "/assets/", "/favicon.ico", "/robots.txt")
 TEMP_ASSET_ACCESS_SECONDS = 48 * 60 * 60
 TEMP_ASSET_ACCESS = {}
 TEMP_ASSET_ACCESS_LOCK = threading.Lock()
 DESKTOP_SSO_SESSION_KEY = "desktop_sso_request_id"
 DESKTOP_GUEST_SESSION_KEY = "desktop_guest_receiver"
+ENFORCED_AUTO_LOGIN_HEADER = "X-OPS-Enforced-Auto-Login"
+ENFORCED_AUTO_LOGIN_SESSION_KEY = "desktop_enforced_auto_login"
 DESKTOP_SSO_REQUEST_TTL_SECONDS = 600
 DESKTOP_SSO_COMPLETE_ROUTE = "/desktop/sso/complete"
 def _positive_int_env(name, default):
@@ -307,6 +310,15 @@ SAML_SETTING_DEFAULTS = {
     "saml_password_change_url": "",
     "saml_username_attribute": "uid",
     "saml_email_attribute": "mail",
+}
+DESKTOP_AUTO_LOGIN_DEFAULTS = {
+    "chromeos_auto_login": "0",
+    "chromeos_workspace_domain": "",
+    "chromeos_session_days": "7",
+    "kerberos_auto_login": "0",
+    "kerberos_realm": "",
+    "kerberos_kdc": "",
+    "kerberos_spn": "",
 }
 LOGIN_SETTING_DEFAULTS = {
     ACCOUNT_EXPIRATION_NOTIFY_SETTING: "1",
@@ -798,6 +810,8 @@ def enforce_demo_mode_protected_pages():
     if not demo_mode_enabled() or request.method not in {"GET", "HEAD"}:
         return None
     normalized_path = (request.path or "").rstrip("/") or "/"
+    if normalized_path == "/admin/settings/identity" and request.args.get("setup") == "wizard":
+        return redirect("/dashboard?demomodal=settings")
     if normalized_path == "/admin/settings/certificates":
         return redirect("/dashboard?demomodal=settings")
     return None
@@ -929,11 +943,6 @@ CERTIFICATE_SETTING_MAP = {
         "api_https_cert",
         "api_https_privkey",
     ),
-    "sip": (
-        "secure_sip_certificate_id",
-        "secure_sip_cert",
-        "secure_sip_privkey",
-    ),
 }
 
 
@@ -1027,29 +1036,6 @@ def migrate_legacy_tls_certificates(data=None):
             )
             source["webserver_https_certificate_id"] = str(legacy_web["id"])
 
-    if not str(source.get("secure_sip_certificate_id", "") or "").strip():
-        legacy_sip = None
-        secure_mode = str(source.get("enable_secure_sip", "0") or "0").strip()
-        if secure_mode == "1" and source.get("webserver_https_certificate_id"):
-            legacy_sip = query_one(
-                "SELECT * FROM certificates WHERE id=%s LIMIT 1",
-                (source["webserver_https_certificate_id"],),
-            )
-        elif secure_mode not in {"", "0"}:
-            legacy_sip = _legacy_certificate_record(
-                "Legacy SIP TLS Certificate",
-                source.get("secure_sip_cert"),
-                source.get("secure_sip_privkey"),
-            )
-        if legacy_sip:
-            save_setting(
-                "secure_sip_certificate_id",
-                str(legacy_sip["id"]),
-                "Certificate used by the SIP TLS listener",
-            )
-            save_setting("secure_sip_cert", legacy_sip["certificate_path"], "Certificate path for SIP TLS")
-            save_setting("secure_sip_privkey", legacy_sip["private_key_path"], "Private key path for SIP TLS")
-            source["secure_sip_certificate_id"] = str(legacy_sip["id"])
     return source
 
 
@@ -1069,6 +1055,7 @@ def ensure_certificate_schema(data=None):
                             managed_upload TINYINT(1) NOT NULL DEFAULT 0,
                             certbot_name VARCHAR(255) DEFAULT NULL,
                             certbot_domains TEXT DEFAULT NULL,
+                            certbot_mode VARCHAR(16) DEFAULT NULL,
                             created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                             updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                             UNIQUE KEY certificates_name_unique (name)
@@ -1084,6 +1071,8 @@ def ensure_certificate_schema(data=None):
                 certificate_alters.append(("ALTER TABLE certificates ADD COLUMN certbot_name VARCHAR(255) DEFAULT NULL AFTER managed_upload", ()))
             if "certbot_domains" not in certificate_columns:
                 certificate_alters.append(("ALTER TABLE certificates ADD COLUMN certbot_domains TEXT DEFAULT NULL AFTER certbot_name", ()))
+            if "certbot_mode" not in certificate_columns:
+                certificate_alters.append(("ALTER TABLE certificates ADD COLUMN certbot_mode VARCHAR(16) DEFAULT NULL AFTER certbot_domains", ()))
             if certificate_alters:
                 execute_many(certificate_alters)
             CERTIFICATE_SCHEMA_READY = True
@@ -1137,23 +1126,11 @@ def set_certificate_for_service(service, certificate_id):
 
 
 def refresh_certificate_assignments(certificate_id):
-    record = certificate_record(certificate_id)
-    if not record:
-        return
-    data = settings()
-    for service, (id_key, _certificate_key, _private_key_key) in CERTIFICATE_SETTING_MAP.items():
-        if str(data.get(id_key, "") or "").strip() == str(record["id"]):
-            set_certificate_for_service(service, record["id"])
+    return None
 
 
 def certificate_usage(certificate_id):
-    data = settings()
-    wanted = str(certificate_id or "").strip()
-    return [
-        service
-        for service, (id_key, _certificate_key, _private_key_key) in CERTIFICATE_SETTING_MAP.items()
-        if str(data.get(id_key, "") or "").strip() == wanted
-    ]
+    return []
 
 
 def table_columns(table_name):
@@ -1647,7 +1624,7 @@ def _upgrade_identity_access_schema():
             "INSERT IGNORE INTO systemsettings (`parameter`, `value`, `description`) VALUES (%s,%s,%s)",
             (parameter, value, ""),
         )
-        for defaults in (SSO_SETTING_DEFAULTS, OIDC_SETTING_DEFAULTS, SAML_SETTING_DEFAULTS)
+        for defaults in (SSO_SETTING_DEFAULTS, OIDC_SETTING_DEFAULTS, SAML_SETTING_DEFAULTS, DESKTOP_AUTO_LOGIN_DEFAULTS)
         for parameter, value in defaults.items()
     )
     execute_many(setting_statements + [
@@ -1754,6 +1731,28 @@ def desktop_client_context():
     return (desktop_param is not None and str(desktop_param).strip().lower() in {"1", "true", "yes", "on"}) or desktop_header in {"1", "true", "yes", "on"} or bool(session.get("desktop_client"))
 
 
+def enforced_auto_login_context():
+    requested = str(
+        request.headers.get(ENFORCED_AUTO_LOGIN_HEADER)
+        or request.args.get("enforced_auto_login")
+        or ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if requested and desktop_client_context():
+        session[ENFORCED_AUTO_LOGIN_SESSION_KEY] = True
+    if not bool(session.get(ENFORCED_AUTO_LOGIN_SESSION_KEY)):
+        return False
+    try:
+        return settings().get("kerberos_auto_login") == "1"
+    except Exception:
+        return False
+
+
+@app.before_request
+def capture_enforced_auto_login_context():
+    enforced_auto_login_context()
+    return None
+
+
 def _session_datetime(value):
     if isinstance(value, datetime):
         return value
@@ -1769,9 +1768,12 @@ def _session_datetime(value):
 def session_soft_logged_out(record):
     if not record:
         return False
-    if record.get("auth_provider") == "chrome_verified_access":
-        return True
     session_type = str(record.get("session_type") or "web").strip().lower()
+    if (
+        record.get("auth_provider") in {"chrome_verified_access", "kerberos"}
+        and session_type == "desktop"
+    ):
+        return True
     limit = SOFT_LOGOUT_AFTER_SECONDS_DESKTOP if session_type == "desktop" else SOFT_LOGOUT_AFTER_SECONDS_WEB
     reference = _session_datetime(record.get("last_full_activity")) or _session_datetime(record.get("created_at"))
     if reference is None:
@@ -2992,6 +2994,7 @@ def identity_provider_settings(data=None):
     normalized.update(SSO_SETTING_DEFAULTS)
     normalized.update(OIDC_SETTING_DEFAULTS)
     normalized.update(SAML_SETTING_DEFAULTS)
+    normalized.update(DESKTOP_AUTO_LOGIN_DEFAULTS)
     normalized.update({key: "" if value is None else str(value) for key, value in source.items() if key != LDAP_ROLE_MAPPING_SETTING})
     provider = str(normalized.get("identity_provider") or "local").strip().lower()
     if provider not in IDENTITY_PROVIDER_VALUES:
@@ -3385,7 +3388,7 @@ def change_ldap_password(dn, current_password, new_password, config):
             )
             try:
                 writer = user_connection if user_connection.bind(read_server_info=False) else connection
-                # A directory that rejects expired credentials can still verify the old password in the change operation.
+
                 if current_config["ldap_password_change_method"] == "active_directory":
                     changed = writer.extend.microsoft.modify_password(dn, new_password, old_password=current_password)
                 else:
@@ -3806,7 +3809,7 @@ def match_sso_user(provider, config, identity_result):
     email = identity_result.get("email")
     user = None
     if subject:
-        # Preserve existing provider links across upgrades and username changes.
+
         user = query_one(
             identity_user_select_clause() + " WHERE auth_provider=%s AND BINARY external_id=%s LIMIT 1",
             (provider, subject),
@@ -4000,11 +4003,17 @@ def begin_web_login_session(user, auth_provider="local"):
     user_agent = request.headers.get("User-Agent", "unknown")
     ip_address = client_ip()
     was_desktop_client = bool(session.get("desktop_client"))
+    was_enforced_auto_login = bool(session.get(ENFORCED_AUTO_LOGIN_SESSION_KEY))
+    previous_session_id = str(session.get("web_session_id") or "").strip()
+    previous_user_id = session.get("user_id")
+    previous_record = active_user_session_record(previous_session_id, previous_user_id) if previous_session_id else None
     now_value = time.time()
     session.clear()
     if was_desktop_client:
         session["desktop_client"] = True
         session.permanent = True
+    if was_enforced_auto_login:
+        session[ENFORCED_AUTO_LOGIN_SESSION_KEY] = True
     session["user_id"] = user["id"]
     session["username"] = user["username"]
     session["auth_provider"] = str(auth_provider or "local")
@@ -4018,6 +4027,12 @@ def begin_web_login_session(user, auth_provider="local"):
     session["web_session_touched_at"] = str(now_value)
     session["external_identity_checked_at"] = str(now_value)
     session["full_activity_touched_at"] = str(now_value)
+    if (
+        previous_session_id
+        and previous_session_id != session["web_session_id"]
+        and (previous_record or {}).get("auth_provider") in {"chrome_verified_access", "kerberos"}
+    ):
+        revoke_user_session_record(previous_session_id, previous_user_id)
     remember_accent_cookie(user)
 
 
@@ -4269,7 +4284,7 @@ def system_banner_records(ctx):
                 "level": "info",
                 "icon": "fa-solid fa-circle-info",
                 "message": "Login again to access all features",
-                "action_html": '<a class="system-banner-action" href="/login?reauth=1">Login</a>',
+                "action_html": '<a class="system-banner-action automatic-login-btn" href="/login?reauth=1&amp;desktop_from=dashboard">Login</a>',
                 "no_dismiss": True,
             }
         )
@@ -4433,14 +4448,21 @@ def legacy_sidebar_html(ctx, active):
             "</div>",
             '<div class="sidebar-account">',
             desktop_settings_button,
-            '<a class="login-btn" href="/login"><span class="nav-icon"><i class="fa-solid fa-sign-in-alt"></i></span><span class="nav-label">Login</span></a>',
+            '<a class="login-btn automatic-login-btn" href="/login" hidden aria-hidden="true"><span class="nav-icon"><i class="fa-solid fa-sign-in-alt"></i></span><span class="nav-label">Login</span></a>',
             '<div class="mobile-nav-divider"></div>',
             "</div>",
         ]
         return "\n    ".join(item for item in rendered if item)
     user_settings_class = ' class="active user-settings-link"' if active == "user-settings" else ' class="user-settings-link"'
     user_settings_link = f'<a href="/user/settings"{user_settings_class}><span class="nav-icon"><i class="fa-solid fa-user"></i></span><span class="nav-label">{h(ctx.get("username") or "User")}</span></a>'
-    logout_button = '<button class="logout-btn" onclick="logout()"><span class="nav-icon"><i class="fa-solid fa-sign-out-alt"></i></span><span class="nav-label">Logout</span></button>'
+    automatic_login_attrs = "" if getattr(g, "ops_soft_logout", False) else ' hidden aria-hidden="true"'
+    automatic_login_button = f'<a class="login-btn automatic-login-btn" href="/login?reauth=1&amp;desktop_from=dashboard"{automatic_login_attrs}><span class="nav-icon"><i class="fa-solid fa-sign-in-alt"></i></span><span class="nav-label">Login</span></a>'
+    logout_hidden = (
+        ' hidden aria-hidden="true"'
+        if ctx.get("is_desktop_client") and getattr(g, "ops_soft_logout", False)
+        else ""
+    )
+    logout_button = f'<button class="logout-btn" onclick="logout()"{logout_hidden}><span class="nav-icon"><i class="fa-solid fa-sign-out-alt"></i></span><span class="nav-label">Logout</span></button>'
     links = []
     if can_access_page(user, "dashboard"):
         links.append(("/dashboard", "house", "Dashboard", "dashboard"))
@@ -4496,6 +4518,7 @@ def legacy_sidebar_html(ctx, active):
         '<div class="sidebar-account">',
         desktop_settings_button,
         user_settings_link,
+        automatic_login_button,
         logout_button,
         '<div class="mobile-nav-divider"></div>',
         "</div>",
@@ -4860,13 +4883,24 @@ def sidebar(active="dashboard", is_admin=False, is_receiver=False):
         rendered.append(
             f'<a class="{cls}" href="{h(href)}"><span class="nav-icon"><i class="fa-solid fa-{icon}"></i></span><span class="nav-label">{h(label)}</span></a>'
         )
+    automatic_login_attrs = "" if getattr(g, "ops_soft_logout", False) else ' hidden aria-hidden="true"'
     rendered.append(
-        '<a class="logout" href="/logout"><span class="nav-icon"><i class="fa-solid fa-sign-out-alt"></i></span><span class="nav-label">Logout</span></a>'
+        f'<a class="login-btn automatic-login-btn" href="/login?reauth=1&amp;desktop_from=dashboard"{automatic_login_attrs}><span class="nav-icon"><i class="fa-solid fa-sign-in-alt"></i></span><span class="nav-label">Login</span></a>'
+    )
+    logout_hidden = (
+        ' hidden aria-hidden="true"'
+        if desktop_client_context() and getattr(g, "ops_soft_logout", False)
+        else ""
+    )
+    rendered.append(
+        f'<a class="logout" href="/logout"{logout_hidden}><span class="nav-icon"><i class="fa-solid fa-sign-out-alt"></i></span><span class="nav-label">Logout</span></a>'
     )
     return "\n".join(rendered)
 
 
 BASE_CSS = """
+*[hidden]{display:none!important}
+.sidebar a.automatic-login-btn[hidden],.sidebar a.logout[hidden],.system-banner-action.automatic-login-btn[hidden]{display:none!important}
 body,html{margin:0;padding:0;font-family:Tahoma,Arial,sans-serif;background:#fff;color:#222;min-height:100%}
 a{color:var(--ops-accent);text-decoration:none}a:hover{text-decoration:underline}
 .layout{display:flex;min-height:100vh}.sidebar{width:220px;background:var(--ops-accent);color:white;position:fixed;inset:0 auto 0 0;display:flex;flex-direction:column;box-shadow:2px 0 8px rgba(0,0,0,.2)}
@@ -4879,6 +4913,8 @@ input,select,textarea{box-sizing:border-box;width:100%;padding:10px;border:1px s
 """
 
 LEGACY_GENERIC_STYLE = """
+*[hidden]{display:none!important}
+#sidebar a.automatic-login-btn[hidden],#sidebar button.automatic-login-btn[hidden],#sidebar .logout-btn[hidden],#sidebar a.logout[hidden],.system-banner-action.automatic-login-btn[hidden]{display:none!important}
 body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:300; background-color:#FFF; height:100%; }
 #sidebar { width:220px; background-color:var(--ops-accent); color:#FFF; height:100vh; position:fixed; top:0; left:0; display:flex; flex-direction:column; box-shadow:2px 0 8px rgba(0,0,0,0.2); transition:transform 0.3s ease; z-index:1200; }
 @media (max-width:767px){ #sidebar{ transform:translateX(-100%); } #sidebar.open{ transform:translateX(0); } }
@@ -5709,14 +5745,15 @@ def bind_desktop_web_session(user, auth_provider="local", session_id=None):
     record = active_user_session_record(sid, (user or {}).get("id"))
     if not record:
         return False
-    if record.get("auth_provider") == "chrome_verified_access":
-        return False
     was_desktop_client = bool(session.get("desktop_client"))
+    was_enforced_auto_login = bool(session.get(ENFORCED_AUTO_LOGIN_SESSION_KEY))
     now_value = str(time.time())
     session.clear()
     if was_desktop_client:
         session["desktop_client"] = True
         session.permanent = True
+    if was_enforced_auto_login:
+        session[ENFORCED_AUTO_LOGIN_SESSION_KEY] = True
     session.pop(DESKTOP_GUEST_SESSION_KEY, None)
     session["user_id"] = (user or {}).get("id")
     session["username"] = (user or {}).get("username")
@@ -6000,6 +6037,51 @@ def desktop_session_chromeos():
     return chromeos_session()
 
 
+@alias("/desktop/session/kerberos", methods=["POST"])
+def desktop_session_kerberos():
+    from srv.web.kerberos_desktop_auth import kerberos_session
+
+    return kerberos_session()
+
+
+@alias("/desktop/session/enforced-downgrade", methods=["POST"])
+def desktop_session_enforced_downgrade():
+    if not str(request.headers.get(DESKTOP_CLIENT_HEADER) or "").strip():
+        return jsonify(error="Desktop client header required"), 400
+    if not enforced_auto_login_context() or settings().get("kerberos_auto_login") != "1":
+        return jsonify(error="Not found"), 404
+    user = desktop_authorized_user()
+    if not isinstance(user, dict) or not user:
+        return jsonify(error="Unauthorized"), 401
+    if str(user.get("role") or "").strip().lower() == "guest":
+        return jsonify(error="Unauthorized"), 403
+    full_user = query_one(
+        "SELECT id, username, email, role FROM users WHERE id=%s LIMIT 1",
+        (user.get("id"),),
+    )
+    if not full_user or user_account_is_expired(full_user):
+        return jsonify(error="Unauthorized"), 403
+    ttl = 7 * 86400
+    receiver_session_id = create_user_session_record(
+        full_user,
+        auth_provider="kerberos",
+        session_type="desktop",
+        expires_at=datetime.now() + timedelta(seconds=ttl),
+        ip_address=client_ip(),
+        user_agent=desktop_login_user_agent(),
+    )
+    old_session_id = desktop_user_session_id(user)
+    if old_session_id and old_session_id != receiver_session_id:
+        revoke_user_session_record(old_session_id, user.get("id"))
+    return desktop_session_json(
+        full_user,
+        session_id=receiver_session_id,
+        include_refresh=False,
+        token_ttl=ttl,
+        extra={"auto_login_provider": "kerberos"},
+    )
+
+
 @alias("/desktop/session/guest", methods=["POST"])
 def desktop_session_guest():
     if not str(request.headers.get(DESKTOP_CLIENT_HEADER) or "").strip():
@@ -6028,7 +6110,19 @@ def desktop_session_token():
         session["desktop_client"] = True
         session["web_session_touched_at"] = now_value
     set_desktop_guest_session(False)
-    return desktop_session_json(user, session_id=web_session_id)
+    session_record = active_user_session_record(web_session_id, user.get("id")) if web_session_id else None
+    receiver_provider = str((session_record or {}).get("auth_provider") or "").strip().lower()
+    receiver_session_type = str((session_record or {}).get("session_type") or "").strip().lower()
+    receiver_only = (
+        receiver_provider in {"chrome_verified_access", "kerberos"}
+        and receiver_session_type == "desktop"
+    )
+    return desktop_session_json(
+        user,
+        session_id=web_session_id,
+        include_refresh=not receiver_only,
+        extra={"auto_login_provider": receiver_provider} if receiver_only else None,
+    )
 
 
 @alias("/desktop/session/web-login", methods=["POST"])
@@ -6117,6 +6211,8 @@ def desktop_app_settings_placeholder():
 
 @alias("/desktop/server-info", methods=["GET"])
 def desktop_server_info():
+    from srv.web.kerberos_desktop_auth import KEYTAB_FILE
+
     config = identity_provider_settings()
     provider = configured_identity_provider(config)
     if provider not in REDIRECT_IDENTITY_PROVIDER_VALUES:
@@ -6131,6 +6227,13 @@ def desktop_server_info():
         desktop_sso_start_path="/desktop/sso/start" if provider else "",
         desktop_sso_poll_path="/desktop/sso/poll" if provider else "",
         sso_auto_redirect=bool(provider and identity_redirect_auto_enabled(config)),
+        kerberos_auto_login=bool(
+            config.get("kerberos_auto_login") == "1"
+            and str(config.get("kerberos_spn") or "").strip()
+            and KEYTAB_FILE.is_file()
+        ),
+        kerberos_spn=str(config.get("kerberos_spn") or "").strip(),
+        kerberos_session_path="/desktop/session/kerberos",
     )
 
 
@@ -6655,6 +6758,11 @@ def settings_general():
     return dispatch_web_page("admin/settings/general")
 
 
+@alias("/admin/settings/polices", methods=["GET", "POST"])
+def settings_polices():
+    return dispatch_web_page("admin/settings/polices")
+
+
 @alias("/admin/settings/multicast-gateway", methods=["GET", "POST"])
 def settings_multicast_gateway():
     return dispatch_web_page("admin/settings/multicast-gateway")
@@ -6752,15 +6860,7 @@ def settings_about():
 
 @alias("/admin/settings/acknowledgments")
 def settings_acknowledgments():
-    user = require_admin()
-    if not isinstance(user, dict):
-        return user
-    if not ACKNOWLEDGMENTS_PATH.is_file():
-        abort(404)
-    return Response(
-        ACKNOWLEDGMENTS_PATH.read_text(encoding="utf-8"),
-        mimetype="text/plain",
-    )
+    return dispatch_web_page("admin/settings/acknowledgments")
 
 
 @alias("/demo-mode")

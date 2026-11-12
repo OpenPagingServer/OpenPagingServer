@@ -1073,6 +1073,7 @@ HTTP_REQUEST_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEA
 HTTP_REQUEST_AUTH_TYPES = {"none", "basic", "digest", "apikey"}
 HTTP_REQUEST_DEFAULT_TIMEOUT = 30
 HTTP_REQUEST_VARIABLE_RE = re.compile(r"\$\{(shortmessage|longmessage|color)(?::([^}]+))?\}", re.IGNORECASE)
+HTTP_REQUEST_MESSAGE_VARIABLE_RE = re.compile(r"\$\{vs:([^{}]*)\}", re.IGNORECASE)
 SERVICE_MONITOR_MODULE = "servicemonitor"
 SERVICE_MONITOR_TABLE = "endpoints-input-servicemonitor"
 SERVICE_MONITOR_NAME = "Service Monitor"
@@ -2511,6 +2512,86 @@ def http_request_rows_for_targets(targets):
         elif lowered.isdigit():
             wanted_ids.add(lowered)
     return [row for row in rows if str(row.get("id")) in wanted_ids]
+
+
+def http_request_split_message_variable_parameters(raw):
+    """Split comma-delimited vs parameters while preserving dropdown brackets."""
+    parts, current, bracket_depth, paren_depth = [], [], 0, 0
+    for char in str(raw or ""):
+        if char == "[":
+            bracket_depth += 1
+        elif char == "]" and bracket_depth:
+            bracket_depth -= 1
+        elif char == "(" and bracket_depth == 0:
+            paren_depth += 1
+        elif char == ")" and paren_depth:
+            paren_depth -= 1
+        if char == "," and bracket_depth == 0 and paren_depth == 0:
+            parts.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+    parts.append("".join(current).strip())
+    return parts
+
+
+def http_request_message_variable_definition(raw):
+    parts = http_request_split_message_variable_parameters(raw)
+    if len(parts) < 3:
+        return None
+    brand, name = parts[0].strip(), parts[1].strip()
+    raw_kind = parts[2].strip()
+    kind = raw_kind.lower()
+    default = ",".join(parts[3:]).strip() if len(parts) > 3 else ""
+    if not name or not re.fullmatch(r"[A-Za-z0-9 _.-]+", name):
+        return None
+    options, option_labels, minimum, maximum = [], [], 1, 100
+    if kind in {"txt", "num", "abc"}:
+        pass
+    elif kind == "r_-_":
+        kind = "range"
+    elif kind.startswith("r_"):
+        match = re.fullmatch(r"r_(-?\d+(?:\.\d+)?)_(-?\d+(?:\.\d+)?)", kind)
+        if not match:
+            return None
+        minimum, maximum = float(match.group(1)), float(match.group(2))
+        if minimum > maximum:
+            minimum, maximum = maximum, minimum
+        kind = "range"
+    elif kind.startswith("dd["):
+        dropdown_match = re.fullmatch(r"dd\[([^\]]*)\](?:\(([^)]*)\))?", raw_kind, re.IGNORECASE)
+        if not dropdown_match:
+            return None
+        options = [item.strip() for item in dropdown_match.group(1).split(",") if item.strip()]
+        if not options:
+            return None
+        labels = [item.strip() for item in (dropdown_match.group(2) or "").split(",")]
+        option_labels = [labels[index] if index < len(labels) and labels[index] else option
+                         for index, option in enumerate(options)]
+        kind = "dropdown"
+    else:
+        return None
+    canonical = json.dumps([brand.casefold(), name.casefold(), kind, minimum, maximum,
+                            [item.casefold() for item in options],
+                            [item.casefold() for item in option_labels]], separators=(",", ":"))
+    key = "vs_" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20]
+    return {"brand": brand, "name": name, "type": kind, "default": default, "options": options,
+            "option_labels": option_labels,
+            "min": minimum, "max": maximum, "key": key}
+
+
+def http_request_message_variable_definitions(rows=None):
+    definitions = {}
+    for row in rows if rows is not None else http_request_rows():
+        sources = [row.get("url"), row.get("body"), row.get("auth_header_value")]
+        for header in sip_clean_headers(row.get("headers_json")):
+            sources.extend((header.get("name"), header.get("value")))
+        for source in sources:
+            for match in HTTP_REQUEST_MESSAGE_VARIABLE_RE.finditer(str(source or "")):
+                definition = http_request_message_variable_definition(match.group(1))
+                if definition:
+                    definitions.setdefault(definition["key"], definition)
+    return list(definitions.values())
 
 
 SERVICE_MONITOR_MESSAGE_FIELDS = (
@@ -5307,8 +5388,8 @@ class SipOutputSession:
 
     def playback_page_audio(self, call):
         sender = SipRtpSender(call)
-        # A short preroll opens NAT/device jitter buffers without putting a
-        # quarter-second of silence in front of every live page.
+
+
         sender.prime(frame_count=3)
         next_send = time.monotonic()
         while not self.stop_event.is_set():
@@ -6388,8 +6469,8 @@ class MulticastRTPSource:
             if len(self.partial_frame) > max_bytes:
                 target_bytes = LIVE_AUDIO_TARGET_BUFFER_FRAMES * MULTICAST_RTP_FRAME_SIZE
                 drop_bytes = len(self.partial_frame) - target_bytes
-                # Keep frame boundaries intact so a latency correction cannot
-                # corrupt PCM alignment.
+
+
                 drop_bytes -= drop_bytes % MULTICAST_RTP_FRAME_SIZE
                 if drop_bytes > 0:
                     del self.partial_frame[:drop_bytes]
@@ -7469,6 +7550,19 @@ def http_request_form_html(values, error, submit_label):
 <button type="button" class="http-var-choice" onclick="httpVarWizard('time')">Time</button>
 <button type="button" class="http-var-choice" onclick="httpVarWizard('sender')">Sender</button>
 <button type="button" class="http-var-choice" onclick="httpVarInsert('${{productname}}')">Product Name</button>
+<button type="button" class="http-var-choice" onclick="httpVarWizard('messagespecific')">Message Specific</button>
+</div>
+<div id="httpVarWizardMessagespecific" class="http-var-wizard">
+<div class="http-var-row"><label>Manufacturer / brand (optional)</label><input class="control" id="httpVsBrand" placeholder="Leave blank for HTTP Requests"></div>
+<div class="http-var-row"><label>Variable name</label><input class="control" id="httpVsName" placeholder="Room number"></div>
+<div class="http-var-row"><label>Data type</label><select class="control" id="httpVsType" onchange="syncHttpVsOptions()"><option value="txt">Text</option><option value="num">Numbers only</option><option value="abc">Letters only</option><option value="range">Range</option><option value="dropdown">Dropdown</option></select></div>
+<div id="httpVsRange" style="display:none;grid-template-columns:1fr 1fr;gap:12px"><div class="http-var-row"><label>Minimum</label><input class="control" type="number" id="httpVsMin" value="1"></div><div class="http-var-row"><label>Maximum</label><input class="control" type="number" id="httpVsMax" value="100"></div></div>
+<div class="http-var-row" id="httpVsDropdown" style="display:none"><label>Dropdown selections</label>
+<div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto;gap:8px;margin-bottom:6px;font-size:.88em;color:#666"><span>Value sent</span><span>Friendly name</span><span></span></div>
+<div id="httpVsChoiceRows" style="display:grid;gap:8px"></div>
+<button type="button" class="button" style="margin-top:8px" onclick="addHttpVsChoiceRow()">+ Add selection</button></div>
+<div class="http-var-row"><label>Default value (optional)</label><input class="control" id="httpVsDefault" placeholder="Shown in gray on messages"></div>
+<button type="button" class="button" onclick="httpVarInsertMessageSpecific()">Insert Variable</button>
 </div>
 <div id="httpVarWizardShortmessage" class="http-var-wizard">
 <div class="http-var-row"><label>Choose a space format</label>
@@ -7617,7 +7711,7 @@ function httpVarWizard(key) {{
   document.getElementById('httpVarList').style.display = 'none';
   var wizards = document.querySelectorAll('.http-var-wizard');
   for (var i = 0; i < wizards.length; i++) wizards[i].classList.remove('open');
-  var titles = {{'shortmessage':'Short Message','longmessage':'Long Message','date':'Date','datetime':'Date + Time','time':'Time','sender':'Sender'}};
+  var titles = {{'shortmessage':'Short Message','longmessage':'Long Message','date':'Date','datetime':'Date + Time','time':'Time','sender':'Sender','messagespecific':'Message Specific'}};
   document.getElementById('httpVarTitle').textContent = titles[key] || 'Insert Variable';
   var id = 'httpVarWizard' + key.charAt(0).toUpperCase() + key.slice(1);
   var wizard = document.getElementById(id);
@@ -7635,6 +7729,49 @@ function httpVarInsert(snippet) {{
   if (typeof field.setSelectionRange === 'function') field.setSelectionRange(caret, caret);
   field.focus();
   closeHttpVarPicker();
+}}
+function syncHttpVsOptions() {{
+  var type = document.getElementById('httpVsType').value;
+  document.getElementById('httpVsRange').style.display = type === 'range' ? 'grid' : 'none';
+  document.getElementById('httpVsDropdown').style.display = type === 'dropdown' ? 'block' : 'none';
+  if (type === 'dropdown' && !document.getElementById('httpVsChoiceRows').children.length) addHttpVsChoiceRow();
+}}
+function addHttpVsChoiceRow(value, label) {{
+  var row = document.createElement('div');
+  row.className = 'http-vs-choice-row';
+  row.style.cssText = 'display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto;gap:8px;align-items:center';
+  row.innerHTML = '<input class="control http-vs-choice-value" placeholder="Value"><input class="control http-vs-choice-label" placeholder="Friendly name"><button type="button" class="danger" title="Remove selection">&minus;</button>';
+  row.querySelector('.http-vs-choice-value').value = value || '';
+  row.querySelector('.http-vs-choice-label').value = label || '';
+  row.querySelector('button').addEventListener('click', function() {{ row.remove(); }});
+  document.getElementById('httpVsChoiceRows').appendChild(row);
+}}
+function httpVarInsertMessageSpecific() {{
+  var brand = document.getElementById('httpVsBrand').value.trim();
+  var name = document.getElementById('httpVsName').value.trim();
+  var type = document.getElementById('httpVsType').value;
+  var defaultValue = document.getElementById('httpVsDefault').value.trim();
+  if (!name) {{ document.getElementById('httpVsName').focus(); return; }}
+  var token = type;
+  if (type === 'range') {{
+    token = 'r_' + (document.getElementById('httpVsMin').value || '1') + '_' + (document.getElementById('httpVsMax').value || '100');
+  }} else if (type === 'dropdown') {{
+    var rows = Array.prototype.slice.call(document.querySelectorAll('#httpVsChoiceRows .http-vs-choice-row'));
+    var choices = [], labels = [];
+    rows.forEach(function(row) {{
+      var value = row.querySelector('.http-vs-choice-value').value.trim();
+      if (!value) return;
+      choices.push(value);
+      labels.push(row.querySelector('.http-vs-choice-label').value.trim() || value);
+    }});
+    if (!choices.length) {{
+      if (!rows.length) addHttpVsChoiceRow();
+      document.querySelector('#httpVsChoiceRows .http-vs-choice-value').focus();
+      return;
+    }}
+    token = 'dd[' + choices.join(',') + '](' + labels.join(',') + ')';
+  }}
+  httpVarInsert('${{vs:' + [brand, name, token, defaultValue].join(',') + '}}');
 }}
 function removeHttpHeaderRow(button) {{
   var row = button.closest('.http-header-row');
@@ -7693,6 +7830,22 @@ def http_request_expand_variables_with_cursor(text, metadata, cursor, space_form
     if not isinstance(issued, datetime):
         issued = datetime.now()
 
+    try:
+        from broadcasts import parse_vendor_specific
+        message_values = parse_vendor_specific(payload.get("vendor_specific") or "").get(HTTP_REQUEST_MODULE, {})
+    except Exception:
+        message_values = {}
+    if not isinstance(message_values, dict):
+        message_values = {}
+
+    def replace_message_variable(match):
+        definition = http_request_message_variable_definition(match.group(1))
+        if not definition:
+            return match.group(0)
+        value = message_values.get(definition["key"], definition["default"])
+        value = definition["default"] if value in (None, "") else value
+        return http_request_space_value(value, space_format)
+
     def replace(match):
         key = str(match.group(1) or "").strip().lower()
         option = str(match.group(2) or "").strip()
@@ -7702,7 +7855,8 @@ def http_request_expand_variables_with_cursor(text, metadata, cursor, space_form
             return http_request_color_value(payload.get("color"))
         return match.group(0)
 
-    replaced = HTTP_REQUEST_VARIABLE_RE.sub(replace, raw_text)
+    replaced = HTTP_REQUEST_MESSAGE_VARIABLE_RE.sub(replace_message_variable, raw_text)
+    replaced = HTTP_REQUEST_VARIABLE_RE.sub(replace, replaced)
     return expand_message_variables(
         replaced,
         cursor,
@@ -7729,6 +7883,53 @@ class BuiltinHttpRequestWeb:
         return {
             "request": {"label": HTTP_REQUEST_NAME, "description": HTTP_REQUEST_DESCRIPTION},
         }
+
+    def render_message_vendor_specific(self, value="", field_name="", context=None):
+        try:
+            from broadcasts import parse_vendor_specific
+            current = parse_vendor_specific(json.dumps({HTTP_REQUEST_MODULE: value})).get(HTTP_REQUEST_MODULE, {}) if not isinstance(value, dict) else value
+        except Exception:
+            current = {}
+        if not isinstance(current, dict):
+            current = {}
+        definitions = http_request_message_variable_definitions()
+        if not definitions:
+            return ""
+        groups = {}
+        for definition in definitions:
+            group_key = definition["brand"].casefold()
+            groups.setdefault(group_key, {"title": definition["brand"], "items": []})["items"].append(definition)
+        sections = []
+        for group in groups.values():
+            brand, items = group["title"], group["items"]
+            fields = []
+            for item in items:
+                key, label = item["key"], h(item["name"])
+                saved = str(current.get(key) or "")
+                placeholder = h(item["default"])
+                name = h(f"{field_name}__{key}")
+                if item["type"] == "dropdown":
+                    if item["default"] in item["options"]:
+                        placeholder = h(item["option_labels"][item["options"].index(item["default"])])
+                    choices = [f'<option value="">{placeholder or "Select..."}</option>']
+                    choices.extend(
+                        f'<option value="{h(option)}"{" selected" if saved == option else ""}>{h(item["option_labels"][index])}</option>'
+                        for index, option in enumerate(item["options"])
+                    )
+                    control = f'<select class="control" name="{name}">{"".join(choices)}</select>'
+                else:
+                    attrs = ' type="text"'
+                    if item["type"] == "num":
+                        attrs = ' type="number"'
+                    elif item["type"] == "abc":
+                        attrs = ' type="text" pattern="[A-Za-z ]*" title="Letters only"'
+                    elif item["type"] == "range":
+                        attrs = f' type="number" min="{item["min"]:g}" max="{item["max"]:g}"'
+                    control = f'<input class="control" name="{name}" value="{h(saved)}" placeholder="{placeholder}"{attrs}>'
+                fields.append(f'<div class="row"><label>{label}</label>{control}</div>')
+            sections.append({"title": brand or HTTP_REQUEST_NAME,
+                             "html": '<div class="grid">' + "".join(fields) + '</div>'})
+        return {"sections": sections}
 
     def render_form(self, form_type, request, conn_factory, page, user):
         ensure_httprequest_schema()
@@ -9183,9 +9384,9 @@ def audio_frames(audio_files_str):
         if not file_path:
             continue
         if is_8k_ulaw(file_path):
-            # Read through the WAV container. Reading the file directly also
-            # streams its RIFF header as audio, which is heard as a burst of
-            # static at the start of otherwise valid 8 kHz mu-law tones.
+
+
+
             with wave.open(file_path, "rb") as handle:
                 while True:
                     chunk = handle.readframes(160)
@@ -10736,9 +10937,9 @@ def deliver_broadcast(stream_id, broadcast_id):
             except Exception as exc:
                 log(f"broadcast recording start error broadcast={broadcast_id}: {exc}")
             frame_duration = 160 / 8000
-            # Prerecorded audio must still leave on the same 20 ms media clock
-            # as live audio. Starting the clock in the past used to burst the
-            # first 300 ms into endpoint and browser queues.
+
+
+
             next_send_time = time.perf_counter()
             stop_check_interval = max(1, int(0.5 / frame_duration))
             frames_since_stop_check = 0
@@ -10788,9 +10989,9 @@ def deliver_broadcast(stream_id, broadcast_id):
                 if sleep_time > 0:
                     time.sleep(sleep_time)
                 else:
-                    # Do not catch up after a scheduler/decoder stall by
-                    # emitting several packets back-to-back. A slightly longer
-                    # bell is preferable to burst loss at every receiver.
+
+
+
                     next_send_time = time.perf_counter()
             try:
                 if desktop_sock is not None:

@@ -83,6 +83,8 @@ body, html { margin:0; padding:0; font-family:"Tahoma",sans-serif; font-weight:3
 .token-list { display:grid; gap:12px; }
 .token-item { border:1px solid #E5E7EB; border-radius:12px; padding:14px; background:#FAFBFD; }
 .token-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px; flex-wrap:wrap; }
+.token-delete { border:0; background:transparent; color:#B71C1C; cursor:pointer; border-radius:50%; width:36px; height:36px; font-size:1em; }
+.token-delete:hover { background:#FFEBEE; }
 .token-name { font-weight:500; color:#202124; }
 .token-meta { display:flex; flex-wrap:wrap; gap:12px; color:#666; font-size:0.9em; }
 .token-create-form { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; }
@@ -248,14 +250,14 @@ def handle_request():
             active_tab = "general"
         if active_tab == "sessions":
             history_limit = session_history_limit_value(request.form.get("limit") or history_limit)
-        if demo_mode_enabled() and action in {"change_password", "create_api_token"}:
+        if demo_mode_enabled() and action in {"change_password", "create_api_token", "delete_api_token"}:
             return demo_mode_iframe_html("user-settings")
         if action == "save_style":
             theme = str(request.form.get("theme") or "system").strip().lower()
             accent_color = str(request.form.get("accent_color") or "orange").strip().lower()
             custom_css_allowed = str(ctx["settings"].get("allow_user_custom_css", "1")) == "1"
             custom_css = str(request.form.get("CSS") or "")
-            valid_accents = {"orange", "blue", "blue-green", "green", "yellow", "red", "red-violet", "violet", "blue-violet"}
+            valid_accents = set(ACCENT_COLORS)
             if theme not in {"system", "light", "dark"} or accent_color not in valid_accents:
                 error_html = '<div class="error">Select a valid theme and accent color.</div>'
             else:
@@ -329,6 +331,18 @@ def handle_request():
                     return redirect("/user/settings?tab=api-keys")
                 except RuntimeError as exc:
                     error_html = f'<div class="error">{h(str(exc))}</div>'
+        elif action == "delete_api_token" and api_enabled:
+            active_tab = "api-keys"
+            try:
+                token_id = int(str(request.form.get("api_token_id") or ""))
+            except ValueError:
+                token_id = 0
+            if token_id <= 0:
+                error_html = '<div class="error">API key not found.</div>'
+            else:
+                execute("DELETE FROM api_tokens WHERE id=%s AND user_id=%s", (token_id, user.get("id")))
+                session["user_settings_flash"] = "API key deleted."
+                return redirect("/user/settings?tab=api-keys")
         elif action in {"revoke_session", "logout_current_session"}:
             active_tab = "sessions"
             target_session_id = str(request.form.get("session_id") or "").strip()
@@ -411,11 +425,12 @@ def handle_request():
     custom_css_allowed = str(ctx["settings"].get("allow_user_custom_css", "1")) == "1"
     accent_choices = (
         ("orange", "Open Paging Orange (Default)", "#C8654C"),
-        ("blue", "Blue", "#1976D2"),
-        ("blue-green", "Blue-Green", "#00897B"),
-        ("green", "Green", "#388E3C"),
-        ("yellow", "Yellow", "#F9A825"),
-        ("red", "Red", "#D32F2F"),
+        ("generated-purple", "Generated Purple", "#BB86FC"),
+        ("blue", "Private-equity Blue", "#1976D2"),
+        ("blue-green", "Calm Blue-Green", "#00897B"),
+        ("green", "Go Green", "#388E3C"),
+        ("yellow", "Warning Yellow", "#F9A825"),
+        ("red", "Fire Red", "#D32F2F"),
         ("red-violet", "Red-Violet", "#C2185B"),
         ("violet", "Violet", "#7B1FA2"),
         ("blue-violet", "Blue-Violet", "#5E35B1"),
@@ -478,6 +493,12 @@ def handle_request():
                     <div>
                         <div class="token-name">{h(row.get("token_label") or "Untitled key")}</div>
                     </div>
+                    <form method="POST" action="/user/settings" onsubmit="return confirm('Delete this API key? This action cannot be undone.');">
+                        <input type="hidden" name="action" value="delete_api_token">
+                        <input type="hidden" name="tab" value="api-keys">
+                        <input type="hidden" name="api_token_id" value="{h(row.get('id'))}">
+                        <button class="token-delete" type="submit" title="Delete API key" aria-label="Delete API key"><i class="fa-solid fa-trash"></i></button>
+                    </form>
                 </div>
                 <div class="token-meta">
                     <span>Created: {h(format_datetime(row.get("created_at")))}</span>

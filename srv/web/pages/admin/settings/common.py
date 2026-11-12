@@ -149,6 +149,7 @@ def settings_tabs(active):
     demo = demo_mode_enabled()
     items = [
         ("general", "General", "/admin/settings/general"),
+        ("polices", "Polices", "/admin/settings/polices"),
         ("login", "Login", "/admin/settings/login"),
         ("identity", "Identity", "/admin/settings/identity"),
         ("sip", "SIP", "/admin/settings/sip"),

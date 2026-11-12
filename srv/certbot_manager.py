@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import uuid
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 CERTBOT_JOB_ROOT = Path(os.getenv("OPS_CERTBOT_JOB_PATH", "/var/lib/openpagingserver/certbot-jobs"))
@@ -23,6 +24,7 @@ CERTBOT_LOCK_RETRY_SECONDS = 15
 CERTBOT_ACCOUNT_JOBS = {}
 CERTBOT_ACCOUNT_JOBS_LOCK = threading.Lock()
 CERTBOT_CONFIG_ROOT = Path(os.getenv("OPS_CERTBOT_CONFIG_PATH", "/etc/letsencrypt"))
+CERTBOT_HTTP_ROOT = Path(os.getenv("OPS_CERTBOT_HTTP_PATH", "/var/lib/openpagingserver/acme-challenges"))
 HOSTNAME_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 EMAIL_RE = re.compile(r"^[^\s@,]+@[^\s@,]+\.[^\s@,]+$")
 
@@ -68,6 +70,31 @@ def certbot_supported_options(binary):
 
 def certbot_auth_hook_path():
     return Path(__file__).resolve().parent / "web" / "certbot_dns_auth.py"
+
+
+def certbot_http_hook_command(action):
+    arguments = [sys.executable, str(Path(__file__).resolve().parent / "web" / "certbot_http_challenge.py"), action]
+    return subprocess.list2cmdline(arguments) if os.name == "nt" else shlex.join(arguments)
+
+
+class _QuietChallengeHandler(SimpleHTTPRequestHandler):
+    def log_message(self, _format, *_args):
+        pass
+
+
+def start_temporary_http_challenge_server():
+    """Best-effort port 80 listener for HTTP-01 when the normal web listener is elsewhere."""
+    CERTBOT_HTTP_ROOT.mkdir(parents=True, exist_ok=True, mode=0o755)
+    handler = lambda *args, **kwargs: _QuietChallengeHandler(
+        *args, directory=str(CERTBOT_HTTP_ROOT), **kwargs
+    )
+    try:
+        server = ThreadingHTTPServer((os.getenv("WEB_HOST", "0.0.0.0"), 80), handler)
+    except OSError:
+        return None
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
 
 
 def find_account_emails(value):
@@ -290,24 +317,31 @@ def certbot_certificate_paths(certbot_name, binary=None):
     return certificate_path, private_key_path
 
 
-def build_certbot_command(binary, hook_command, certbot_name, hostnames, force_renewal=False, supported_options=None):
+def build_certbot_command(binary, hook_command, certbot_name, hostnames, force_renewal=False, supported_options=None, verification_method="dns"):
     options = certbot_supported_options(binary) if supported_options is None else frozenset(supported_options)
-    command = [
-        binary,
-        "certonly",
-        "--manual",
-        "--preferred-challenges",
-        "dns",
-        "--manual-auth-hook",
-        hook_command,
-        "--non-interactive",
-        "--cert-name",
-        certbot_name,
-    ]
-    if "--manual-public-ip-logging-ok" in options:
-        command.append("--manual-public-ip-logging-ok")
-    if "--no-autorenew" in options:
-        command.append("--no-autorenew")
+    method = str(verification_method or "dns").strip().lower()
+    if method not in {"http", "dns"}:
+        raise ValueError("Select HTTP or DNS verification.")
+    command = [binary, "certonly"]
+    if method == "http":
+        if any(hostname.startswith("*.") for hostname in hostnames):
+            raise ValueError("Wildcard certificates require DNS verification.")
+        CERTBOT_HTTP_ROOT.mkdir(parents=True, exist_ok=True, mode=0o755)
+        command.extend(["--webroot", "--webroot-path", str(CERTBOT_HTTP_ROOT), "--preferred-challenges", "http"])
+        command.extend(
+            [
+                "--pre-hook", certbot_http_hook_command("start"),
+                "--post-hook", certbot_http_hook_command("stop"),
+                "--deploy-hook", certbot_http_hook_command("deploy"),
+            ]
+        )
+    else:
+        command.extend(["--manual", "--preferred-challenges", "dns", "--manual-auth-hook", hook_command])
+        if "--manual-public-ip-logging-ok" in options:
+            command.append("--manual-public-ip-logging-ok")
+        if "--no-autorenew" in options:
+            command.append("--no-autorenew")
+    command.extend(["--non-interactive", "--cert-name", certbot_name])
     if force_renewal:
         command.append("--force-renewal")
     for hostname in hostnames:
@@ -484,6 +518,7 @@ def public_job(job):
         "private_key_path": job.get("private_key_path", ""),
         "certificate_id": job.get("certificate_id"),
         "renew_certificate_id": job.get("renew_certificate_id"),
+        "verification_method": job.get("verification_method", "dns"),
         "error": job.get("error", ""),
         "status_message": job.get("status_message", ""),
         "dns_name": job.get("dns_name", ""),
@@ -547,6 +582,13 @@ def watch_certbot_job(job_id):
         job["log_handle"].close()
     except Exception:
         pass
+    temporary_http_server = job.get("temporary_http_server")
+    if temporary_http_server is not None:
+        try:
+            temporary_http_server.shutdown()
+            temporary_http_server.server_close()
+        except OSError:
+            pass
     read_challenge_state(job)
     certificate_paths = None
     certificate_path_error = ""
@@ -575,7 +617,7 @@ def watch_certbot_job(job_id):
         current["status"] = "error"
 
 
-def start_certbot_job(hostname_values, existing_certbot_name=None, renew_certificate_id=None):
+def start_certbot_job(hostname_values, existing_certbot_name=None, renew_certificate_id=None, verification_method="dns"):
     runtime = certbot_runtime_status()
     binary = runtime.get("binary") if runtime.get("available") else None
     if not binary:
@@ -583,6 +625,9 @@ def start_certbot_job(hostname_values, existing_certbot_name=None, renew_certifi
     if not certbot_account_status(binary=binary).get("ready"):
         raise RuntimeError("Complete the Let's Encrypt account setup before requesting a certificate.")
     hostnames = normalize_hostnames(hostname_values)
+    verification_method = str(verification_method or "dns").strip().lower()
+    if verification_method not in {"http", "dns"}:
+        raise ValueError("Select HTTP or DNS verification.")
     certbot_name = str(existing_certbot_name or "").strip()
     if certbot_name:
         if "/" in certbot_name or "\\" in certbot_name or len(certbot_name) > 255:
@@ -611,8 +656,10 @@ def start_certbot_job(hostname_values, existing_certbot_name=None, renew_certifi
         certbot_name,
         hostnames,
         force_renewal=bool(renew_certificate_id),
+        verification_method=verification_method,
     )
     env = certbot_environment({"OPS_CERTBOT_JOB_DIR": str(job_dir)}, binary=binary)
+    temporary_http_server = start_temporary_http_challenge_server() if verification_method == "http" else None
     try:
         process = subprocess.Popen(
             command,
@@ -624,6 +671,9 @@ def start_certbot_job(hostname_values, existing_certbot_name=None, renew_certifi
             start_new_session=os.name != "nt",
         )
     except Exception:
+        if temporary_http_server is not None:
+            temporary_http_server.shutdown()
+            temporary_http_server.server_close()
         log_handle.close()
         raise
     job = {
@@ -640,6 +690,8 @@ def start_certbot_job(hostname_values, existing_certbot_name=None, renew_certifi
         "private_key_path": "",
         "certificate_id": int(renew_certificate_id) if renew_certificate_id else None,
         "renew_certificate_id": int(renew_certificate_id) if renew_certificate_id else None,
+        "verification_method": verification_method,
+        "temporary_http_server": temporary_http_server,
         "error": "",
         "status_message": "This may take several minutes...",
         "created_at": int(time.time()),

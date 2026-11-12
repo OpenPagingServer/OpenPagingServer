@@ -303,10 +303,6 @@ def sip_settings_body(ctx, data, detected_external_ipv4, user, unlock_page_token
     udp_disabled = "" if udp_checked else " disabled"
     tls_checked = " checked" if str(data.get("enable_secure_sip", "0") or "0") not in {"", "0"} else ""
     tls_disabled = "" if tls_checked else " disabled"
-    certificate_options = '<option value="">Select a certificate</option>' + "".join(
-        f'<option value="{int(record["id"])}"{" selected" if str(record["id"]) == str(data.get("secure_sip_certificate_id", "")) else ""}>{h(record.get("name"))}</option>'
-        for record in certificate_records()
-    )
     nat_enabled = clean_sip_nat_support_mode(data.get("sip_nat_support", "1")) != "no"
     nat_checked = " checked" if nat_enabled else ""
     sip_codec_order = stored_sip_codec_order(data.get("sip_codecs_order", ""))
@@ -620,11 +616,6 @@ def sip_settings_body(ctx, data, detected_external_ipv4, user, unlock_page_token
                         {docker_port_notice}
                         <span id="tlsPortError" class="port-error-text">Please enter a valid port (1-65535).</span>
                     </div>
-                    <div class="info-row" style="flex-direction: column; align-items: flex-start; gap: 8px; margin-bottom:16px;">
-                        <span class="info-label">Certificate</span>
-                        <select name="secure_sip_certificate_id" id="tlsCertificate"{tls_disabled}>{certificate_options}</select>
-                        <span class="info-description">Certificates are managed in the Certificates settings panel.</span>
-                    </div>
                 </div>
                 <div class="info-row" style="align-items:center; gap:16px; flex-wrap:wrap;">
                     <span class="info-label">RTP Port Range</span>
@@ -740,7 +731,6 @@ document.addEventListener('DOMContentLoaded', function() {
     const tlsSettings = document.getElementById('sipTlsSettings');
     const tlsPort = document.getElementById('tlsPort');
     const tlsPortError = document.getElementById('tlsPortError');
-    const tlsCertificate = document.getElementById('tlsCertificate');
     const natToggle = document.getElementById('natToggle');
     const natOptions = document.getElementById('natOptions');
     const externalIpv4ModeAuto = document.getElementById('externalIpv4ModeAuto');
@@ -940,7 +930,6 @@ __UNLOCK_RUNTIME_DECLARATIONS__
         const enabled = tlsToggle.checked;
         tlsSettings.style.display = enabled ? '' : 'none';
         tlsPort.disabled = !enabled;
-        tlsCertificate.disabled = !enabled;
         if (enabled) validatePortInput(tlsPort, tlsPortError, 1);
         else {
             tlsPort.classList.remove('invalid-port');
@@ -972,10 +961,9 @@ __UNLOCK_RUNTIME_DECLARATIONS__
     function validateForm() {
         const udpValid = !udpToggle.checked || validatePortInput(udpPort, udpPortError, 1);
         const tlsValid = !tlsToggle.checked || validatePortInput(tlsPort, tlsPortError, 1);
-        const certificateValid = !tlsToggle.checked || Boolean(tlsCertificate.value);
         const natValid = validateExternalIpv4();
         const rtpValid = validateRtpRange();
-        return udpValid && tlsValid && certificateValid && natValid && rtpValid;
+        return udpValid && tlsValid && natValid && rtpValid;
     }
 
     function syncSecurityHiddenValues() {
@@ -1304,7 +1292,6 @@ def handle_request():
         udp_port = request.form.get("insecure_sip_port", "5060").strip()
         tls_enabled = "1" if request.form.get("enable_secure_sip") else "0"
         tls_port = request.form.get("secure_sip_port", "5061").strip()
-        tls_certificate_id = request.form.get("secure_sip_certificate_id", data.get("secure_sip_certificate_id", "")).strip()
         nat_support = "1" if request.form.get("sip_nat_support") else "0"
         external_mode = str(request.form.get("sip_external_ipv4_mode", "auto") or "auto").strip().lower()
         stored_manual_external_ipv4 = str(data.get("sip_external_ipv4", "") or "").strip()
@@ -1349,16 +1336,6 @@ def handle_request():
         except ValueError:
             errors.append("Invalid SIP TLS port.")
 
-        if tls_enabled == "1":
-            certificate = certificate_record(tls_certificate_id)
-            if not certificate:
-                errors.append("Select a certificate when SIP over TLS is enabled.")
-            else:
-                try:
-                    validate_tls_certificate(certificate["certificate_path"], certificate["private_key_path"])
-                except ValueError as exc:
-                    errors.append(str(exc))
-
         try:
             rtp_start_number = int(rtp_port_start)
             rtp_end_number = int(rtp_port_end)
@@ -1389,7 +1366,6 @@ def handle_request():
                     "insecure_sip_port": udp_port,
                     "enable_secure_sip": tls_enabled,
                     "secure_sip_port": tls_port,
-                    "secure_sip_certificate_id": tls_certificate_id,
                     "sip_nat_support": nat_support,
                     "sip_external_ipv4_mode": external_mode,
                     "sip_external_ipv4": manual_external_ipv4,
@@ -1426,8 +1402,6 @@ def handle_request():
         save_setting("insecure_sip_port", udp_port, "SIP UDP/TCP Port")
         save_setting("enable_secure_sip", tls_enabled, "Enable SIP over TLS (0/1)")
         save_setting("secure_sip_port", tls_port, "Port for TLS SIP")
-        if tls_enabled == "1" and tls_certificate_id:
-            set_certificate_for_service("sip", tls_certificate_id)
         save_setting("sip_nat_support", nat_support, "Enable NAT support for SIP (0/1)")
         save_setting("sip_external_ipv4_mode", external_mode, "SIP external IPv4 mode (auto/manual)")
         save_setting("sip_external_ipv4", manual_external_ipv4, "Manual SIP external IPv4 address")

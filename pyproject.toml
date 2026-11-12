@@ -16,5 +16,6 @@ dependencies = [
     "ldap3",
     "authlib",
     "python3-saml",
-    "google-auth[requests]"
+    "google-auth[requests]",
+    "gssapi"
 ]

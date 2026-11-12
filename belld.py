@@ -481,9 +481,9 @@ def build_bell_cluster(schedule, events, start_index, day_value):
         event_start = bell_event_start(day_value, event)
         if included and event_start > cluster_end + bridge:
             break
-        # A run of short tones separated by bridge-sized gaps must not turn
-        # into an unbounded, hours-long WAV. Never split genuinely overlapping
-        # audio; doing that would create competing broadcasts at the receiver.
+
+
+
         separated = bool(included and event_start > cluster_end)
         if separated and (
             len(included) >= BELL_CLUSTER_MAX_EVENTS or event_start >= cluster_deadline

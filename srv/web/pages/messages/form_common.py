@@ -2001,6 +2001,17 @@ def normalize_vendor_renderer_payload(result, module_id):
     if result in (None, "", False):
         return None
     if isinstance(result, dict):
+        child_sections = result.get("sections")
+        if isinstance(child_sections, list):
+            normalized = []
+            for section in child_sections:
+                if not isinstance(section, dict):
+                    continue
+                section_html = section.get("html") or section.get("body") or ""
+                if section_html:
+                    normalized.append({"title": section.get("title") or section.get("label") or module_id,
+                                       "html": section_html})
+            return {"sections": normalized}
         html = result.get("html") or result.get("body") or ""
         if result.get("script"):
             html += f"\n<script>{result.get('script')}</script>"
@@ -2033,15 +2044,19 @@ def vendor_specific_editor_html(current_vendor_specific="", message=None, contex
             continue
         value = parse_vendor_specific(current_vendor_specific).get(module_id, "")
         result = normalize_vendor_renderer_payload(vendor_renderer_result(renderer, module_id, value, base_context), module_id)
-        if not result or not result["html"]:
+        if not result:
             continue
-        title = result["title"] or module_info.get("name") or module_id
-        sections.append(
-            f"""<details class="vendor-module">
+        rendered_sections = result.get("sections") or [result]
+        for rendered in rendered_sections:
+            if not rendered.get("html"):
+                continue
+            title = rendered.get("title") or module_info.get("name") or module_id
+            sections.append(
+                f"""<details class="vendor-module">
                     <summary>{h(title)}</summary>
-                    <div class="vendor-module-body">{result["html"]}</div>
+                    <div class="vendor-module-body">{rendered["html"]}</div>
                 </details>"""
-        )
+            )
     if not sections:
         return ""
     return f"""

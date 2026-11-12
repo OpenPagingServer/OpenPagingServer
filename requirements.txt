@@ -10,3 +10,4 @@ ldap3
 authlib
 python3-saml
 google-auth[requests]
+gssapi

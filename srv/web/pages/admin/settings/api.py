@@ -15,7 +15,6 @@ def handle_request():
         http_port = request.form.get("api_http_port", "8088").strip()
         https_enabled = "1" if request.form.get("api_https_enable") else "0"
         https_port = request.form.get("api_https_port", "8089").strip()
-        certificate_id = request.form.get("api_https_certificate_id", data.get("api_https_certificate_id", "")).strip()
         http_to_https = "1" if http_enabled == "1" and https_enabled == "1" and request.form.get("api_http_to_https") else "0"
         hsts_enabled = "1" if https_enabled == "1" and request.form.get("api_hsts") else "0"
         errors = []
@@ -50,15 +49,6 @@ def handle_request():
                 if str(api_port) == str(web_port):
                     errors.append(f"{api_label} and {web_label} ports must be different.")
 
-        if https_enabled == "1":
-            certificate = certificate_record(certificate_id)
-            if not certificate:
-                errors.append("Select a certificate when API HTTPS is enabled.")
-            else:
-                try:
-                    validate_tls_certificate(certificate["certificate_path"], certificate["private_key_path"])
-                except ValueError as exc:
-                    errors.append(str(exc))
         if errors:
             message = " ".join(dict.fromkeys(errors))
             return jsonify(status="error", message=message) if request.headers.get("X-Requested-With") == "XMLHttpRequest" else page("API Settings", h(message), "settings", user)
@@ -69,8 +59,6 @@ def handle_request():
         save_setting("api_https_port", https_port or "8089", "REST API HTTPS port")
         save_setting("api_http_to_https", http_to_https, "Automatically redirect API HTTP requests to HTTPS (0/1)")
         save_setting("api_hsts", hsts_enabled, "Send HSTS headers over API HTTPS (0/1)")
-        if https_enabled == "1" and certificate_id:
-            set_certificate_for_service("api", certificate_id)
         if request.headers.get("X-Requested-With") == "XMLHttpRequest":
             return jsonify(status="success")
         return redirect("/admin/settings/api")
@@ -82,10 +70,6 @@ def handle_request():
     https_disabled = "" if https_checked else " disabled"
     redirect_checked = " checked" if data.get("api_http_to_https", "0") == "1" else ""
     hsts_checked = " checked" if data.get("api_hsts", "0") == "1" else ""
-    certificate_options = '<option value="">Select a certificate</option>' + "".join(
-        f'<option value="{int(record["id"])}"{" selected" if str(record["id"]) == str(data.get("api_https_certificate_id", "")) else ""}>{h(record.get("name"))}</option>'
-        for record in certificate_records()
-    )
     body = f"""
     <div id="api" class="tab-content active">
         <div class="info-card login-settings">
@@ -109,11 +93,6 @@ def handle_request():
                         <span class="info-label">HTTPS Port</span>
                         <input type="number" name="api_https_port" id="apiHttpsPort" min="1" max="65535" value="{h(data.get("api_https_port", "8089") or "8089")}"{https_disabled}>
                         <span id="apiHttpsPortError" class="port-error-text">Please enter a valid port (1-65535).</span>
-                    </div>
-                    <div class="info-row" style="flex-direction:column; align-items:flex-start; gap:8px; border-bottom:none;">
-                        <span class="info-label">Certificate</span>
-                        <select name="api_https_certificate_id" id="apiHttpsCertificate"{https_disabled}>{certificate_options}</select>
-                        <span class="info-description">Certificates are managed in the Certificates settings panel.</span>
                     </div>
                     <div class="info-row" style="border-bottom:none;">
                         <span class="info-label">Auto Upgrade HTTP to HTTPS</span>
@@ -141,7 +120,6 @@ document.addEventListener('DOMContentLoaded', function() {
     const httpsSettings = document.getElementById('apiHttpsSettings');
     const httpsPort = document.getElementById('apiHttpsPort');
     const httpsPortError = document.getElementById('apiHttpsPortError');
-    const httpsCertificate = document.getElementById('apiHttpsCertificate');
     const redirectToggle = document.getElementById('apiHttpToHttpsToggle');
     const hstsToggle = document.getElementById('apiHstsToggle');
     function validatePort(input, error) {
@@ -166,7 +144,6 @@ document.addEventListener('DOMContentLoaded', function() {
         const enabled = httpsToggle.checked;
         httpsSettings.style.display = enabled ? '' : 'none';
         httpsPort.disabled = !enabled;
-        httpsCertificate.disabled = !enabled;
         hstsToggle.disabled = !enabled;
         redirectToggle.disabled = !enabled || !apiToggle.checked;
         if (enabled) validatePort(httpsPort, httpsPortError);

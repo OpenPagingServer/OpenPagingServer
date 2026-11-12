@@ -133,7 +133,7 @@ def save_certificate_record(action, record):
                 """
                 UPDATE certificates
                 SET name=%s, certificate_path=%s, private_key_path=%s, managed_upload=%s,
-                    certbot_name=NULL, certbot_domains=NULL
+                    certbot_name=NULL, certbot_domains=NULL, certbot_mode=NULL
                 WHERE id=%s
                 """,
                 (name, certificate_path, private_key_path, managed_upload, record["id"]),
@@ -186,13 +186,14 @@ def register_certbot_job(job):
         execute(
             """
             UPDATE certificates
-            SET certificate_path=%s, private_key_path=%s, certbot_domains=%s
+            SET certificate_path=%s, private_key_path=%s, certbot_domains=%s, certbot_mode=%s
             WHERE id=%s
             """,
             (
                 job["certificate_path"],
                 job["private_key_path"],
                 json.dumps(hostnames),
+                job.get("verification_method", "dns"),
                 existing["id"],
             ),
         )
@@ -204,8 +205,8 @@ def register_certbot_job(job):
     certificate_id = execute(
         """
         INSERT INTO certificates (
-            name, certificate_path, private_key_path, managed_upload, certbot_name, certbot_domains
-        ) VALUES (%s,%s,%s,0,%s,%s)
+            name, certificate_path, private_key_path, managed_upload, certbot_name, certbot_domains, certbot_mode
+        ) VALUES (%s,%s,%s,0,%s,%s,%s)
         """,
         (
             display_name,
@@ -213,6 +214,7 @@ def register_certbot_job(job):
             job["private_key_path"],
             job["certbot_name"],
             json.dumps(hostnames),
+            job.get("verification_method", "dns"),
         ),
     )
     set_certbot_job_certificate_id(job["id"], certificate_id)
@@ -250,20 +252,16 @@ def finish_certbot_job(job, data):
     enable_api = bool(request.form.get("enable_api_https")) and data.get("api_http_enable", "0") == "1"
     enable_sip = bool(request.form.get("enable_sip_tls")) and data.get("enable_insecure_sip", "0") == "1"
     selected = enable_web or enable_api or enable_sip
-    renewed_in_use = bool(job.get("renew_certificate_id") and certificate_usage(certificate_id))
-    restart_needed = selected or renewed_in_use
+    restart_needed = selected or bool(job.get("renew_certificate_id"))
     if restart_needed and not can_restart_openpagingserver():
         raise RuntimeError("The certificate was deployed, but OpenPagingServer cannot be restarted automatically on this server.")
     if enable_web:
-        set_certificate_for_service("web", certificate_id)
         save_setting("webserver_https_enable", "1", "HTTPs Enable (0/1)")
         save_setting("webserver_http_to_https", "1", "Automatically redirect HTTP requests to HTTPS (0/1)")
     if enable_api:
-        set_certificate_for_service("api", certificate_id)
         save_setting("api_https_enable", "1", "Enable REST API over HTTPS (0/1)")
         save_setting("api_http_to_https", "1", "Automatically redirect API HTTP requests to HTTPS (0/1)")
     if enable_sip:
-        set_certificate_for_service("sip", certificate_id)
         save_setting("enable_secure_sip", "1", "Enable SIP over TLS (0/1)")
     if restart_needed:
         schedule_openpagingserver_restart()
@@ -297,8 +295,6 @@ def render_page(user, message="", error=""):
     rows = []
     for record in records:
         usage = certificate_usage(record["id"])
-        usage_labels = {"web": "Web", "api": "API", "sip": "SIP"}
-        usage_html = ", ".join(usage_labels.get(service, service) for service in usage)
         expiry_html, expiry_class = expiration_label(record)
         source = "Certbot" if record.get("certbot_name") else "Uploaded" if int(record.get("managed_upload") or 0) else "Server paths"
         if record.get("certbot_name"):
@@ -310,7 +306,7 @@ def render_page(user, message="", error=""):
             if certbot_is_available:
                 update_button = (
                     f'<button type="button" class="md-icon-button certificate-certbot-renew" title="Renew certificate" aria-label="Renew certificate" '
-                    f'data-id="{int(record["id"])}" data-domains="{h(json.dumps(certbot_domains))}">{material_icon("restart")}</button>'
+                    f'data-id="{int(record["id"])}" data-mode="{h(record.get("certbot_mode") or "dns")}" data-domains="{h(json.dumps(certbot_domains))}">{material_icon("restart")}</button>'
                 )
             else:
                 update_button = f'<button type="button" class="md-icon-button" disabled title="Install Certbot to renew this certificate" aria-label="Renew certificate">{material_icon("restart")}</button>'
@@ -326,7 +322,6 @@ def render_page(user, message="", error=""):
                 <td><strong>{h(record.get("name"))}</strong><div class="certificate-subject">{h(record.get("subject") or "")}</div></td>
                 <td>{source}</td>
                 <td>{expiry_html}</td>
-                <td>{usage_html or '<span class="certificate-unused">Not in use</span>'}</td>
                 <td class="certificate-actions">
                     {update_button}
                     <form method="post" onsubmit="return confirm('Delete this certificate?');">
@@ -338,7 +333,7 @@ def render_page(user, message="", error=""):
             </tr>
             """
         )
-    table_body = "".join(rows) or '<tr><td colspan="5" class="certificate-empty">No certificates are available.</td></tr>'
+    table_body = "".join(rows) or '<tr><td colspan="4" class="certificate-empty">No certificates are available.</td></tr>'
     notice = f'<div class="certificate-notice success">{h(message)}</div>' if message else ""
     if error:
         notice = f'<div class="certificate-notice error">{h(error)}</div>'
@@ -444,7 +439,7 @@ def render_page(user, message="", error=""):
             {notice}
             <div class="certificate-table-wrap">
                 <table class="certificate-table">
-                    <thead><tr><th>Name</th><th>Source</th><th>Expiration / Renewal</th><th>Used by</th><th>Actions</th></tr></thead>
+                    <thead><tr><th>Name</th><th>Source</th><th>Expiration / Renewal</th><th>Actions</th></tr></thead>
                     <tbody>{table_body}</tbody>
                 </table>
             </div>
@@ -519,6 +514,11 @@ def render_page(user, message="", error=""):
             <h2 id="certbotHostnamesTitle">Generate new using Certbot</h2>
             <p>Enter hostname(s) for this certificate</p>
             <form id="certbotHostnamesForm">
+                <fieldset style="border:0;padding:0;margin:0 0 16px">
+                    <legend class="info-label" style="margin-bottom:10px">Select a verification method</legend>
+                    <label style="display:block;margin:8px 0"><input type="radio" name="certbotVerificationMethod" value="http" checked> HTTP</label>
+                    <label style="display:block;margin:8px 0"><input type="radio" name="certbotVerificationMethod" value="dns"> DNS</label>
+                </fieldset>
                 <div id="certbotHostnameList"></div>
                 <button type="button" class="md-icon-button" id="certbotAddHostname" title="Add hostname" aria-label="Add hostname">{material_icon("add")}</button>
                 <div id="certbotHostnameError" class="certbot-error" style="margin-top:12px"></div>
@@ -664,8 +664,10 @@ document.addEventListener('DOMContentLoaded', function() {
         list.appendChild(row);
         input.focus();
     }
-    function openCertbotHostnames(hostnames, certificateId) {
+    function openCertbotHostnames(hostnames, certificateId, verificationMethod) {
         renewCertificateId = certificateId || '';
+        const mode = document.querySelector('input[name="certbotVerificationMethod"][value="' + (verificationMethod || 'http') + '"]');
+        if (mode) mode.checked = true;
         const list = document.getElementById('certbotHostnameList');
         list.innerHTML = '';
         const values = Array.isArray(hostnames) && hostnames.length ? hostnames : [''];
@@ -675,8 +677,8 @@ document.addEventListener('DOMContentLoaded', function() {
         document.getElementById('certbotHostnameError').innerText = '';
         openModal(certbotHostnamesModal);
     }
-    function beginCertbotFlow(hostnames, certificateId) {
-        pendingCertbotFlow = { hostnames: Array.isArray(hostnames) ? hostnames : [], certificateId: certificateId || '' };
+    function beginCertbotFlow(hostnames, certificateId, verificationMethod) {
+        pendingCertbotFlow = { hostnames: Array.isArray(hostnames) ? hostnames : [], certificateId: certificateId || '', verificationMethod: verificationMethod || 'http' };
         if (!certbotAvailable) {
             openModal(certbotInstallModal);
             return;
@@ -687,7 +689,7 @@ document.addEventListener('DOMContentLoaded', function() {
             document.getElementById('certbotAccountEmail').focus();
             return;
         }
-        openCertbotHostnames(pendingCertbotFlow.hostnames, pendingCertbotFlow.certificateId);
+        openCertbotHostnames(pendingCertbotFlow.hostnames, pendingCertbotFlow.certificateId, pendingCertbotFlow.verificationMethod);
     }
     if (certbotChoice) {
         certbotChoice.addEventListener('click', function() {
@@ -699,7 +701,7 @@ document.addEventListener('DOMContentLoaded', function() {
         button.addEventListener('click', function() {
             let domains = [];
             try { domains = JSON.parse(this.dataset.domains || '[]'); } catch (_error) {}
-            beginCertbotFlow(domains, this.dataset.id);
+            beginCertbotFlow(domains, this.dataset.id, this.dataset.mode);
         });
     });
     document.querySelectorAll('[data-close-certificate-modal]').forEach(button => button.addEventListener('click', closeModals));
@@ -795,7 +797,7 @@ document.addEventListener('DOMContentLoaded', function() {
             await waitForCertbotAccountJob(data.account_job.id);
             certbotAccountReady = true;
             certbotChoice.dataset.accountReady = '1';
-            openCertbotHostnames(pendingCertbotFlow.hostnames, pendingCertbotFlow.certificateId);
+            openCertbotHostnames(pendingCertbotFlow.hostnames, pendingCertbotFlow.certificateId, pendingCertbotFlow.verificationMethod);
         } catch (error) {
             errorElement.innerText = error && error.message ? error.message : "Unable to configure the Let's Encrypt account.";
             openModal(certbotAccountModal);
@@ -957,7 +959,8 @@ document.addEventListener('DOMContentLoaded', function() {
         const data = await certbotRequest({
             action: 'certbot_start',
             hostnames: hostnames,
-            renew_certificate_id: renewCertificateId
+            renew_certificate_id: renewCertificateId,
+            verification_method: (document.querySelector('input[name="certbotVerificationMethod"]:checked') || {}).value || 'http'
         });
         certbotJobId = data.job.id;
         certbotPollFailures = 0;
@@ -1119,6 +1122,9 @@ def handle_request():
                         request.form.getlist("hostnames"),
                         existing_certbot_name=renew_record.get("certbot_name") if renew_record else None,
                         renew_certificate_id=renew_record.get("id") if renew_record else None,
+                        verification_method=(
+                            renew_record.get("certbot_mode") if renew_record else request.form.get("verification_method")
+                        ) or "dns",
                     )
                 else:
                     job_id = str(request.form.get("job_id") or "").strip()
@@ -1137,6 +1143,7 @@ def handle_request():
                                 job.get("hostnames") or [],
                                 existing_certbot_name=job.get("certbot_name") if job.get("renew_certificate_id") else None,
                                 renew_certificate_id=job.get("renew_certificate_id"),
+                                verification_method=job.get("verification_method", "dns"),
                             )
                     elif action == "certbot_status":
                         if job.get("status") == "success":

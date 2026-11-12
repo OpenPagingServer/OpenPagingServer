@@ -27,6 +27,8 @@ MULTICAST_GATEWAY_BAN_SECONDS = 48 * 60 * 60
 MULTICAST_GATEWAY_FAILED_LIMIT = 5
 MAX_SPECIAL_JSON_BODY = 65536
 DEMO_MODAL_ENVIRON_KEY = "ops.demo_modal"
+ACME_CHALLENGE_PREFIX = "/.well-known/acme-challenge/"
+ACME_CHALLENGE_ROOT = Path(os.getenv("OPS_CERTBOT_HTTP_PATH", "/var/lib/openpagingserver/acme-challenges"))
 
 
 def connect(cursorclass=pymysql.cursors.DictCursor):
@@ -120,6 +122,7 @@ def read_web_settings():
         "api_https_privkey": "",
         "api_http_to_https": "0",
         "api_hsts": "0",
+        "_certificates": [],
     }
     if not all([DB_HOST, DB_USER, DB_NAME]):
         return defaults
@@ -139,6 +142,11 @@ def read_web_settings():
             )
             for row in cur.fetchall():
                 defaults[str(row["parameter"])] = str(row["value"])
+            try:
+                cur.execute("SELECT certificate_path, private_key_path, certbot_domains FROM certificates")
+                defaults["_certificates"] = list(cur.fetchall())
+            except pymysql.MySQLError:
+                defaults["_certificates"] = []
     finally:
         conn.close()
     return defaults
@@ -486,22 +494,92 @@ def send_redirect_response(client, location, head_only=False):
 
 
 def should_bypass_https_redirect(path, headers):
-    if path == MULTICAST_GATEWAY_PROVISION_PATH:
+    if path == MULTICAST_GATEWAY_PROVISION_PATH or path.startswith(ACME_CHALLENGE_PREFIX):
         return True
     upgrade = str((headers or {}).get("upgrade") or "").lower()
     return "websocket" in upgrade
 
 
-def create_ssl_context(cert_path, key_path):
-    certfile = str(cert_path or "").strip()
-    keyfile = str(key_path or "").strip()
-    if not certfile or not keyfile:
-        raise ValueError("HTTPS certificate and private key paths are required when HTTPS is enabled.")
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    if hasattr(ssl, "TLSVersion") and hasattr(ssl.TLSVersion, "TLSv1_2"):
-        context.minimum_version = ssl.TLSVersion.TLSv1_2
-    context.load_cert_chain(certfile=certfile, keyfile=keyfile)
-    return context
+def send_acme_challenge(client, path, head_only=False):
+    token = path[len(ACME_CHALLENGE_PREFIX):].split("?", 1)[0]
+    if not token or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for character in token):
+        body, status = b"Not found", "404 Not Found"
+    else:
+        try:
+            body, status = (ACME_CHALLENGE_ROOT / ".well-known" / "acme-challenge" / token).read_bytes(), "200 OK"
+        except OSError:
+            body, status = b"Not found", "404 Not Found"
+    header = (
+        f"HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+    ).encode("ascii")
+    client.sendall(header if head_only else header + body)
+
+
+def certificate_hostnames(record):
+    try:
+        configured = json.loads(record.get("certbot_domains") or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        configured = []
+    names = [str(value).strip().lower().rstrip(".") for value in configured if str(value).strip()]
+    try:
+        decoded = ssl._ssl._test_decode_cert(str(record.get("certificate_path") or ""))
+    except (OSError, ValueError, ssl.SSLError):
+        decoded = {}
+    names.extend(
+        str(value).strip().lower().rstrip(".")
+        for kind, value in decoded.get("subjectAltName", ())
+        if str(kind).lower() == "dns" and value
+    )
+    if not names:
+        for rdn in decoded.get("subject", ()):
+            for key, value in rdn:
+                if key == "commonName" and value:
+                    names.append(str(value).strip().lower().rstrip("."))
+    return tuple(dict.fromkeys(name for name in names if name))
+
+
+def hostname_matches(pattern, hostname):
+    pattern = str(pattern or "").lower().rstrip(".")
+    hostname = str(hostname or "").lower().rstrip(".")
+    if pattern.startswith("*."):
+        return hostname.endswith(pattern[1:]) and hostname.count(".") == pattern.count(".")
+    return bool(pattern and pattern == hostname)
+
+
+def create_ssl_context(certificates):
+    contexts = []
+    for record in certificates or []:
+        certfile = str(record.get("certificate_path") or "").strip()
+        keyfile = str(record.get("private_key_path") or "").strip()
+        candidate = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        if hasattr(ssl, "TLSVersion") and hasattr(ssl.TLSVersion, "TLSv1_2"):
+            candidate.minimum_version = ssl.TLSVersion.TLSv1_2
+        try:
+            candidate.load_cert_chain(certfile=certfile, keyfile=keyfile)
+        except (OSError, ssl.SSLError):
+            continue
+        names = certificate_hostnames(record)
+        if names:
+            contexts.append((names, candidate))
+    if not contexts:
+        return None, lambda _hostname: False
+    context = contexts[0][1]
+
+    def context_for_hostname(hostname):
+        for names, candidate in contexts:
+            if any(hostname_matches(name, hostname) for name in names):
+                return candidate
+        return None
+
+    def select_context(sock, server_name, _initial_context):
+        selected = context_for_hostname(server_name)
+        if selected is None:
+            return ssl.ALERT_DESCRIPTION_UNRECOGNIZED_NAME
+        sock.context = selected
+        return None
+
+    context.set_servername_callback(select_context)
+    return context, lambda hostname: context_for_hostname(hostname) is not None
 
 
 def query_one(sql, params=None):
@@ -594,7 +672,7 @@ def reject_forbidden(client, denied_html):
 
 
 class FrontServer:
-    def __init__(self, app, port, scheme="http", ssl_context=None, redirect_https_port=None, hsts_enabled=False):
+    def __init__(self, app, port, scheme="http", ssl_context=None, redirect_https_port=None, hsts_enabled=False, tls_hostname_checker=None):
         self.allowlist = parse_proxy_allowlist(os.getenv("WEB_REVERSE_PROXY_ALLOWED"))
         self.denied_html = load_reverse_proxy_denied_html()
         self.scheme = str(scheme or "http").lower()
@@ -608,6 +686,7 @@ class FrontServer:
         self.effective_port = self.listener.getsockname()[1]
         self.ssl_context = ssl_context
         self.redirect_https_port = int(redirect_https_port) if redirect_https_port else None
+        self.tls_hostname_checker = tls_hostname_checker
         self._closed = threading.Event()
         self._internal_thread = None
 
@@ -647,6 +726,9 @@ class FrontServer:
                 wrapped_client.close()
                 return
             request_line, path, headers = parse_request_head(head)
+            if path.startswith(ACME_CHALLENGE_PREFIX):
+                send_acme_challenge(wrapped_client, path, head_only=(request_method(request_line) == "HEAD"))
+                return
             if using_reverse_proxy_headers(headers) and not proxy_is_trusted(remote_addr, self.allowlist):
                 reject_forbidden(wrapped_client, self.denied_html)
                 wrapped_client.close()
@@ -655,7 +737,12 @@ class FrontServer:
             if client_ip != remote_addr and multicast_gateway_ban_store.is_banned(client_ip):
                 wrapped_client.close()
                 return
-            if self.redirect_https_port and not should_bypass_https_redirect(path, headers):
+            request_host = normalized_request_host(headers)
+            if (
+                self.redirect_https_port
+                and not should_bypass_https_redirect(path, headers)
+                and (self.tls_hostname_checker is None or self.tls_hostname_checker(request_host))
+            ):
                 location = "https://" + https_redirect_authority(headers, self.redirect_https_port) + parsed_request_target(request_line)
                 send_redirect_response(wrapped_client, location, head_only=(request_method(request_line) == "HEAD"))
                 return
@@ -673,8 +760,8 @@ class FrontServer:
                 handle_desktop_websocket_client(wrapped_client, addr, head)
                 return
             upstream = socket.create_connection(("127.0.0.1", self.internal_port), timeout=10)
-            if path == "/desktop/session/chromeos":
-                # The handler may need a Google token and an API call before responding.
+            if path in {"/desktop/session/chromeos", "/desktop/session/kerberos"}:
+
                 upstream.settimeout(30)
             upstream.sendall(
                 rewrite_request_head(
@@ -765,7 +852,7 @@ class FrontServer:
         send_json_response(client, status_code, response_payload)
 
 
-def create_front_server(app, port, scheme="http", ssl_context=None, redirect_https_port=None, hsts_enabled=False):
+def create_front_server(app, port, scheme="http", ssl_context=None, redirect_https_port=None, hsts_enabled=False, tls_hostname_checker=None):
     return FrontServer(
         app,
         port,
@@ -773,6 +860,7 @@ def create_front_server(app, port, scheme="http", ssl_context=None, redirect_htt
         ssl_context=ssl_context,
         redirect_https_port=redirect_https_port,
         hsts_enabled=hsts_enabled,
+        tls_hostname_checker=tls_hostname_checker,
     )
 
 
@@ -786,6 +874,7 @@ def server_ports(label, configured_port):
 
 def build_servers(settings):
     servers = []
+    ssl_context, tls_hostname_checker = create_ssl_context(settings.get("_certificates") or [])
     if enabled(settings.get("webserver_enable")):
         from srv.web.app import app as web_app, ensure_identity_access_schema, start_ldap_sync_worker
 
@@ -806,12 +895,12 @@ def build_servers(settings):
                 {
                     "scheme": "http",
                     "redirect_https_port": https_port if http_redirect else None,
+                    "tls_hostname_checker": tls_hostname_checker,
                     "hsts_enabled": False,
                 },
             )
         )
-        if https_enabled:
-            ssl_context = create_ssl_context(settings.get("webserver_https_cert"), settings.get("webserver_https_privkey"))
+        if https_enabled and ssl_context is not None:
             servers.append(
                 (
                     "web-https",
@@ -831,7 +920,7 @@ def build_servers(settings):
         from srv.api.app import app as api_app
 
         api_https_port = port_value(settings.get("api_https_port"), 8089)
-        if api_http_enabled:
+        if api_http_enabled or api_https_enabled:
             servers.append(
                 (
                     "api",
@@ -841,12 +930,12 @@ def build_servers(settings):
                     {
                         "scheme": "http",
                         "redirect_https_port": api_https_port if api_https_enabled and enabled(settings.get("api_http_to_https")) else None,
+                        "tls_hostname_checker": tls_hostname_checker,
                         "hsts_enabled": False,
                     },
                 )
             )
-        if api_https_enabled:
-            api_ssl_context = create_ssl_context(settings.get("api_https_cert"), settings.get("api_https_privkey"))
+        if api_https_enabled and ssl_context is not None:
             servers.append(
                 (
                     "api-https",
@@ -855,7 +944,7 @@ def build_servers(settings):
                     server_ports("api-https", settings.get("api_https_port")),
                     {
                         "scheme": "https",
-                        "ssl_context": api_ssl_context,
+                        "ssl_context": ssl_context,
                         "hsts_enabled": enabled(settings.get("api_hsts")),
                     },
                 )

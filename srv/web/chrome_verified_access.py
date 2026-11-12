@@ -38,8 +38,8 @@ def store_service_account(upload):
     except (GoogleAuthError, ValueError, TypeError) as exc:
         raise ValueError("Invalid service account key") from exc
 
-    # Publish the complete key atomically. NamedTemporaryFile creates it with
-    # owner-only permissions and the temporary name is on the same filesystem.
+
+
     temporary_path = None
     try:
         with tempfile.NamedTemporaryFile(dir=SERVICE_ACCOUNT_FILE.parent, prefix=".verified-access-", delete=False) as temporary:
@@ -52,8 +52,8 @@ def store_service_account(upload):
 
 
 def _attestation_fields(message):
-    # Chromium SignedData and ChallengeResponse contain length-delimited
-    # fields. Extract the signed challenge without trusting client metadata.
+
+
     fields = {}
     offset = 0
     while offset < len(message):
@@ -128,8 +128,8 @@ def _google_challenge(action, payload=None):
 
         credentials.refresh(refresh_request)
 
-    # Use IPv4 for Verified Access without changing networking for other OPS
-    # requests. Send the token and attestation to curl on stdin.
+
+
     config = [f"header = {json.dumps('Authorization: Bearer ' + credentials.token)}"]
     if payload is not None:
         config.append('header = "Content-Type: application/json"')
