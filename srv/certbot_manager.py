@@ -152,7 +152,12 @@ def certbot_account_status(config_root=None, binary=None):
     return {
         "registered": registered,
         "email": emails[0] if emails else "",
-        "ready": bool(registered and emails),
+        # Some Certbot/ACME versions do not retain the contact address in
+        # regr.json, and `show_account` output is not stable across versions.
+        # The account registration itself is what Certbot requires before an
+        # order can be created; a missing display email must not make a valid
+        # account unusable.
+        "ready": bool(registered),
     }
 
 
