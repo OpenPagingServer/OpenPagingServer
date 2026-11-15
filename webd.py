@@ -120,34 +120,43 @@ def read_web_settings():
         "api_hsts": "0",
         "_certificates": [],
     }
-    if not all([DB_HOST, DB_USER, DB_NAME]):
-        return defaults
-    try:
-        conn = db()
-    except Exception as exc:
-        print(f"webd database connection failed, using defaults: {exc}", flush=True)
-        return defaults
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT parameter, value FROM systemsettings WHERE parameter IN "
-                "('webserver_enable','webserver_http_port','webserver_https_enable','webserver_https_port',"
-                "'webserver_http_to_https','webserver_hsts','api_http_enable','api_http_port',"
-                "'api_https_enable','api_https_port','api_http_to_https','api_hsts')"
-            )
-            for row in cur.fetchall():
-                defaults[str(row["parameter"])] = str(row["value"])
+    if all([DB_HOST, DB_USER, DB_NAME]):
+        try:
+            conn = db()
+        except Exception as exc:
+            print(f"webd database connection failed, using defaults: {exc}", flush=True)
+        else:
             try:
-                cur.execute(
-                    "SELECT id, certificate_path, private_key_path, certbot_domains, "
-                    "UNIX_TIMESTAMP(updated_at) AS certificate_version "
-                    "FROM certificates ORDER BY id DESC"
-                )
-                defaults["_certificates"] = list(cur.fetchall())
-            except pymysql.MySQLError:
-                defaults["_certificates"] = []
-    finally:
-        conn.close()
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT parameter, value FROM systemsettings WHERE parameter IN "
+                        "('webserver_enable','webserver_http_port','webserver_https_enable','webserver_https_port',"
+                        "'webserver_http_to_https','webserver_hsts','api_http_enable','api_http_port',"
+                        "'api_https_enable','api_https_port','api_http_to_https','api_hsts')"
+                    )
+                    for row in cur.fetchall():
+                        defaults[str(row["parameter"])] = str(row["value"])
+                    try:
+                        cur.execute(
+                            "SELECT id, certificate_path, private_key_path, certbot_domains, "
+                            "UNIX_TIMESTAMP(updated_at) AS certificate_version "
+                            "FROM certificates ORDER BY id DESC"
+                        )
+                        defaults["_certificates"] = list(cur.fetchall())
+                    except pymysql.MySQLError:
+                        defaults["_certificates"] = []
+            finally:
+                conn.close()
+
+    # Docker owns the listener addresses.  The database remains the source of
+    # truth for native installs, but Compose's .env values must win in Docker.
+    if enabled(os.getenv("OPS_DOCKER_MODE")):
+        http_port = os.getenv("HTTP_PORT") or os.getenv("WEB_PORT")
+        if http_port:
+            defaults["webserver_http_port"] = http_port
+        https_port = os.getenv("HTTPS_PORT")
+        if https_port:
+            defaults["webserver_https_port"] = https_port
     return defaults
 
 
@@ -355,7 +364,11 @@ def create_waitress_server(app, port, trusted_proxy_allowlist=(), denied_html=No
     wrapped = HSTSMiddleware(app, hsts_enabled)
     wrapped = ReverseProxyTrustMiddleware(wrapped, trusted_proxy_allowlist, denied_html, default_scheme)
     wrapped = StripServerHeaderMiddleware(wrapped)
-    return create_server(wrapped, host="127.0.0.1", port=port, ident="")
+    try:
+        worker_threads = max(4, min(int(os.getenv("OPS_WEB_THREADS", "12")), 64))
+    except (TypeError, ValueError):
+        worker_threads = 12
+    return create_server(wrapped, host="127.0.0.1", port=port, ident="", threads=worker_threads)
 
 
 def recv_until(sock, marker, limit=65536):
@@ -944,6 +957,8 @@ def create_front_server(app, port, scheme="http", ssl_context=None, redirect_htt
 
 
 def server_ports(label, configured_port):
+    if enabled(os.getenv("OPS_DOCKER_MODE")):
+        return [port_value(configured_port, 443 if label == "web-https" else 80)]
     if label == "web":
         return ports_to_try(configured_port, 80)
     if label == "web-https":

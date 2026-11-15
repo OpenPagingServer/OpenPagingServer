@@ -598,8 +598,32 @@ def load_persisted_certbot_job(job_id):
         "error": str(payload.get("error") or ""),
         "status_message": str(payload.get("status_message") or "This may take several minutes..."),
         "created_at": payload.get("created_at"),
+        "dns_name": str(payload.get("dns_name") or ""),
+        "dns_value": str(payload.get("dns_value") or ""),
+        "challenges": list(payload.get("challenges") or []),
+        "challenge_number": payload.get("challenge_number", 1),
+        "challenge_total": payload.get("challenge_total", len(hostnames) or 1),
+        "external_observations": dict(payload.get("external_observations") or {}),
+        "ready_resolvers": list(payload.get("ready_resolvers") or []),
+        "next_check_at": payload.get("next_check_at"),
         "rehydrated": True,
     }
+
+
+def active_persisted_certbot_job():
+    """Return an in-progress job even when another web worker started it."""
+    try:
+        job_ids = [item.name for item in CERTBOT_JOB_ROOT.iterdir() if item.is_dir()]
+    except OSError:
+        return None
+    for job_id in job_ids:
+        job = load_persisted_certbot_job(job_id)
+        if not job or job.get("status") in {"success", "error", "cancelled"}:
+            continue
+        refresh_rehydrated_certbot_job(job)
+        if job.get("status") not in {"success", "error", "cancelled"}:
+            return job
+    return None
 
 
 def certbot_process_running(job):
@@ -736,6 +760,12 @@ def watch_certbot_job(job_id):
 
 
 def start_certbot_job(hostname_values, existing_certbot_name=None, renew_certificate_id=None, verification_method="dns"):
+    active_job = active_persisted_certbot_job()
+    if active_job:
+        raise RuntimeError(
+            "A Certbot certificate request is already running "
+            f"(job {active_job['id']}). Return to that request or cancel it before starting another."
+        )
     runtime = certbot_runtime_status()
     binary = runtime.get("binary") if runtime.get("available") else None
     if not binary:

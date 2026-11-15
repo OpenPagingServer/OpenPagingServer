@@ -18,6 +18,10 @@ def handle_request():
     if not isinstance(user, dict):
         return user
     data = ensure_certificate_schema(settings())
+    docker_mode = os.environ.get("OPS_DOCKER_MODE", "") == "1"
+    if docker_mode:
+        data["webserver_http_port"] = os.environ.get("HTTP_PORT") or os.environ.get("WEB_PORT") or data.get("webserver_http_port", "80")
+        data["webserver_https_port"] = os.environ.get("HTTPS_PORT") or data.get("webserver_https_port", "443")
     if request.method == "POST":
         if demo_mode_enabled():
             return jsonify(status="error", message="Demo Mode is enabled.") if request.headers.get("X-Requested-With") == "XMLHttpRequest" else demo_mode_page("Web Settings", legacy_user_context(user), "settings", "settings")
@@ -70,7 +74,6 @@ def handle_request():
     https_field_disabled = "" if https_checked else " disabled"
     http_to_https_checked = " checked" if data.get("webserver_http_to_https", "0") == "1" else ""
     hsts_checked = " checked" if data.get("webserver_hsts", "0") == "1" else ""
-    docker_mode = os.environ.get("OPS_DOCKER_MODE", "") == "1"
     docker_port_disabled = " disabled" if docker_mode else ""
     docker_port_style = ' style="background:rgba(0,0,0,0.05); color:#777;"' if docker_mode else ""
     docker_port_notice = '<div style="display:flex; align-items:center; gap:6px; margin-top:4px;"><svg width="16" height="16" viewBox="0 0 24 24" style="fill:var(--ops-accent)"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg><span style="color:var(--ops-accent); font-size:0.85em;">Change port by editing .env in Docker</span></div>' if docker_mode else ""

@@ -51,8 +51,11 @@ except ImportError:
         )
 try:
     from authlib.integrations.flask_client import OAuth
+    from authlib.integrations.flask_client.apps import FlaskOAuth2App
+    from authlib.integrations.requests_client import OAuth2Session
 except ImportError:
     OAuth = None
+    FlaskOAuth2App = OAuth2Session = None
 try:
     from onelogin.saml2.auth import OneLogin_Saml2_Auth
 except ImportError:
@@ -145,6 +148,10 @@ WEB_RATE_LIMIT_EXEMPT_PREFIXES = ("/bundled-assets/", "/assets/", "/favicon.ico"
 TEMP_ASSET_ACCESS_SECONDS = 48 * 60 * 60
 TEMP_ASSET_ACCESS = {}
 TEMP_ASSET_ACCESS_LOCK = threading.Lock()
+OIDC_FAILURE_LOCK = threading.Lock()
+OIDC_START_LOCK = threading.Lock()
+OIDC_UNAVAILABLE_UNTIL = 0.0
+OIDC_UNAVAILABLE_ERROR = ""
 DESKTOP_SSO_SESSION_KEY = "desktop_sso_request_id"
 DESKTOP_GUEST_SESSION_KEY = "desktop_guest_receiver"
 ENFORCED_AUTO_LOGIN_HEADER = "X-OPS-Enforced-Auto-Login"
@@ -2297,39 +2304,75 @@ def ldap_role_mappings(data=None):
     return normalize_ldap_role_mappings((source or {}).get(LDAP_ROLE_MAPPING_SETTING))
 
 
-def provider_role_mapping_for_identity(config, provider, raw_groups, claims_source=None):
+def provider_role_mappings_for_identity(config, provider, raw_groups, claims_source=None):
     fallback_mapping = None
+    matched_mappings = []
     for mapping in ldap_role_mappings(config) if provider == "ldap" else []:
         if str(mapping.get("fallback") or "0") == "1":
             fallback_mapping = mapping
             continue
         if groups_match_requirement(raw_groups, mapping.get("group_match")) and claims_match_requirement(claims_source or {}, mapping.get("claim_match")):
-            return mapping
-    return fallback_mapping
+            matched_mappings.append(mapping)
+    return matched_mappings or ([fallback_mapping] if fallback_mapping else [])
+
+
+def provider_role_mapping_for_identity(config, provider, raw_groups, claims_source=None):
+    mappings = provider_role_mappings_for_identity(config, provider, raw_groups, claims_source)
+    return mappings[0] if mappings else None
 
 
 def identity_access_profile(provider, config, raw_groups, claims_source=None):
     normalized_provider = str(provider or "").strip().lower()
     groups = normalize_identity_group_values(raw_groups or [])
-    mapping = provider_role_mapping_for_identity(config, normalized_provider, groups, claims_source)
-    if mapping:
-        role = normalize_identity_mapping_role(mapping.get("role"))
+    mappings = provider_role_mappings_for_identity(config, normalized_provider, groups, claims_source)
+    if mappings:
+        role_priority = {"none": 0, "receiver": 1, "user": 2, "admin": 3}
+        role = max(
+            (normalize_identity_mapping_role(mapping.get("role")) for mapping in mappings),
+            key=lambda value: role_priority.get(value, 1),
+        )
+        recipient_groups = normalize_role_mapping_ids(
+            [group_id
+            for mapping in mappings
+            for group_id in (mapping.get("recipient_groups") or [])]
+        )
         if role == "user":
+            user_mappings = [mapping for mapping in mappings if normalize_identity_mapping_role(mapping.get("role")) == "user"]
+
+            def merged_scope(restrict_key, allowed_key):
+                restricted = bool(user_mappings) and all(truthy(mapping.get(restrict_key)) for mapping in user_mappings)
+                allowed = normalize_role_mapping_ids(
+                    [item_id
+                    for mapping in user_mappings
+                    for item_id in (mapping.get(allowed_key) or [])]
+                )
+                return ("1" if restricted else "0"), allowed
+
+            restrict_groups, allowed_groups = merged_scope("restrict_groups", "allowed_groups")
+            restrict_messages, allowed_messages = merged_scope("restrict_messages", "allowed_messages")
+            restrict_bell_schedules, allowed_bell_schedules = merged_scope(
+                "restrict_bell_schedules", "allowed_bell_schedules"
+            )
             return {
                 "role": "user",
-                "recipient_groups": normalize_role_mapping_ids(mapping.get("recipient_groups") or []),
-                "userperm": serialize_permission_tokens(mapping.get("userperm") or []),
-                "restrict_groups": "1" if truthy(mapping.get("restrict_groups")) else "0",
-                "allowed_groups": normalize_role_mapping_ids(mapping.get("allowed_groups") or []),
-                "restrict_messages": "1" if truthy(mapping.get("restrict_messages")) else "0",
-                "allowed_messages": normalize_role_mapping_ids(mapping.get("allowed_messages") or []),
-                "restrict_bell_schedules": "1" if truthy(mapping.get("restrict_bell_schedules")) else "0",
-                "allowed_bell_schedules": normalize_role_mapping_ids(mapping.get("allowed_bell_schedules") or []),
-                "mapping": mapping,
+                "recipient_groups": recipient_groups,
+                "userperm": serialize_permission_tokens(
+                    [permission
+                    for mapping in user_mappings
+                    for permission in permission_token_set(mapping.get("userperm") or [])]
+                ),
+                "restrict_groups": restrict_groups,
+                "allowed_groups": allowed_groups,
+                "restrict_messages": restrict_messages,
+                "allowed_messages": allowed_messages,
+                "restrict_bell_schedules": restrict_bell_schedules,
+                "allowed_bell_schedules": allowed_bell_schedules,
+                "mapping": mappings[0],
+                "mappings": mappings,
             }
         return {
             "role": role,
-            "recipient_groups": normalize_role_mapping_ids(mapping.get("recipient_groups") or []),
+            "recipient_groups": recipient_groups,
             "userperm": "",
             "restrict_groups": "0",
             "allowed_groups": [],
@@ -2337,7 +2380,8 @@ def identity_access_profile(provider, config, raw_groups, claims_source=None):
             "allowed_messages": [],
             "restrict_bell_schedules": "0",
             "allowed_bell_schedules": [],
-            "mapping": mapping,
+            "mapping": mappings[0],
+            "mappings": mappings,
         }
     return {
         "role": "receiver",
@@ -3475,6 +3519,7 @@ def _sync_ldap_directory(config):
 
     ensure_identity_access_schema()
     count = failed = 0
+    synced_user_ids = set()
     reason = ""
     for entry in entries:
         if entry.get("type") != "searchResEntry" or not entry.get("dn"):
@@ -3485,7 +3530,7 @@ def _sync_ldap_directory(config):
         claims = dict(attributes, memberof=groups)
         try:
             with LDAP_USER_SYNC_LOCK, identity_transaction():
-                _sync_ldap_user_record(config, {
+                synced_user = _sync_ldap_user_record(config, {
                     "dn": entry["dn"],
                     "username": username,
                     "display_name": identity_claim_value(attributes, display_field.lower()),
@@ -3503,8 +3548,17 @@ def _sync_ldap_directory(config):
             app.logger.exception("LDAP sync could not save one directory account")
         else:
             count += 1
+            synced_user_id = str((synced_user or {}).get("id") or "").strip()
+            if synced_user_id:
+                synced_user_ids.add(synced_user_id)
     if failed:
         raise LDAPSyncPartialFailure(count, failed, reason)
+    with LDAP_USER_SYNC_LOCK, identity_transaction():
+        stored_users = query_all("SELECT id FROM users WHERE auth_provider='ldap' FOR UPDATE")
+        for stored_user in stored_users:
+            stored_user_id = str(stored_user.get("id") or "").strip()
+            if stored_user_id and stored_user_id not in synced_user_ids:
+                delete_provider_managed_user(stored_user_id)
     return count
 
 
@@ -3889,6 +3943,47 @@ def refresh_synced_identity_user(user, data=None):
     return user
 
 
+def oidc_http_timeout():
+    try:
+        return max(1.0, min(float(os.getenv("OPS_OIDC_HTTP_TIMEOUT", "4")), 60.0))
+    except (TypeError, ValueError):
+        return 4.0
+
+
+def oidc_circuit_error():
+    with OIDC_FAILURE_LOCK:
+        if time.monotonic() < OIDC_UNAVAILABLE_UNTIL:
+            return OIDC_UNAVAILABLE_ERROR or "The OIDC provider is temporarily unavailable."
+    return ""
+
+
+def mark_oidc_unavailable(exc):
+    global OIDC_UNAVAILABLE_UNTIL, OIDC_UNAVAILABLE_ERROR
+    with OIDC_FAILURE_LOCK:
+        OIDC_UNAVAILABLE_UNTIL = time.monotonic() + max(5.0, oidc_http_timeout())
+        OIDC_UNAVAILABLE_ERROR = f"The OIDC provider is unavailable: {exc}"
+
+
+def clear_oidc_unavailable():
+    global OIDC_UNAVAILABLE_UNTIL, OIDC_UNAVAILABLE_ERROR
+    with OIDC_FAILURE_LOCK:
+        OIDC_UNAVAILABLE_UNTIL = 0.0
+        OIDC_UNAVAILABLE_ERROR = ""
+
+
+if OAuth2Session is not None and FlaskOAuth2App is not None:
+    class TimeoutOAuth2Session(OAuth2Session):
+        def request(self, method, url, **kwargs):
+            kwargs.setdefault("timeout", oidc_http_timeout())
+            return super().request(method, url, **kwargs)
+
+
+    class OpsFlaskOAuth2App(FlaskOAuth2App):
+        client_cls = TimeoutOAuth2Session
+else:
+    OpsFlaskOAuth2App = None
+
+
 def build_oidc_client(config):
     if OAuth is None:
         raise RuntimeError("OIDC Python library not installed in running environment")
@@ -3899,9 +3994,13 @@ def build_oidc_client(config):
     client_secret = str(config.get("oidc_client_secret") or "").strip()
     if not client_id or not client_secret:
         raise RuntimeError("OIDC client ID and client secret are required.")
+    circuit_error = oidc_circuit_error()
+    if circuit_error:
+        raise RuntimeError(circuit_error)
     oauth = OAuth(app)
     return oauth.register(
         "ops_oidc",
+        client_cls=OpsFlaskOAuth2App,
         client_id=client_id,
         client_secret=client_secret,
         server_metadata_url=discovery_url,
@@ -3919,7 +4018,7 @@ def oidc_identity_result(config, token, client):
     email = identity_claim_value(claims, email_claim) if claims.get("email_verified") is True else ""
     if (not username or (email_claim and not email)) and client.load_server_metadata().get("userinfo_endpoint"):
         try:
-            userinfo = client.userinfo(token=token)
+            userinfo = client.userinfo(token=token, timeout=oidc_http_timeout())
         except Exception:
             if username:
                 return {"external_id": subject, "username": username, "email": email}
@@ -3951,8 +4050,8 @@ def saml_settings_dict(config):
     idp_entity_id = str(config.get("saml_idp_entity_id") or "").strip()
     sso_url = str(config.get("saml_sso_url") or "").strip()
     x509_cert = str(config.get("saml_x509_certificate") or "").strip()
-    if not idp_entity_id or not sso_url or not x509_cert:
-        raise RuntimeError("SAML IdP entity ID, SSO URL, and X.509 certificate are required.")
+    if not idp_entity_id or not sso_url:
+        raise RuntimeError("SAML IdP entity ID and SSO URL are required.")
     base_url = request.url_root.rstrip("/")
     return {
         "strict": True,
@@ -3981,6 +4080,8 @@ def saml_settings_dict(config):
         },
         "security": {
             "requestedAuthnContext": False,
+            "wantMessagesSigned": bool(x509_cert),
+            "wantAssertionsSigned": bool(x509_cert),
         },
     }
 
@@ -4448,7 +4549,7 @@ def legacy_sidebar_html(ctx, active):
             "</div>",
             '<div class="sidebar-account">',
             desktop_settings_button,
-            '<a class="login-btn automatic-login-btn" href="/login" hidden aria-hidden="true"><span class="nav-icon"><i class="fa-solid fa-sign-in-alt"></i></span><span class="nav-label">Login</span></a>',
+            '<a class="login-btn" href="/login?local=1"><span class="nav-icon"><i class="fa-solid fa-sign-in-alt"></i></span><span class="nav-label">Login</span></a>',
             '<div class="mobile-nav-divider"></div>',
             "</div>",
         ]
@@ -5501,12 +5602,22 @@ def login_sso_start():
             return redirect("/login?sso_error=failed")
     try:
         if provider == "oidc":
-            client = build_oidc_client(config)
-            redirect_uri = request.url_root.rstrip("/") + "/login/oidc/callback"
-            return client.authorize_redirect(redirect_uri, prompt="login")
+            if not OIDC_START_LOCK.acquire(blocking=False):
+                raise RuntimeError("An OIDC provider connection attempt is already in progress. Please retry shortly.")
+            try:
+                client = build_oidc_client(config)
+                redirect_uri = request.url_root.rstrip("/") + "/login/oidc/callback"
+                response = client.authorize_redirect(redirect_uri, prompt="login")
+                clear_oidc_unavailable()
+                return response
+            finally:
+                OIDC_START_LOCK.release()
         auth = build_saml_auth(config)
         return redirect(auth.login(return_to=request.url_root.rstrip("/") + "/", force_authn=True))
     except Exception as exc:
+        app.logger.exception("Unable to start %s SSO login", provider.upper())
+        if provider == "oidc":
+            mark_oidc_unavailable(exc)
         set_sso_error_detail(exc)
         if desktop_sso_request_id:
             fail_desktop_sso_request(desktop_sso_request_id, exc)
@@ -5540,7 +5651,7 @@ def login_oidc_callback():
         return redirect("/login?sso_error=failed")
     try:
         client = build_oidc_client(config)
-        token = client.authorize_access_token()
+        token = client.authorize_access_token(timeout=oidc_http_timeout())
         identity_result = oidc_identity_result(config, token, client)
         user = match_sso_user("oidc", config, identity_result)
         if not user:
@@ -5563,6 +5674,7 @@ def login_oidc_callback():
             return desktop_sso_finish_redirect(desktop_sso_request_id, ok=False, message=str(exc))
         return redirect("/login?sso_error=denied")
     except Exception as exc:
+        app.logger.exception("OIDC callback failed")
         set_sso_error_detail(exc)
         if desktop_sso_request_id:
             fail_desktop_sso_request(desktop_sso_request_id, exc)

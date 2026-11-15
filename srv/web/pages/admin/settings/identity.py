@@ -340,8 +340,6 @@ def _normalize_identity_settings(form, existing):
             errors.append("SAML IdP entity ID is required.")
         if not cleaned["saml_sso_url"]:
             errors.append("SAML SSO URL is required.")
-        if not cleaned["saml_x509_certificate"]:
-            errors.append("SAML X.509 certificate is required.")
         if not cleaned["saml_username_attribute"]:
             errors.append("SAML username attribute is required.")
 
@@ -1357,7 +1355,7 @@ def handle_request():
                                     <input type="text" name="saml_sso_url" id="samlSsoUrl" value="{h(identity_data.get("saml_sso_url", ""))}">
                                 </div>
                                 <div class="info-row" style="flex-direction: column; align-items: flex-start; gap: 8px;">
-                                    <label class="info-label" for="samlX509Certificate">X.509 certificate</label>
+                                    <label class="info-label" for="samlX509Certificate">X.509 certificate (optional)</label>
                                     <textarea name="saml_x509_certificate" id="samlX509Certificate">{h(identity_data.get("saml_x509_certificate", ""))}</textarea>
                                 </div>
                                 <div class="info-row" style="flex-direction: column; align-items: flex-start; gap: 8px;">
@@ -2138,7 +2136,6 @@ document.addEventListener('DOMContentLoaded', function() {
                 ] : [
                     ['samlIdpEntityId', 'Enter the SAML provider entity ID.'],
                     ['samlSsoUrl', 'Enter the SAML sign-on URL.'],
-                    ['samlX509Certificate', 'Enter the SAML signing certificate.']
                 ]
             };
             if (current === 'wizardSsoChoice' && !selected('wizard_sign_in')) {
